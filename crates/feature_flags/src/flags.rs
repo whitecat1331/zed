@@ -99,6 +99,18 @@ impl FeatureFlag for AgentThreadWorktreeLabelFlag {
 }
 register_feature_flag!(AgentThreadWorktreeLabelFlag);
 
+pub struct DebuggerToolFeatureFlag;
+
+impl FeatureFlag for DebuggerToolFeatureFlag {
+    const NAME: &'static str = "debugger-tool";
+    type Value = PresenceFlag;
+
+    fn enabled_for_staff() -> bool {
+        false
+    }
+}
+register_feature_flag!(DebuggerToolFeatureFlag);
+
 /// Wraps agent-run terminal commands in an OS-level sandbox where supported,
 /// and applies the shared per-host network grants to the `fetch` tool and the
 /// out-of-project write grants to the `create_directory` tool. When off,
