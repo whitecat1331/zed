@@ -4820,7 +4820,7 @@ impl agent::DebuggerHost for AgentPanelDebuggerHost {
 
                     let inferred_active_buffer = active_buffer
                         .is_none()
-                        .then_some(active_editor_buffer.clone())
+                        .then_some(active_editor_buffer)
                         .flatten()
                         .filter(|_| active_editor_matches_explicit_worktree);
 
