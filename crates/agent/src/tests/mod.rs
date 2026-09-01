@@ -1096,7 +1096,7 @@ async fn test_debugger_tool_ask_mode_gating(cx: &mut TestAppContext) {
 
     let mut events = thread
         .update(cx, |thread, cx| {
-            thread.send(UserMessageId::new(), ["debug"], cx)
+            thread.send(ClientUserMessageId::new(), ["debug"], cx)
         })
         .unwrap();
     cx.run_until_parked();
@@ -6967,7 +6967,7 @@ async fn test_debugger_tool_gated_by_feature_flag(cx: &mut TestAppContext) {
 
     thread
         .update(cx, |thread, cx| {
-            thread.send(UserMessageId::new(), ["hello"], cx)
+            thread.send(ClientUserMessageId::new(), ["hello"], cx)
         })
         .unwrap();
     cx.run_until_parked();
@@ -6994,7 +6994,7 @@ async fn test_debugger_tool_gated_by_feature_flag(cx: &mut TestAppContext) {
 
     thread
         .update(cx, |thread, cx| {
-            thread.send(UserMessageId::new(), ["hello again"], cx)
+            thread.send(ClientUserMessageId::new(), ["hello again"], cx)
         })
         .unwrap();
     cx.run_until_parked();
