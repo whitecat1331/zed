@@ -1062,3 +1062,166 @@ fn truncate_string(mut value: String, max_length: usize) -> (String, bool) {
     value.truncate(boundary);
     (value, true)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{FakeFs, Project};
+    use dap::adapters::{DebugAdapterBinary, DebugAdapterName};
+    use dap::client::DebugAdapterClient;
+    use dap::{StartDebuggingRequestArguments, StartDebuggingRequestArgumentsRequest};
+    use gpui::{BackgroundExecutor, TestAppContext};
+    use serde_json::json;
+    use settings::SettingsStore;
+    use task::SharedTaskContext;
+    use util::path;
+
+    /// Exercises the deterministic half of the boot-race fix: when a control
+    /// operation is issued while the session is still booting, it must *wait*
+    /// for the adapter to become ready instead of racing it and failing with
+    /// "no adapter running". A session that never leaves `Booting` therefore
+    /// times out with an explicit error.
+    #[gpui::test]
+    async fn test_control_waits_for_boot_instead_of_racing_adapter(
+        executor: BackgroundExecutor,
+        cx: &mut TestAppContext,
+    ) {
+        let fs = FakeFs::new(executor.clone());
+        fs.insert_tree(path!("/project"), json!({})).await;
+
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+        });
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+
+        // `Session::new` starts in the `Booting` state; never calling `boot`
+        // keeps it there, which is exactly the window the fix must guard.
+        let session = cx.update(|cx| {
+            let breakpoint_store = project.read(cx).breakpoint_store();
+            Session::new(
+                breakpoint_store,
+                SessionId(1),
+                None,
+                None,
+                DebugAdapterName("fake-adapter".into()),
+                SharedTaskContext::default(),
+                crate::debugger::session::SessionQuirks::default(),
+                None,
+                None,
+                None,
+                cx,
+            )
+        });
+
+        let result = cx
+            .update(|cx| {
+                cx.spawn(async move |cx| {
+                    wait_for_boot_stop(&session, ThreadId(1), Duration::from_millis(20), cx).await
+                })
+            })
+            .await;
+
+        let error = result.expect_err("should time out while the session is still booting");
+        assert!(
+            error
+                .to_string()
+                .contains("timed out waiting for debugger session to start"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Exercises the other half of the boot-race fix: when a control operation
+    /// is issued while the session is still booting and a breakpoint was hit
+    /// during that boot, the operation must return the already-hit stop rather
+    /// than sending a continue that resumes straight past it.
+    #[gpui::test]
+    async fn test_wait_for_boot_stop_returns_breakpoint_hit_during_boot(
+        executor: BackgroundExecutor,
+        cx: &mut TestAppContext,
+    ) {
+        let fs = FakeFs::new(executor.clone());
+        fs.insert_tree(path!("/project"), json!({})).await;
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+        });
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+
+        let client = Arc::new(
+            DebugAdapterClient::start(
+                SessionId(1),
+                DebugAdapterBinary {
+                    command: Some("command".into()),
+                    arguments: Default::default(),
+                    envs: Default::default(),
+                    cwd: None,
+                    connection: None,
+                    request_args: StartDebuggingRequestArguments {
+                        configuration: serde_json::Value::Null,
+                        request: StartDebuggingRequestArgumentsRequest::Launch,
+                    },
+                },
+                Box::new(|_| {}),
+                &mut cx.to_async(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let worktree = cx.update(|cx| project.read(cx).worktrees(cx).next().unwrap().downgrade());
+
+        let session = cx.update(|cx| {
+            Session::new(
+                project.read(cx).breakpoint_store(),
+                SessionId(1),
+                None,
+                None,
+                DebugAdapterName("fake-adapter".into()),
+                SharedTaskContext::default(),
+                crate::debugger::session::SessionQuirks::default(),
+                None,
+                None,
+                None,
+                cx,
+            )
+        });
+
+        // Simulate the breakpoint hit during boot: shortly after this control
+        // op starts waiting, the session finishes booting with the thread
+        // already stopped.
+        cx.update(|cx| {
+            cx.spawn({
+                let session = session.clone();
+                let client = client.clone();
+                let worktree = worktree.clone();
+                let executor = executor.clone();
+                async move |cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(5))
+                        .await;
+                    session.update(cx, |this, _| {
+                        this.set_running_with_stopped_thread_for_test(
+                            ThreadId(1),
+                            client,
+                            worktree,
+                            executor,
+                        );
+                    });
+                }
+            })
+            .detach();
+        });
+
+        let result = cx
+            .update(|cx| {
+                cx.spawn(async move |cx| {
+                    wait_for_boot_stop(&session, ThreadId(1), Duration::from_secs(1), cx).await
+                })
+            })
+            .await;
+
+        assert_eq!(result.unwrap(), Some(ThreadId(1)));
+    }
+}

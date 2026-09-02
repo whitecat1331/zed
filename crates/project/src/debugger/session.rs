@@ -913,6 +913,44 @@ impl Session {
         })
     }
 
+    /// Test-only: put this session into the `Running` state with `thread_id`
+    /// already stopped, simulating a breakpoint that was hit during boot. Only
+    /// the boot-race state machine is exercised; the client and worktree are
+    /// supplied by the caller and otherwise unused.
+    #[cfg(test)]
+    pub(crate) fn set_running_with_stopped_thread_for_test(
+        &mut self,
+        stopped_thread_id: ThreadId,
+        client: Arc<DebugAdapterClient>,
+        worktree: WeakEntity<Worktree>,
+        executor: BackgroundExecutor,
+    ) {
+        let (messages_tx, _messages_rx) = mpsc::unbounded();
+        self.state = SessionState::Running(RunningMode {
+            client,
+            binary: DebugAdapterBinary {
+                command: None,
+                arguments: Default::default(),
+                envs: Default::default(),
+                cwd: None,
+                connection: None,
+                request_args: StartDebuggingRequestArguments {
+                    configuration: Value::Null,
+                    request: StartDebuggingRequestArgumentsRequest::Launch,
+                },
+            },
+            tmp_breakpoint: None,
+            worktree,
+            executor,
+            is_started: true,
+            has_ever_stopped: true,
+            messages_tx,
+        });
+        self.active_snapshot
+            .thread_states
+            .stop_thread(stopped_thread_id);
+    }
+
     pub fn task_context(&self) -> &SharedTaskContext {
         &self.task_context
     }
