@@ -32,8 +32,7 @@ mod write_file_tool;
 
 use crate::AgentTool;
 use feature_flags::{
-    CreateThreadToolFeatureFlag, DebuggerToolFeatureFlag, FeatureFlagAppExt as _,
-    LspToolFeatureFlag, RenameToolFeatureFlag,
+    CreateThreadToolFeatureFlag, FeatureFlagAppExt as _, LspToolFeatureFlag, RenameToolFeatureFlag,
 };
 use gpui::App;
 use language_model::LanguageModelRequestTool;
@@ -237,7 +236,6 @@ tools! {
 pub fn tool_feature_flag_enabled(tool_name: &str, cx: &App) -> bool {
     match tool_name {
         RenameTool::NAME => cx.has_flag::<RenameToolFeatureFlag>(),
-        DebuggerTool::NAME => cx.has_flag::<DebuggerToolFeatureFlag>(),
         FindReferencesTool::NAME
         | GetCodeActionsTool::NAME
         | ApplyCodeActionTool::NAME
