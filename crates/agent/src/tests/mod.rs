@@ -1268,15 +1268,17 @@ async fn test_debugger_tool_permission_rules_match_breakpoint_expressions(cx: &m
     let result = cx
         .update(|cx| {
             tool.clone().run(
-                ToolInput::resolved(DebuggerToolInput::SetBreakpoints {
-                    breakpoints: vec![BreakpointInput {
+                ToolInput::resolved(DebuggerToolInput {
+                    operation: DebuggerOperation::SetBreakpoints,
+                    breakpoints: Some(vec![BreakpointInput {
                         path: path!("/test/main.js").into(),
                         line: 3,
                         enabled: true,
                         condition: Some("secret == true".into()),
                         hit_condition: Some(">= 10".into()),
                         log_message: Some("secret {value}".into()),
-                    }],
+                    }]),
+                    ..Default::default()
                 }),
                 event_stream,
                 cx,
@@ -1294,15 +1296,17 @@ async fn test_debugger_tool_permission_rules_match_breakpoint_expressions(cx: &m
     let (event_stream, mut receiver) = ToolCallEventStream::test();
     let task = cx.update(|cx| {
         tool.run(
-            ToolInput::resolved(DebuggerToolInput::SetBreakpoints {
-                breakpoints: vec![BreakpointInput {
+            ToolInput::resolved(DebuggerToolInput {
+                operation: DebuggerOperation::SetBreakpoints,
+                breakpoints: Some(vec![BreakpointInput {
                     path: path!("/test/main.js").into(),
                     line: 3,
                     enabled: true,
                     condition: Some("secret == true".into()),
                     hit_condition: Some(">= 10".into()),
                     log_message: Some("secret {value}".into()),
-                }],
+                }]),
+                ..Default::default()
             }),
             event_stream,
             cx,
@@ -1331,10 +1335,12 @@ async fn test_debugger_tool_rejects_excessive_snapshot_and_control_limits(cx: &m
     let result = cx
         .update(|cx| {
             tool.clone().run(
-                ToolInput::resolved(DebuggerToolInput::Snapshot(SnapshotInput {
+                ToolInput::resolved(DebuggerToolInput {
+                    operation: DebuggerOperation::Snapshot,
                     session_id: Some(1),
                     limits: Some(snapshot_limits_with_max_frames(201)),
-                })),
+                    ..Default::default()
+                }),
                 event_stream,
                 cx,
             )
@@ -1346,15 +1352,17 @@ async fn test_debugger_tool_rejects_excessive_snapshot_and_control_limits(cx: &m
     let result = cx
         .update(|cx| {
             tool.clone().run(
-                ToolInput::resolved(DebuggerToolInput::Control(ControlInput {
+                ToolInput::resolved(DebuggerToolInput {
+                    operation: DebuggerOperation::Control,
                     session_id: Some(1),
                     thread_id: Some(2),
-                    action: ControlAction::Continue,
+                    action: Some(ControlAction::Continue),
                     path: None,
                     line: None,
                     timeout_ms: Some(300_001),
                     snapshot_limits: None,
-                })),
+                    ..Default::default()
+                }),
                 event_stream,
                 cx,
             )
@@ -1366,15 +1374,17 @@ async fn test_debugger_tool_rejects_excessive_snapshot_and_control_limits(cx: &m
     let result = cx
         .update(|cx| {
             tool.run(
-                ToolInput::resolved(DebuggerToolInput::Control(ControlInput {
+                ToolInput::resolved(DebuggerToolInput {
+                    operation: DebuggerOperation::Control,
                     session_id: Some(1),
                     thread_id: Some(2),
-                    action: ControlAction::Continue,
+                    action: Some(ControlAction::Continue),
                     path: None,
                     line: None,
                     timeout_ms: Some(30_000),
                     snapshot_limits: Some(snapshot_limits_with_max_output_bytes(1_048_577)),
-                })),
+                    ..Default::default()
+                }),
                 event_stream,
                 cx,
             )
@@ -1460,15 +1470,17 @@ async fn test_debugger_tool_permission_rules_match_resolved_paths(cx: &mut TestA
     let (event_stream, mut receiver) = ToolCallEventStream::test();
     let task = cx.update(|cx| {
         tool.clone().run(
-            ToolInput::resolved(DebuggerToolInput::SetBreakpoints {
-                breakpoints: vec![BreakpointInput {
+            ToolInput::resolved(DebuggerToolInput {
+                operation: DebuggerOperation::SetBreakpoints,
+                breakpoints: Some(vec![BreakpointInput {
                     path: "src/main.js".into(),
                     line: 3,
                     enabled: true,
                     condition: None,
                     hit_condition: None,
                     log_message: None,
-                }],
+                }]),
+                ..Default::default()
             }),
             event_stream,
             cx,
@@ -1497,15 +1509,17 @@ async fn test_debugger_tool_permission_rules_match_resolved_paths(cx: &mut TestA
     let result = cx
         .update(|cx| {
             tool.clone().run(
-                ToolInput::resolved(DebuggerToolInput::SetBreakpoints {
-                    breakpoints: vec![BreakpointInput {
+                ToolInput::resolved(DebuggerToolInput {
+                    operation: DebuggerOperation::SetBreakpoints,
+                    breakpoints: Some(vec![BreakpointInput {
                         path: path!("/test/src/./main.js").into(),
                         line: 1,
                         enabled: true,
                         condition: None,
                         hit_condition: None,
                         log_message: None,
-                    }],
+                    }]),
+                    ..Default::default()
                 }),
                 event_stream,
                 cx,
@@ -1524,15 +1538,17 @@ async fn test_debugger_tool_permission_rules_match_resolved_paths(cx: &mut TestA
     let result = cx
         .update(|cx| {
             tool.run(
-                ToolInput::resolved(DebuggerToolInput::Control(ControlInput {
+                ToolInput::resolved(DebuggerToolInput {
+                    operation: DebuggerOperation::Control,
                     session_id: Some(12),
                     thread_id: Some(34),
-                    action: ControlAction::RunToLine,
+                    action: Some(ControlAction::RunToLine),
                     path: Some(path!("/test/src/./main.js").into()),
                     line: Some(5),
                     timeout_ms: None,
                     snapshot_limits: None,
-                })),
+                    ..Default::default()
+                }),
                 event_stream,
                 cx,
             )
@@ -1590,8 +1606,9 @@ fn assert_debugger_error_contains(
 }
 
 fn debugger_start_session_input() -> DebuggerToolInput {
-    DebuggerToolInput::StartSession(StartSessionInput {
-        scenario: task::DebugScenario {
+    DebuggerToolInput {
+        operation: DebuggerOperation::StartSession,
+        scenario: Some(task::DebugScenario {
             adapter: "node".into(),
             label: "Debug secret".into(),
             build: Some(task::BuildTaskDefinition::ByName("build-secret".into())),
@@ -1615,9 +1632,10 @@ fn debugger_start_session_input() -> DebuggerToolInput {
                 host: Some("127.0.0.1".parse().expect("test host should parse")),
                 timeout: Some(1000),
             }),
-        },
+        }),
         worktree_id: Some(7),
-    })
+        ..Default::default()
+    }
 }
 
 fn set_debugger_permission_rules(

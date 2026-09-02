@@ -47,29 +47,75 @@ const MAX_SNAPSHOT_SOURCE_CONTEXT_LINES: usize = 200;
 /// - Do not use this tool for expression evaluation; evaluation is intentionally
 ///   not available.
 /// </guidelines>
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "operation", rename_all = "snake_case")]
-pub enum DebuggerToolInput {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DebuggerOperation {
     /// List active debug sessions.
+    #[default]
     ListSessions,
     /// Inspect debugger state for a session.
-    Snapshot(SnapshotInput),
+    Snapshot,
     /// List source breakpoints in the project.
     ListBreakpoints,
-    /// Add or update source breakpoints. Requires Write mode and permission.
-    SetBreakpoints { breakpoints: Vec<BreakpointInput> },
-    /// Remove source breakpoints. Requires Write mode and permission.
-    RemoveBreakpoints {
-        breakpoints: Vec<BreakpointLocationInput>,
-    },
-    /// Continue, pause, step, or run to a line. Requires Write mode and permission.
-    Control(ControlInput),
+    /// Add or update source breakpoints.
+    SetBreakpoints,
+    /// Remove source breakpoints.
+    RemoveBreakpoints,
+    /// Continue, pause, step, or run to a line.
+    Control,
     /// List registered debug adapters and their configuration schemas.
     ListAdapters,
-    /// Start a debug session through Zed's debugger UI. Requires Write mode and permission.
-    StartSession(StartSessionInput),
-    /// Stop a debug session. Requires Write mode and permission.
-    StopSession { session_id: u64 },
+    /// Start a debug session through Zed's debugger UI.
+    StartSession,
+    /// Stop a debug session.
+    StopSession,
+}
+
+/// A single debugger operation and the fields it needs.
+///
+/// Kept as a flat struct (rather than a tagged enum) so the JSON schema
+/// advertised to language-model providers is a `type: "object"` with an
+/// `operation` discriminator. Some providers reject top-level union schemas
+/// that internally-tagged enums produce.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct DebuggerToolInput {
+    /// Which debugger operation to run.
+    pub operation: DebuggerOperation,
+    /// DAP session id, used by snapshot, control, and stop_session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<u64>,
+    /// Optional bounds for the snapshot operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<SnapshotLimitsInput>,
+    /// Source breakpoints. `set_breakpoints` uses every field;
+    /// `remove_breakpoints` only reads `path` and `line`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breakpoints: Option<Vec<BreakpointInput>>,
+    /// DAP thread id, used by control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<i64>,
+    /// Execution control action, used by control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<ControlAction>,
+    /// Source path for control run_to_line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    /// 1-based line for control run_to_line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    /// Maximum time to wait for the debugger to stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// Optional bounds for the snapshot returned after control completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_limits: Option<SnapshotLimitsInput>,
+    /// Debug scenario for start_session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenario: Option<DebugScenario>,
+    /// Optional worktree id for start_session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -312,16 +358,17 @@ impl DebuggerTool {
         event_stream: ToolCallEventStream,
         cx: &mut gpui::AsyncApp,
     ) -> Result<DebuggerToolOutput> {
-        match input {
-            DebuggerToolInput::ListSessions => {
+        match input.operation {
+            DebuggerOperation::ListSessions => {
                 let data = cx.update(|cx| sessions_to_json(self.api(cx).list_sessions(cx)));
                 Ok(success(operation, "listed debug sessions", data))
             }
-            DebuggerToolInput::Snapshot(input) => {
+            DebuggerOperation::Snapshot => {
+                let session_id = input.session_id;
                 let limits = limits_from_input(input.limits)?;
                 let (api, session_id) = cx.update(|cx| {
                     let api = self.api(cx);
-                    let session_id = resolve_session_id(&self.project, &api, input.session_id, cx)?;
+                    let session_id = resolve_session_id(&self.project, &api, session_id, cx)?;
                     anyhow::Ok((api, session_id))
                 })?;
                 let snapshot_task = cx.update(|cx| api.snapshot(session_id, limits, cx));
@@ -332,17 +379,20 @@ impl DebuggerTool {
                     snapshot_to_json(snapshot),
                 ))
             }
-            DebuggerToolInput::ListBreakpoints => {
+            DebuggerOperation::ListBreakpoints => {
                 let data = cx.update(|cx| breakpoints_to_json(self.api(cx).list_breakpoints(cx)));
                 Ok(success(operation, "listed breakpoints", data))
             }
-            DebuggerToolInput::ListAdapters => {
+            DebuggerOperation::ListAdapters => {
                 let data = cx
                     .update(|cx| serde_json::to_value(DapRegistry::global(cx).adapters_schema()))?;
                 Ok(success(operation, "listed debug adapters", data))
             }
-            DebuggerToolInput::SetBreakpoints { breakpoints } => {
+            DebuggerOperation::SetBreakpoints => {
                 self.ensure_write_mode(&operation, cx)?;
+                let breakpoints = input
+                    .breakpoints
+                    .context("breakpoints is required for debugger set_breakpoints")?;
                 let breakpoints = breakpoints
                     .into_iter()
                     .map(|breakpoint| resolve_breakpoint_input(&self.project, breakpoint, cx))
@@ -369,8 +419,17 @@ impl DebuggerTool {
                     Value::Array(results),
                 ))
             }
-            DebuggerToolInput::RemoveBreakpoints { breakpoints } => {
+            DebuggerOperation::RemoveBreakpoints => {
                 self.ensure_write_mode(&operation, cx)?;
+                let breakpoints = input
+                    .breakpoints
+                    .context("breakpoints is required for debugger remove_breakpoints")?
+                    .into_iter()
+                    .map(|breakpoint| BreakpointLocationInput {
+                        path: breakpoint.path,
+                        line: breakpoint.line,
+                    })
+                    .collect::<Vec<_>>();
                 let breakpoints = breakpoints
                     .into_iter()
                     .map(|breakpoint| resolve_breakpoint_location(&self.project, breakpoint, cx))
@@ -398,11 +457,22 @@ impl DebuggerTool {
                     Value::Array(results),
                 ))
             }
-            DebuggerToolInput::Control(input) => {
+            DebuggerOperation::Control => {
                 self.ensure_write_mode(&operation, cx)?;
-                validate_control_timeout(input.timeout_ms)?;
-                let snapshot_limits = limits_from_input(input.snapshot_limits.clone())?;
-                let resolved_input = self.resolve_control_input(input, cx).await?;
+                let control_input = ControlInput {
+                    session_id: input.session_id,
+                    thread_id: input.thread_id,
+                    action: input
+                        .action
+                        .context("action is required for debugger control")?,
+                    path: input.path,
+                    line: input.line,
+                    timeout_ms: input.timeout_ms,
+                    snapshot_limits: input.snapshot_limits,
+                };
+                validate_control_timeout(control_input.timeout_ms)?;
+                let snapshot_limits = limits_from_input(control_input.snapshot_limits.clone())?;
+                let resolved_input = self.resolve_control_input(control_input, cx).await?;
                 let action = resolved_input.action;
                 authorize_debugger_operation(
                     &event_stream,
@@ -425,15 +495,21 @@ impl DebuggerTool {
                     }),
                 ))
             }
-            DebuggerToolInput::StartSession(input) => {
+            DebuggerOperation::StartSession => {
                 self.ensure_write_mode(&operation, cx)?;
+                let start_session_input = StartSessionInput {
+                    scenario: input
+                        .scenario
+                        .context("scenario is required for debugger start_session")?,
+                    worktree_id: input.worktree_id,
+                };
                 authorize_debugger_operation(
                     &event_stream,
                     format!(
                         "Start debug session {}",
-                        MarkdownInlineCode(&input.scenario.label)
+                        MarkdownInlineCode(&start_session_input.scenario.label)
                     ),
-                    start_session_permission_inputs(&operation, &input)?,
+                    start_session_permission_inputs(&operation, &start_session_input)?,
                     cx,
                 )
                 .await?;
@@ -454,10 +530,10 @@ impl DebuggerTool {
                 }
 
                 let request = DebugSessionRequest {
-                    scenario: input.scenario,
+                    scenario: start_session_input.scenario,
                     task_context: SharedTaskContext::default(),
                     active_buffer: None,
-                    worktree_id: input.worktree_id.map(WorktreeId::from_proto),
+                    worktree_id: start_session_input.worktree_id.map(WorktreeId::from_proto),
                 };
                 let info = self.environment.start_debug_session(request, cx).await?;
                 Ok(success(
@@ -470,8 +546,11 @@ impl DebuggerTool {
                     }),
                 ))
             }
-            DebuggerToolInput::StopSession { session_id } => {
+            DebuggerOperation::StopSession => {
                 self.ensure_write_mode(&operation, cx)?;
+                let session_id = input
+                    .session_id
+                    .context("session_id is required for debugger stop_session")?;
                 authorize_debugger_operation(
                     &event_stream,
                     format!("Stop debug session {session_id}"),
@@ -851,28 +930,29 @@ fn sort_json_value(value: Value) -> Value {
 }
 
 fn operation_name(input: &DebuggerToolInput) -> &'static str {
-    match input {
-        DebuggerToolInput::ListSessions => "list_sessions",
-        DebuggerToolInput::Snapshot(_) => "snapshot",
-        DebuggerToolInput::ListBreakpoints => "list_breakpoints",
-        DebuggerToolInput::SetBreakpoints { .. } => "set_breakpoints",
-        DebuggerToolInput::RemoveBreakpoints { .. } => "remove_breakpoints",
-        DebuggerToolInput::Control(_) => "control",
-        DebuggerToolInput::ListAdapters => "list_adapters",
-        DebuggerToolInput::StartSession(_) => "start_session",
-        DebuggerToolInput::StopSession { .. } => "stop_session",
+    match input.operation {
+        DebuggerOperation::ListSessions => "list_sessions",
+        DebuggerOperation::Snapshot => "snapshot",
+        DebuggerOperation::ListBreakpoints => "list_breakpoints",
+        DebuggerOperation::SetBreakpoints => "set_breakpoints",
+        DebuggerOperation::RemoveBreakpoints => "remove_breakpoints",
+        DebuggerOperation::Control => "control",
+        DebuggerOperation::ListAdapters => "list_adapters",
+        DebuggerOperation::StartSession => "start_session",
+        DebuggerOperation::StopSession => "stop_session",
     }
 }
 
 fn initial_title_for_input(input: &DebuggerToolInput) -> SharedString {
-    match input {
-        DebuggerToolInput::ListSessions => "List debug sessions".into(),
-        DebuggerToolInput::Snapshot(input) => input
+    match input.operation {
+        DebuggerOperation::ListSessions => "List debug sessions".into(),
+        DebuggerOperation::Snapshot => input
             .session_id
             .map(|session_id| format!("Inspect debug session {session_id}").into())
             .unwrap_or_else(|| "Inspect debugger".into()),
-        DebuggerToolInput::ListBreakpoints => "List debugger breakpoints".into(),
-        DebuggerToolInput::SetBreakpoints { breakpoints } => {
+        DebuggerOperation::ListBreakpoints => "List debugger breakpoints".into(),
+        DebuggerOperation::SetBreakpoints => {
+            let breakpoints = input.breakpoints.as_deref().unwrap_or_default();
             if breakpoints.len() == 1 {
                 let breakpoint = &breakpoints[0];
                 format!(
@@ -885,7 +965,8 @@ fn initial_title_for_input(input: &DebuggerToolInput) -> SharedString {
                 format!("Set {} debugger breakpoints", breakpoints.len()).into()
             }
         }
-        DebuggerToolInput::RemoveBreakpoints { breakpoints } => {
+        DebuggerOperation::RemoveBreakpoints => {
+            let breakpoints = input.breakpoints.as_deref().unwrap_or_default();
             if breakpoints.len() == 1 {
                 let breakpoint = &breakpoints[0];
                 format!(
@@ -898,8 +979,8 @@ fn initial_title_for_input(input: &DebuggerToolInput) -> SharedString {
                 format!("Remove {} debugger breakpoints", breakpoints.len()).into()
             }
         }
-        DebuggerToolInput::Control(input) => match input.action {
-            ControlAction::RunToLine => match (input.path.as_deref(), input.line) {
+        DebuggerOperation::Control => match input.action {
+            Some(ControlAction::RunToLine) => match (input.path.as_deref(), input.line) {
                 (Some(path), Some(line)) => format!(
                     "Debugger run to line at {}:{}",
                     MarkdownInlineCode(&path.to_string_lossy()),
@@ -908,21 +989,25 @@ fn initial_title_for_input(input: &DebuggerToolInput) -> SharedString {
                 .into(),
                 _ => "Debugger run to line".into(),
             },
-            ControlAction::Continue
-            | ControlAction::Pause
-            | ControlAction::StepOver
-            | ControlAction::StepIn
-            | ControlAction::StepOut => format!("Debugger {}", input.action.label()).into(),
+            Some(action) => format!("Debugger {}", action.label()).into(),
+            None => "Debugger control".into(),
         },
-        DebuggerToolInput::ListAdapters => "List debug adapters".into(),
-        DebuggerToolInput::StartSession(input) => format!(
-            "Start debug session {}",
-            MarkdownInlineCode(&input.scenario.label)
-        )
-        .into(),
-        DebuggerToolInput::StopSession { session_id } => {
-            format!("Stop debug session {session_id}").into()
-        }
+        DebuggerOperation::ListAdapters => "List debug adapters".into(),
+        DebuggerOperation::StartSession => input
+            .scenario
+            .as_ref()
+            .map(|scenario| {
+                format!(
+                    "Start debug session {}",
+                    MarkdownInlineCode(&scenario.label)
+                )
+                .into()
+            })
+            .unwrap_or_else(|| "Start debug session".into()),
+        DebuggerOperation::StopSession => input
+            .session_id
+            .map(|session_id| format!("Stop debug session {session_id}").into())
+            .unwrap_or_else(|| "Stop debug session".into()),
     }
 }
 
