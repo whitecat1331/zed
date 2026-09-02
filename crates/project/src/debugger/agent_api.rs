@@ -313,6 +313,12 @@ impl AgentDebuggerApi {
         let dap_store = self.dap_store.clone();
         cx.spawn(async move |cx| {
             let session = session_by_id(&dap_store, session_id, cx)?;
+            if let Some(thread_id) = wait_for_boot_stop(&session, thread_id, timeout, cx).await? {
+                return Ok(AgentDebuggerControlResult {
+                    status: AgentDebuggerWaitStatus::Stopped,
+                    stopped_thread_id: Some(thread_id),
+                });
+            }
             let stop_wait = subscribe_to_stop(session.clone(), cx)?;
             session
                 .update(cx, |session, cx| {
@@ -333,6 +339,7 @@ impl AgentDebuggerApi {
         let dap_store = self.dap_store.clone();
         cx.spawn(async move |cx| {
             let session = session_by_id(&dap_store, session_id, cx)?;
+            wait_for_session_ready(&session, timeout, cx).await?;
             if session.read_with(cx, |session, _| session.thread_status(thread_id))
                 == ThreadStatus::Stopped
             {
@@ -361,6 +368,12 @@ impl AgentDebuggerApi {
         let dap_store = self.dap_store.clone();
         cx.spawn(async move |cx| {
             let session = session_by_id(&dap_store, session_id, cx)?;
+            if let Some(thread_id) = wait_for_boot_stop(&session, thread_id, timeout, cx).await? {
+                return Ok(AgentDebuggerControlResult {
+                    status: AgentDebuggerWaitStatus::Stopped,
+                    stopped_thread_id: Some(thread_id),
+                });
+            }
             let stop_wait = subscribe_to_stop(session.clone(), cx)?;
             session
                 .update(cx, |session, cx| match step_kind {
@@ -392,6 +405,12 @@ impl AgentDebuggerApi {
         cx.spawn(async move |cx| {
             let row = line_to_row(line)?;
             let session = session_by_id(&dap_store, session_id, cx)?;
+            if let Some(thread_id) = wait_for_boot_stop(&session, thread_id, timeout, cx).await? {
+                return Ok(AgentDebuggerControlResult {
+                    status: AgentDebuggerWaitStatus::Stopped,
+                    stopped_thread_id: Some(thread_id),
+                });
+            }
             let stop_wait = subscribe_to_stop(session.clone(), cx)?;
             let breakpoint = SourceBreakpoint {
                 row,
@@ -655,6 +674,45 @@ fn subscribe_to_stop(session: Entity<Session>, cx: &mut AsyncApp) -> Result<Agen
         _stopped_subscription: stopped_subscription,
         _shutdown_subscription: shutdown_subscription,
     })
+}
+
+async fn wait_for_session_ready(
+    session: &Entity<Session>,
+    timeout: Duration,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let mut remaining = timeout;
+    loop {
+        if !session.read_with(cx, |session, _| session.is_building()) {
+            return Ok(());
+        }
+        if remaining.is_zero() {
+            anyhow::bail!("timed out waiting for debugger session to start");
+        }
+        let sleep = remaining.min(Duration::from_millis(50));
+        cx.background_executor().timer(sleep).await;
+        remaining = remaining.saturating_sub(sleep);
+    }
+}
+
+/// Waits for a session that is still booting to finish, and reports whether the
+/// given thread ended up stopped — which happens when a breakpoint is hit
+/// during launch. In that case the caller should return the current stop instead
+/// of sending a continue/step that would resume straight past it.
+async fn wait_for_boot_stop(
+    session: &Entity<Session>,
+    thread_id: ThreadId,
+    timeout: Duration,
+    cx: &mut AsyncApp,
+) -> Result<Option<ThreadId>> {
+    let was_booting = session.read_with(cx, |session, _| session.is_building());
+    if !was_booting {
+        return Ok(None);
+    }
+    wait_for_session_ready(session, timeout, cx).await?;
+    let stopped = session.read_with(cx, |session, _| session.thread_status(thread_id))
+        == ThreadStatus::Stopped;
+    Ok(stopped.then_some(thread_id))
 }
 
 async fn wait_for_stop_or_timeout(
