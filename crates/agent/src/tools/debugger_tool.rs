@@ -497,12 +497,13 @@ impl DebuggerTool {
             }
             DebuggerOperation::StartSession => {
                 self.ensure_write_mode(&operation, cx)?;
-                let start_session_input = StartSessionInput {
+                let mut start_session_input = StartSessionInput {
                     scenario: input
                         .scenario
                         .context("scenario is required for debugger start_session")?,
                     worktree_id: input.worktree_id,
                 };
+                ensure_stop_on_entry(&mut start_session_input.scenario);
                 authorize_debugger_operation(
                     &event_stream,
                     format!(
@@ -867,6 +868,23 @@ pub fn control_permission_inputs_for_test(
             timeout_ms: input.timeout_ms,
         })],
     )
+}
+
+/// Launch with `stopOnEntry` so a fast-running debuggee doesn't exit (and tear
+/// down the session) before the agent can set breakpoints. The agent sets
+/// breakpoints *after* starting the session, so without this the program runs
+/// to completion and the session is dropped from the DAP store.
+fn ensure_stop_on_entry(scenario: &mut DebugScenario) {
+    let Value::Object(config) = &mut scenario.config else {
+        return;
+    };
+    let is_attach = config
+        .get("request")
+        .and_then(Value::as_str)
+        .is_some_and(|request| request == "attach");
+    if !is_attach && !config.contains_key("stopOnEntry") {
+        config.insert("stopOnEntry".to_string(), Value::Bool(true));
+    }
 }
 
 fn start_session_permission_inputs(
