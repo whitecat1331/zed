@@ -901,6 +901,41 @@ fn main() {
         #[cfg(not(target_os = "windows"))]
         let wsl = None;
 
+        // Trusted local agent prompt (debugger-loop resume handoff): read the
+        // file and auto-submit it once a workspace is ready. Gated to a local
+        // file path so it cannot be triggered by a hostile `zed://` URL.
+        if let Some(prompt) = args
+            .agent_prompt
+            .as_ref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+        {
+            let app_state = app_state.clone();
+            cx.spawn(async move |cx| {
+                let multi_workspace =
+                    workspace::get_any_active_multi_workspace(app_state, cx.clone()).await?;
+                multi_workspace.update(cx, |multi_workspace, window, cx| {
+                    multi_workspace.workspace().update(cx, |workspace, cx| {
+                        if let Some(panel) = workspace.focus_panel::<AgentPanel>(window, cx) {
+                            panel.update(cx, |panel, cx| {
+                                panel.new_agent_thread_with_auto_submit(
+                                    prompt.clone(),
+                                    window,
+                                    cx,
+                                );
+                            });
+                        } else {
+                            log::warn!(
+                                "--agent-prompt given but the AgentPanel is not registered \
+                                 (is `disable_ai` enabled?)"
+                            );
+                        }
+                    });
+                })?;
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+        }
+
         if !urls.is_empty() || !diff_paths.is_empty() {
             open_listener.open(RawOpenRequest {
                 urls,
@@ -1785,6 +1820,11 @@ struct Args {
     #[cfg(target_os = "windows")]
     #[arg(long, hide = true)]
     etw_socket: Option<PathBuf>,
+
+    /// Path to a file whose contents are auto-submitted as an agent prompt on
+    /// startup. Trusted local input only — not reachable via `zed://` URLs.
+    #[arg(long, hide = true)]
+    agent_prompt: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
