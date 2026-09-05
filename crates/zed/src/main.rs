@@ -983,13 +983,11 @@ fn main() {
                 }
                 multi_workspace.update(cx, |multi_workspace, window, cx| {
                     multi_workspace.workspace().update(cx, |workspace, cx| {
-                        if let Some(panel) = workspace.focus_panel::<AgentPanel>(window, cx) {
+                        workspace.open_panel::<AgentPanel>(window, cx);
+                        if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                            workspace.focus_panel::<AgentPanel>(window, cx);
                             panel.update(cx, |panel, cx| {
-                                panel.new_agent_thread_with_auto_submit(
-                                    prompt.clone(),
-                                    window,
-                                    cx,
-                                );
+                                panel.new_agent_thread_with_auto_submit(prompt.clone(), window, cx);
                             });
                         } else {
                             log::warn!(
