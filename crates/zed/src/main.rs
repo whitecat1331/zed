@@ -901,40 +901,12 @@ fn main() {
         #[cfg(not(target_os = "windows"))]
         let wsl = None;
 
-        // Trusted local agent prompt (debugger-loop resume handoff): read the
-        // file and auto-submit it once a workspace is ready. Gated to a local
-        // file path so it cannot be triggered by a hostile `zed://` URL.
-        if let Some(prompt) = args
+        // Trusted local agent prompt (debugger-loop resume handoff): read it
+        // now; it is auto-submitted once the workspace is restored (below).
+        let agent_prompt = args
             .agent_prompt
             .as_ref()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-        {
-            let app_state = app_state.clone();
-            cx.spawn(async move |cx| {
-                let multi_workspace =
-                    workspace::get_any_active_multi_workspace(app_state, cx.clone()).await?;
-                multi_workspace.update(cx, |multi_workspace, window, cx| {
-                    multi_workspace.workspace().update(cx, |workspace, cx| {
-                        if let Some(panel) = workspace.focus_panel::<AgentPanel>(window, cx) {
-                            panel.update(cx, |panel, cx| {
-                                panel.new_agent_thread_with_auto_submit(
-                                    prompt.clone(),
-                                    window,
-                                    cx,
-                                );
-                            });
-                        } else {
-                            log::warn!(
-                                "--agent-prompt given but the AgentPanel is not registered \
-                                 (is `disable_ai` enabled?)"
-                            );
-                        }
-                    });
-                })?;
-                anyhow::Ok(())
-            })
-            .detach_and_log_err(cx);
-        }
+            .and_then(|path| std::fs::read_to_string(path).ok());
 
         if !urls.is_empty() || !diff_paths.is_empty() {
             open_listener.open(RawOpenRequest {
@@ -991,6 +963,46 @@ fn main() {
         });
 
         let restore_finished = cx.background_spawn(restore_task).shared();
+
+        // Auto-submit the trusted agent prompt once the workspace is restored
+        // and its panels (including the AgentPanel) are ready.
+        if let Some(prompt) = agent_prompt {
+            let app_state = app_state.clone();
+            let restore_finished = restore_finished.clone();
+            cx.spawn(async move |cx| {
+                restore_finished.await;
+                let multi_workspace =
+                    workspace::get_any_active_multi_workspace(app_state, cx.clone()).await?;
+                let panels_task = multi_workspace.update(cx, |multi_workspace, _, cx| {
+                    multi_workspace
+                        .workspace()
+                        .update(cx, |workspace, _| workspace.take_panels_task())
+                })?;
+                if let Some(task) = panels_task {
+                    task.await.log_err();
+                }
+                multi_workspace.update(cx, |multi_workspace, window, cx| {
+                    multi_workspace.workspace().update(cx, |workspace, cx| {
+                        if let Some(panel) = workspace.focus_panel::<AgentPanel>(window, cx) {
+                            panel.update(cx, |panel, cx| {
+                                panel.new_agent_thread_with_auto_submit(
+                                    prompt.clone(),
+                                    window,
+                                    cx,
+                                );
+                            });
+                        } else {
+                            log::warn!(
+                                "--agent-prompt given but the AgentPanel is not registered \
+                                 (is `disable_ai` enabled?)"
+                            );
+                        }
+                    });
+                })?;
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+        }
 
         cx.spawn({
             let db = workspace::WorkspaceDb::global(cx);
