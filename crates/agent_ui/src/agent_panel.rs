@@ -4422,6 +4422,29 @@ impl AgentPanel {
         );
     }
 
+    /// Auto-submit a trusted local prompt (only reachable via `--agent-prompt`).
+    pub fn new_agent_thread_with_auto_submit(
+        &mut self,
+        prompt: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.external_thread(
+            None,
+            None,
+            None,
+            None,
+            Some(AgentInitialContent::ContentBlock {
+                blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))],
+                auto_submit: true,
+            }),
+            true,
+            AgentThreadSource::AgentPanel,
+            window,
+            cx,
+        );
+    }
+
     pub fn load_agent_thread(
         &mut self,
         agent: Agent,
