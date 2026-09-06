@@ -136,6 +136,13 @@ Other entities can then register a callback to handle these events by doing `cx.
 
 - Use `./script/clippy` instead of `cargo clippy`
 
+# Debugger tool
+
+* vscode-js-debug (JavaScript/TypeScript) does not bind breakpoints on the
+  single `return <expression>` line of a return-only function. Set breakpoints
+  in multi-statement functions instead; `step_in` into a single-expression
+  function will not stop.
+
 # Pull request hygiene
 
 When an agent opens or updates a pull request, it must:
