@@ -661,7 +661,6 @@ async fn snapshot_session(
     let dap_threads = session
         .update(cx, |session, _| session.agent_fetch_threads())
         .await?;
-    let adapter = session.read_with(cx, |session, _| session.adapter().to_string());
     let mut remaining_frames = limits.max_frames;
     let mut frames_truncated = false;
     let mut threads = Vec::new();
@@ -695,13 +694,13 @@ async fn snapshot_session(
     for (index, dap_thread) in stopped_threads.iter().enumerate() {
         let thread_id = ThreadId(dap_thread.id);
 
-        // Delve synthesizes a "Dummy" thread (thread id 0) before the first
-        // real goroutine exists and after `pause`; it has no stack. Keep the
-        // thread in the snapshot (with no frames) so the control path still
-        // has a thread to continue/step/pause on, instead of reporting zero
-        // threads and failing.
-        if adapter == "Delve" && dap_thread.name == "Dummy" {
-            notes.push("Delve synthetic `Dummy` thread has no stack; frames omitted".to_string());
+        // Some adapters synthesize a placeholder thread (Delve calls it
+        // "Dummy") before the first real goroutine exists and after `pause`; it
+        // has no stack. Detect it by the thread's own name rather than
+        // hardcoding the adapter, so the control path keeps a thread to
+        // continue/step/pause on even if the adapter's reported name changes.
+        if dap_thread.name == "Dummy" {
+            notes.push("Synthetic `Dummy` thread has no stack; frames omitted".to_string());
             threads.push(AgentDebuggerThread {
                 thread_id,
                 name: dap_thread.name.clone(),
