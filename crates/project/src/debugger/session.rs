@@ -2836,6 +2836,20 @@ impl Session {
         thread_id: ThreadId,
         cx: &mut Context<Self>,
     ) -> Result<Vec<StackFrame>> {
+        // Some adapters synthesize a placeholder thread (Delve calls it "Dummy")
+        // before the first real goroutine exists; it has no stack, and requesting
+        // one fails with "Unable to produce stack trace: unknown goroutine 1".
+        // Detect it by name and return empty frames so the panel doesn't surface
+        // a transient error banner for it.
+        if self
+            .session_state()
+            .threads
+            .get(&thread_id)
+            .is_some_and(|thread| thread.dap.name == "Dummy")
+        {
+            return Ok(Vec::new());
+        }
+
         if self.active_snapshot.thread_states.thread_status(thread_id) == ThreadStatus::Stopped
             && self.requests.contains_key(&ThreadsCommand.type_id())
             && self.active_snapshot.threads.contains_key(&thread_id)
