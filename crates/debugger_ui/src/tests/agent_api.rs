@@ -855,3 +855,68 @@ async fn test_agent_api_snapshot_frame_budget_prioritizes_stop_thread(
         snapshot.notes
     );
 }
+
+#[gpui::test]
+async fn test_agent_api_snapshot_keeps_synthetic_placeholder_thread(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(path!("/project"), json!({ "main.js": "" }))
+        .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let session = start_debug_session(&workspace, cx, |_| {}).unwrap();
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+    let client = session.update(cx, |session, _| session.adapter_client().unwrap());
+
+    // Delve synthesizes a "Dummy" placeholder thread before the first real
+    // goroutine exists; it has no stack. The fake adapter is NOT named
+    // "Delve", so this also proves the snapshot detects the placeholder by
+    // thread name rather than by the adapter's name.
+    client.on_request::<Threads, _>(move |_, _| {
+        Ok(dap::ThreadsResponse {
+            threads: vec![dap::Thread {
+                id: 1,
+                name: "Dummy".into(),
+            }],
+        })
+    });
+
+    client
+        .fake_event(dap::messages::Events::Stopped(dap::StoppedEvent {
+            reason: dap::StoppedEventReason::Pause,
+            description: None,
+            thread_id: Some(1),
+            preserve_focus_hint: None,
+            text: None,
+            all_threads_stopped: None,
+            hit_breakpoint_ids: None,
+        }))
+        .await;
+
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+    let snapshot = cx
+        .update(|cx| api.snapshot(session_id, AgentDebuggerSnapshotLimits::default(), None, cx))
+        .await
+        .unwrap();
+
+    assert_eq!(snapshot.threads.len(), 1);
+    let thread = &snapshot.threads[0];
+    assert_eq!(thread.name, "Dummy");
+    assert_eq!(thread.status, AgentDebuggerThreadStatus::Stopped);
+    assert!(thread.frames.is_empty());
+    assert!(
+        snapshot
+            .notes
+            .iter()
+            .any(|note| note.contains("Synthetic `Dummy` thread has no stack")),
+        "expected the synthetic-placeholder note, got {:?}",
+        snapshot.notes
+    );
+}
