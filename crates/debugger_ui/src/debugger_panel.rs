@@ -219,6 +219,7 @@ impl DebugPanel {
         let quirks = SessionQuirks {
             compact: adapter.compact_child_session(),
             prefer_thread_name: adapter.prefer_thread_name(),
+            unescape_python_repr: adapter.unescape_python_repr(),
         };
         let project = self.project.read(cx);
         let worktree = if let Some(worktree_id) = worktree_id {

@@ -395,6 +395,10 @@ pub trait DebugAdapter: 'static + Send + Sync {
     fn prefer_thread_name(&self) -> bool {
         false
     }
+
+    fn unescape_python_repr(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]

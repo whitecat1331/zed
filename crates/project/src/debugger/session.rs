@@ -175,6 +175,7 @@ pub struct RunningMode {
 pub struct SessionQuirks {
     pub compact: bool,
     pub prefer_thread_name: bool,
+    pub unescape_python_repr: bool,
 }
 
 fn client_source(abs_path: &Path) -> dap::Source {
@@ -2203,10 +2204,10 @@ impl Session {
             count: Some(u64::try_from(max_variables).unwrap_or(u64::MAX)),
             format: None,
         });
-        let adapter = self.adapter.clone();
+        let quirks = self.quirks;
         cx.spawn(async move |_, _| {
             let mut variables = request.await?;
-            Self::normalize_variables_for_adapter(&adapter, &mut variables);
+            Self::normalize_variables_for_adapter(quirks, &mut variables);
             // Adapters may ignore the `count` argument, so enforce the bound here.
             variables.truncate(max_variables);
             Ok(variables)
@@ -3040,38 +3041,16 @@ impl Session {
     }
 
     fn normalize_variables_for_adapter(
-        adapter: &DebugAdapterName,
+        quirks: SessionQuirks,
         variables: &mut [dap::Variable],
     ) {
-        if adapter.0.as_ref() != "Debugpy" {
+        if !quirks.unescape_python_repr {
             return;
         }
 
         for variable in variables.iter_mut() {
             if variable.type_ == Some("str".into()) {
-                // reverse Python repr() escaping
-                let mut unescaped = String::with_capacity(variable.value.len());
-                let mut chars = variable.value.chars();
-                while let Some(c) = chars.next() {
-                    if c != '\\' {
-                        unescaped.push(c);
-                    } else {
-                        match chars.next() {
-                            Some('\\') => unescaped.push('\\'),
-                            Some('n') => unescaped.push('\n'),
-                            Some('t') => unescaped.push('\t'),
-                            Some('r') => unescaped.push('\r'),
-                            Some('\'') => unescaped.push('\''),
-                            Some('"') => unescaped.push('"'),
-                            Some(c) => {
-                                unescaped.push('\\');
-                                unescaped.push(c);
-                            }
-                            None => {}
-                        }
-                    }
-                }
-                variable.value = unescaped;
+                variable.value = unescape_python_repr(&variable.value);
             }
         }
     }
@@ -3096,7 +3075,7 @@ impl Session {
                     return;
                 };
 
-                Self::normalize_variables_for_adapter(&this.adapter, &mut variables);
+                Self::normalize_variables_for_adapter(this.quirks, &mut variables);
 
                 this.active_snapshot
                     .variables
@@ -3627,4 +3606,45 @@ async fn get_or_install_companion(node: NodeRuntime, cx: &mut AsyncApp) -> Resul
         .join(PACKAGE_NAME)
         .join("out")
         .join("cli.js"))
+}
+
+fn unescape_python_repr(value: &str) -> String {
+    // Debugpy reports `str` values with Python repr() escaping, so reverse it
+    // here (e.g. `\n`, `\t`, `\\`) rather than showing escaped noise to the user.
+    let mut unescaped = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            unescaped.push(c);
+        } else {
+            match chars.next() {
+                Some('\\') => unescaped.push('\\'),
+                Some('n') => unescaped.push('\n'),
+                Some('t') => unescaped.push('\t'),
+                Some('r') => unescaped.push('\r'),
+                Some('\'') => unescaped.push('\''),
+                Some('"') => unescaped.push('"'),
+                Some(c) => {
+                    unescaped.push('\\');
+                    unescaped.push(c);
+                }
+                None => {}
+            }
+        }
+    }
+    unescaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unescape_python_repr_decodes_escapes() {
+        assert_eq!(unescape_python_repr(r"'line\nbreak'"), "'line\nbreak'");
+        assert_eq!(unescape_python_repr(r"a\tb"), "a\tb");
+        assert_eq!(unescape_python_repr(r"a\\b"), "a\\b");
+        assert_eq!(unescape_python_repr(r"'it\'s'"), "'it's'");
+        assert_eq!(unescape_python_repr("plain"), "plain");
+    }
 }
