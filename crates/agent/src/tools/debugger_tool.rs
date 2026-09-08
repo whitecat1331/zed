@@ -912,18 +912,27 @@ fn normalize_scenario_config(scenario: &mut DebugScenario) {
     }
 }
 
-/// Route the debuggee's stdio to the debug console (DAP output events) rather
-/// than an integrated terminal, so agent snapshots can include program output.
-/// Only overrides adapters whose launch configs default stdio to a terminal;
-/// an explicit `console`/`terminal`/`stdio` in the config is left untouched.
+/// The `console` value that routes an adapter's debuggee stdio to the debug
+/// console (DAP output events) instead of an integrated terminal, so agent
+/// snapshots can include program output. Centralizes the per-adapter console
+/// quirk in one place; `None` means the adapter routes output itself.
+fn adapter_console_value(adapter: &str) -> Option<&'static str> {
+    // Both adapters use `internalConsole`: Debugpy defaults stdio to a
+    // terminal, and CodeLLDB rejects unknown `console` variants (its serde
+    // enum is case-sensitive camelCase).
+    match adapter {
+        "Debugpy" | "CodeLLDB" => Some("internalConsole"),
+        _ => None,
+    }
+}
+
+/// Route the debuggee's stdio to the debug console rather than an integrated
+/// terminal. Only overrides adapters whose launch configs default stdio to a
+/// terminal; an explicit `console`/`terminal`/`stdio` in the config is left
+/// untouched.
 fn ensure_console_output(scenario: &mut DebugScenario) {
-    let console_value = match scenario.adapter.as_ref() {
-        "Debugpy" => "internalConsole",
-        // CodeLLDB rejects unknown `console` variants, so use one of its
-        // declared values: integratedTerminal | externalTerminal |
-        // internalConsole (its serde enum is case-sensitive camelCase).
-        "CodeLLDB" => "internalConsole",
-        _ => return,
+    let Some(console_value) = adapter_console_value(scenario.adapter.as_ref()) else {
+        return;
     };
     let Value::Object(config) = &mut scenario.config else {
         return;
