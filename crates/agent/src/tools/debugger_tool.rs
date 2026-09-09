@@ -50,11 +50,11 @@ const SESSION_BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 ///   "request", "program", "cwd", ...}`). A nested `"config"` object is
 ///   also accepted. Program output is routed to the debug console so that
 ///   snapshots include it.
-/// - `evaluate` runs an expression in the debuggee (REPL context, like the
-///   Debug Console Evaluate button) and returns the result string plus its
-///   `variables_reference`; pass a `frame_id` from a snapshot to scope the
-///   evaluation to a specific stack frame. It can run code or mutate state, so
-///   it requires Write mode.
+/// - `evaluate` runs an expression in the debuggee using the DAP `watch`
+///   context (the adapter's expression evaluator, not its REPL command
+///   interpreter) and returns the result string plus its `variables_reference`;
+///   pass a `frame_id` from a snapshot to scope the evaluation to a specific
+///   stack frame. It can run code or mutate state, so it requires Write mode.
 /// - `set_variable` changes a variable's value. Pass the container
 ///   `variables_reference` (a scope's `variables_reference` from a snapshot),
 ///   the variable `name`, and the new `value`; follow with a `snapshot` to
@@ -636,7 +636,7 @@ impl DebuggerTool {
                     api.evaluate(
                         session_id,
                         expression,
-                        dap::EvaluateArgumentsContext::Repl,
+                        dap::EvaluateArgumentsContext::Watch,
                         frame_id,
                         cx,
                     )
