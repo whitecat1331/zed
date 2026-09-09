@@ -3,15 +3,15 @@ use crate::tests::{init_test, init_test_workspace, start_debug_session};
 use dap::{
     ErrorResponse, Message, Scope, StackFrame, Variable,
     requests::{
-        Continue, Evaluate, Initialize, Scopes, SetBreakpoints, SetVariable, StackTrace, Threads,
-        Variables,
+        Continue, Evaluate, Initialize, Scopes, SetBreakpoints, SetVariable, StackTrace, StepBack,
+        Threads, Variables,
     },
 };
 use gpui::{BackgroundExecutor, TestAppContext};
 use project::debugger::{
     agent_api::{
         AgentDebuggerApi, AgentDebuggerSessionStatus, AgentDebuggerSnapshotLimits,
-        AgentDebuggerThreadStatus, AgentSourceBreakpointInput,
+        AgentDebuggerStepKind, AgentDebuggerThreadStatus, AgentSourceBreakpointInput,
     },
     session::ThreadId,
 };
@@ -1064,3 +1064,125 @@ async fn test_agent_api_set_variable_rejects_when_unsupported(
         "unexpected error: {error}"
     );
 }
+
+#[gpui::test]
+async fn test_agent_api_step_back(executor: BackgroundExecutor, cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let step_back_thread_id = Arc::new(Mutex::new(None));
+    let session = start_debug_session(&workspace, cx, {
+        let step_back_thread_id = step_back_thread_id.clone();
+        move |client| {
+            client.on_request::<Initialize, _>(move |_, _| {
+                Ok(dap::Capabilities {
+                    supports_step_back: Some(true),
+                    ..Default::default()
+                })
+            });
+            client.on_request::<StepBack, _>({
+                let step_back_thread_id = step_back_thread_id.clone();
+                move |_, args| {
+                    *step_back_thread_id.lock().unwrap() = Some(args.thread_id);
+                    Ok(())
+                }
+            });
+        }
+    })
+    .unwrap();
+
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+    let client = session.update(cx, |session, _| session.adapter_client().unwrap());
+    client
+        .fake_event(dap::messages::Events::Stopped(dap::StoppedEvent {
+            reason: dap::StoppedEventReason::Pause,
+            description: None,
+            thread_id: Some(1),
+            preserve_focus_hint: None,
+            text: None,
+            all_threads_stopped: None,
+            hit_breakpoint_ids: None,
+        }))
+        .await;
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+    cx.update(|cx| {
+        api.step_thread(
+            session_id,
+            ThreadId(1),
+            AgentDebuggerStepKind::Back,
+            Duration::from_millis(100),
+            cx,
+        )
+    })
+    .await
+    .expect("step_back should succeed when the adapter supports it");
+
+    assert_eq!(*step_back_thread_id.lock().unwrap(), Some(1));
+}
+
+#[gpui::test]
+async fn test_agent_api_step_back_rejects_when_unsupported(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let session = start_debug_session(&workspace, cx, |_| {}).unwrap();
+    let client = session.update(cx, |session, _| session.adapter_client().unwrap());
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+
+    client
+        .fake_event(dap::messages::Events::Stopped(dap::StoppedEvent {
+            reason: dap::StoppedEventReason::Pause,
+            description: None,
+            thread_id: Some(1),
+            preserve_focus_hint: None,
+            text: None,
+            all_threads_stopped: None,
+            hit_breakpoint_ids: None,
+        }))
+        .await;
+    cx.run_until_parked();
+
+    // The fake adapter advertises no capabilities, so `step_thread` with the
+    // back kind must fail fast with a clear unsupported-capability error rather
+    // than sending a `stepBack` request.
+    let api = agent_api(&project, cx);
+    let error = cx
+        .update(|cx| {
+            api.step_thread(
+                session_id,
+                ThreadId(1),
+                AgentDebuggerStepKind::Back,
+                Duration::from_millis(100),
+                cx,
+            )
+        })
+        .await
+        .expect_err("step_back should fail when the adapter lacks support");
+
+    assert!(
+        error.to_string().contains("does not support"),
+        "unexpected error: {error}"
+    );
+}
+
