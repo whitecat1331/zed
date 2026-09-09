@@ -30,8 +30,9 @@ const SESSION_BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Interact with Zed's debugger. Read-only operations such as `snapshot`,
 /// `list_sessions`, `list_breakpoints`, and `list_adapters` are available in
-/// Ask mode. Operations that start sessions, change breakpoints, or control
-/// execution require Write mode and user permission.
+/// Ask mode. Operations that start sessions, change breakpoints, control
+/// execution, evaluate expressions, or change variables require Write mode and
+/// user permission.
 ///
 /// Prefer `snapshot` when inspecting a paused debug session: it returns a
 /// bounded view of threads, stack frames, source context, variables, and recent
@@ -49,8 +50,15 @@ const SESSION_BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 ///   "request", "program", "cwd", ...}`). A nested `"config"` object is
 ///   also accepted. Program output is routed to the debug console so that
 ///   snapshots include it.
-/// - Do not use this tool for expression evaluation; evaluation is intentionally
-///   not available.
+/// - `evaluate` runs an expression in the debuggee (REPL context, like the
+///   Debug Console Evaluate button) and returns the result string plus its
+///   `variables_reference`; pass a `frame_id` from a snapshot to scope the
+///   evaluation to a specific stack frame. It can run code or mutate state, so
+///   it requires Write mode.
+/// - `set_variable` changes a variable's value. Pass the container
+///   `variables_reference` (a scope's `variables_reference` from a snapshot),
+///   the variable `name`, and the new `value`; follow with a `snapshot` to
+///   confirm. Requires Write mode.
 /// </guidelines>
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -74,6 +82,10 @@ pub enum DebuggerOperation {
     StartSession,
     /// Stop a debug session.
     StopSession,
+    /// Evaluate an expression in a debug session.
+    Evaluate,
+    /// Set the value of a variable in a debug session.
+    SetVariable,
 }
 
 /// A single debugger operation and the fields it needs.
@@ -121,6 +133,21 @@ pub struct DebuggerToolInput {
     /// Optional worktree id for start_session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_id: Option<u64>,
+    /// Expression to evaluate, used by evaluate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression: Option<String>,
+    /// Stack frame id, used by evaluate and set_variable to scope the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_id: Option<u64>,
+    /// Variable container reference, used by set_variable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variables_reference: Option<u64>,
+    /// Variable name, used by set_variable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// New variable value, used by set_variable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -588,6 +615,72 @@ impl DebuggerTool {
                     json!({ "session_id": session_id }),
                 ))
             }
+            DebuggerOperation::Evaluate => {
+                self.ensure_write_mode(&operation, cx)?;
+                let expression = input
+                    .expression
+                    .context("expression is required for debugger evaluate")?;
+                let frame_id = input.frame_id;
+                let api = cx.update(|cx| self.api(cx));
+                let session_id =
+                    cx.update(|cx| resolve_session_id(&self.project, &api, input.session_id, cx))?;
+                authorize_debugger_operation(
+                    &event_stream,
+                    format!("Debugger evaluate {}", MarkdownInlineCode(&expression)),
+                    evaluate_permission_inputs(&operation, session_id, &expression, frame_id)?,
+                    cx,
+                )
+                .await?;
+                let _guard = api.acquire_agent_control(session_id, cx)?;
+                let task = cx.update(|cx| {
+                    api.evaluate(
+                        session_id,
+                        expression,
+                        dap::EvaluateArgumentsContext::Repl,
+                        frame_id,
+                        cx,
+                    )
+                });
+                let result = task.await?;
+                Ok(success(
+                    operation,
+                    "evaluated expression",
+                    evaluate_result_to_json(result),
+                ))
+            }
+            DebuggerOperation::SetVariable => {
+                self.ensure_write_mode(&operation, cx)?;
+                let frame_id = input.frame_id;
+                let variables_reference = input
+                    .variables_reference
+                    .context("variables_reference is required for debugger set_variable")?;
+                let name = input
+                    .name
+                    .context("name is required for debugger set_variable")?;
+                let value = input
+                    .value
+                    .context("value is required for debugger set_variable")?;
+                let api = cx.update(|cx| self.api(cx));
+                let session_id =
+                    cx.update(|cx| resolve_session_id(&self.project, &api, input.session_id, cx))?;
+                authorize_debugger_operation(
+                    &event_stream,
+                    format!("Debugger set variable {}", MarkdownInlineCode(&name)),
+                    set_variable_permission_inputs(&operation, session_id, &name, &value)?,
+                    cx,
+                )
+                .await?;
+                let _guard = api.acquire_agent_control(session_id, cx)?;
+                let task = cx.update(|cx| {
+                    api.set_variable(session_id, frame_id, variables_reference, name, value, cx)
+                });
+                let result = task.await?;
+                Ok(success(
+                    operation,
+                    "set variable value",
+                    set_variable_result_to_json(result),
+                ))
+            }
         }
     }
 
@@ -862,6 +955,42 @@ fn control_permission_input(input: &ResolvedControlInput) -> String {
     value
 }
 
+fn evaluate_permission_inputs(
+    operation: &str,
+    session_id: SessionId,
+    expression: &str,
+    frame_id: Option<u64>,
+) -> Result<Vec<String>> {
+    let expression = permission_value_to_string(&expression, "evaluate expression")?;
+    let frame_id = frame_id
+        .map(|frame_id| frame_id.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    Ok(permission_inputs(
+        operation,
+        [format!(
+            "session_id:{} expression:{} frame_id:{}",
+            session_id.0, expression, frame_id
+        )],
+    ))
+}
+
+fn set_variable_permission_inputs(
+    operation: &str,
+    session_id: SessionId,
+    name: &str,
+    value: &str,
+) -> Result<Vec<String>> {
+    let name = permission_value_to_string(&name, "set_variable name")?;
+    let value = permission_value_to_string(&value, "set_variable value")?;
+    Ok(permission_inputs(
+        operation,
+        [format!(
+            "session_id:{} name:{} value:{}",
+            session_id.0, name, value
+        )],
+    ))
+}
+
 #[cfg(test)]
 pub fn control_permission_inputs_for_test(
     operation: &str,
@@ -1055,6 +1184,8 @@ fn operation_name(input: &DebuggerToolInput) -> &'static str {
         DebuggerOperation::ListAdapters => "list_adapters",
         DebuggerOperation::StartSession => "start_session",
         DebuggerOperation::StopSession => "stop_session",
+        DebuggerOperation::Evaluate => "evaluate",
+        DebuggerOperation::SetVariable => "set_variable",
     }
 }
 
@@ -1123,6 +1254,22 @@ fn initial_title_for_input(input: &DebuggerToolInput) -> SharedString {
             .session_id
             .map(|session_id| format!("Stop debug session {session_id}").into())
             .unwrap_or_else(|| "Stop debug session".into()),
+        DebuggerOperation::Evaluate => input
+            .expression
+            .as_ref()
+            .map(|expression| {
+                format!(
+                    "Evaluate debugger expression {}",
+                    MarkdownInlineCode(expression)
+                )
+                .into()
+            })
+            .unwrap_or_else(|| "Evaluate debugger expression".into()),
+        DebuggerOperation::SetVariable => input
+            .name
+            .as_ref()
+            .map(|name| format!("Set debugger variable {}", MarkdownInlineCode(name)).into())
+            .unwrap_or_else(|| "Set debugger variable".into()),
     }
 }
 
@@ -1402,6 +1549,22 @@ fn control_result_to_json(result: AgentDebuggerControlResult) -> Value {
     })
 }
 
+fn evaluate_result_to_json(result: AgentDebuggerEvaluateResult) -> Value {
+    json!({
+        "result": result.result,
+        "type": result.type_name,
+        "variables_reference": result.variables_reference,
+    })
+}
+
+fn set_variable_result_to_json(result: AgentDebuggerSetVariableResult) -> Value {
+    json!({
+        "value": result.value,
+        "type": result.type_name,
+        "variables_reference": result.variables_reference,
+    })
+}
+
 fn snapshot_to_json(snapshot: AgentDebuggerSnapshot) -> Value {
     json!({
         "session": session_to_json(snapshot.session),
@@ -1553,5 +1716,35 @@ mod tests {
         let mut spread = scenario("Debugpy", json!({"request": "launch"}));
         normalize_scenario_config(&mut spread);
         assert_eq!(spread.config["request"], "launch");
+    }
+
+    #[test]
+    fn evaluate_permission_inputs_include_expression_and_frame() {
+        let inputs =
+            evaluate_permission_inputs("evaluate", SessionId::from_proto(7), "a + b", Some(3))
+                .unwrap();
+        assert_eq!(
+            inputs,
+            vec!["evaluate session_id:7 expression:\"a + b\" frame_id:3".to_string()]
+        );
+
+        let inputs =
+            evaluate_permission_inputs("evaluate", SessionId::from_proto(7), "a + b", None)
+                .unwrap();
+        assert_eq!(
+            inputs,
+            vec!["evaluate session_id:7 expression:\"a + b\" frame_id:none".to_string()]
+        );
+    }
+
+    #[test]
+    fn set_variable_permission_inputs_include_name_and_value() {
+        let inputs =
+            set_variable_permission_inputs("set_variable", SessionId::from_proto(7), "count", "42")
+                .unwrap();
+        assert_eq!(
+            inputs,
+            vec!["set_variable session_id:7 name:\"count\" value:\"42\"".to_string()]
+        );
     }
 }
