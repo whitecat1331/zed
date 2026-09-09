@@ -184,6 +184,7 @@ pub enum AgentDebuggerStepKind {
     In,
     Out,
     Over,
+    Back,
 }
 
 #[derive(Clone, Debug)]
@@ -470,6 +471,9 @@ impl AgentDebuggerApi {
                     }
                     AgentDebuggerStepKind::Over => {
                         session.agent_step_over(thread_id, SteppingGranularity::Line, cx)
+                    }
+                    AgentDebuggerStepKind::Back => {
+                        session.agent_step_back(thread_id, SteppingGranularity::Line, cx)
                     }
                 })
                 .await?;

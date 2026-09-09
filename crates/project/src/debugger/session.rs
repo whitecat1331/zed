@@ -2461,6 +2461,32 @@ impl Session {
         self.agent_resume_request(thread_id, command, cx)
     }
 
+    pub(crate) fn agent_step_back(
+        &mut self,
+        thread_id: ThreadId,
+        granularity: SteppingGranularity,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.select_historic_snapshot(None, cx);
+
+        let supports_single_thread_execution_requests =
+            self.capabilities.supports_single_thread_execution_requests;
+        let supports_stepping_granularity = self
+            .capabilities
+            .supports_stepping_granularity
+            .unwrap_or_default();
+        let command = StepBackCommand {
+            inner: StepCommand {
+                thread_id: thread_id.0,
+                granularity: supports_stepping_granularity.then(|| granularity),
+                single_thread: supports_single_thread_execution_requests,
+            },
+        };
+
+        self.active_snapshot.thread_states.process_step(thread_id);
+        self.agent_resume_request(thread_id, command, cx)
+    }
+
     pub(crate) fn agent_run_to_position(
         &mut self,
         breakpoint: SourceBreakpoint,
