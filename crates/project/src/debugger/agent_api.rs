@@ -5,8 +5,8 @@ use super::{
 };
 use anyhow::{Context as _, Result, anyhow};
 use dap::{
-    StackFrameId, StackFramePresentationHint, SteppingGranularity, VariableReference,
-    client::SessionId,
+    EvaluateArgumentsContext, StackFrameId, StackFramePresentationHint, SteppingGranularity,
+    VariableReference, client::SessionId,
 };
 use futures::{FutureExt as _, select_biased};
 use gpui::{App, AsyncApp, Entity, Subscription, Task};
@@ -196,6 +196,20 @@ pub struct AgentDebuggerControlResult {
     pub notes: Vec<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct AgentDebuggerEvaluateResult {
+    pub result: String,
+    pub type_name: Option<String>,
+    pub variables_reference: VariableReference,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentDebuggerSetVariableResult {
+    pub value: String,
+    pub type_name: Option<String>,
+    pub variables_reference: Option<VariableReference>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentDebuggerWaitStatus {
     Stopped,
@@ -207,6 +221,14 @@ struct AgentDebuggerStopWait {
     receiver: futures::channel::oneshot::Receiver<AgentDebuggerWaitEvent>,
     _stopped_subscription: Subscription,
     _shutdown_subscription: Subscription,
+}
+
+/// RAII guard that releases a session's agent-control flag when dropped.
+///
+/// Dropping the guard signals a detached task to clear the flag on the session,
+/// so a cancelled tool turn can never leave the debugger UI locked.
+pub struct AgentDebuggerControlGuard {
+    _release_sender: futures::channel::oneshot::Sender<()>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -513,6 +535,76 @@ impl AgentDebuggerApi {
                     .push(format!("Timed out before reaching line {line}"));
             }
             Ok(result)
+        })
+    }
+
+    pub fn evaluate(
+        &self,
+        session_id: SessionId,
+        expression: String,
+        context: EvaluateArgumentsContext,
+        frame_id: Option<u64>,
+        cx: &mut App,
+    ) -> Task<Result<AgentDebuggerEvaluateResult>> {
+        let dap_store = self.dap_store.clone();
+        cx.spawn(async move |cx| {
+            let session = session_by_id(&dap_store, session_id, cx)?;
+            let response = session
+                .update(cx, |session, cx| {
+                    session.agent_evaluate(expression, Some(context), frame_id, cx)
+                })
+                .await?;
+            Ok(AgentDebuggerEvaluateResult {
+                result: response.result,
+                type_name: response.type_,
+                variables_reference: response.variables_reference,
+            })
+        })
+    }
+
+    pub fn set_variable(
+        &self,
+        session_id: SessionId,
+        frame_id: Option<u64>,
+        variables_reference: VariableReference,
+        name: String,
+        value: String,
+        cx: &mut App,
+    ) -> Task<Result<AgentDebuggerSetVariableResult>> {
+        let dap_store = self.dap_store.clone();
+        cx.spawn(async move |cx| {
+            let session = session_by_id(&dap_store, session_id, cx)?;
+            let response = session
+                .update(cx, |session, cx| {
+                    session.agent_set_variable(frame_id, variables_reference, name, value, cx)
+                })
+                .await?;
+            Ok(AgentDebuggerSetVariableResult {
+                value: response.value,
+                type_name: response.type_,
+                variables_reference: response.variables_reference,
+            })
+        })
+    }
+
+    pub fn acquire_agent_control(
+        &self,
+        session_id: SessionId,
+        cx: &mut AsyncApp,
+    ) -> Result<AgentDebuggerControlGuard> {
+        let session = session_by_id(&self.dap_store, session_id, cx)?;
+        session.update(cx, |session, cx| session.set_agent_control(true, cx));
+        let (release_sender, release_receiver) = futures::channel::oneshot::channel();
+        let weak_session = session.downgrade();
+        cx.spawn(async move |cx| {
+            let _ = release_receiver.await;
+            if let Some(session) = weak_session.upgrade() {
+                session.update(cx, |session, cx| session.set_agent_control(false, cx));
+            }
+        })
+        .detach();
+        Ok(AgentDebuggerControlGuard {
+            _release_sender: release_sender,
         })
     }
 

@@ -721,6 +721,7 @@ pub struct Session {
     output: Box<circular_buffer::CircularBuffer<MAX_TRACKED_OUTPUT_EVENTS, dap::OutputEvent>>,
     watchers: HashMap<SharedString, Watcher>,
     is_session_terminated: bool,
+    agent_control: bool,
     requests: TypeIdHashMap<HashMap<RequestSlot, Shared<Task<Option<()>>>>>,
     pub(crate) breakpoint_store: Entity<BreakpointStore>,
     ignore_breakpoints: bool,
@@ -897,6 +898,7 @@ impl Session {
                 background_tasks: Vec::default(),
                 restart_task: None,
                 is_session_terminated: false,
+                agent_control: false,
                 ignore_breakpoints: false,
                 breakpoint_store,
                 data_breakpoints: Default::default(),
@@ -1116,6 +1118,15 @@ impl Session {
 
     pub fn capabilities(&self) -> &Capabilities {
         &self.capabilities
+    }
+
+    pub(crate) fn set_agent_control(&mut self, control: bool, cx: &mut Context<Self>) {
+        self.agent_control = control;
+        cx.notify();
+    }
+
+    pub fn agent_control(&self) -> bool {
+        self.agent_control
     }
 
     pub fn binary(&self) -> Option<&DebugAdapterBinary> {
@@ -3040,10 +3051,7 @@ impl Session {
         self.watchers.remove(&expression);
     }
 
-    fn normalize_variables_for_adapter(
-        quirks: SessionQuirks,
-        variables: &mut [dap::Variable],
-    ) {
+    fn normalize_variables_for_adapter(quirks: SessionQuirks, variables: &mut [dap::Variable]) {
         if !quirks.unescape_python_repr {
             return;
         }
@@ -3201,6 +3209,110 @@ impl Session {
                 cx.notify();
             })
             .ok();
+        })
+    }
+
+    pub(crate) fn agent_evaluate(
+        &mut self,
+        expression: String,
+        context: Option<EvaluateArgumentsContext>,
+        frame_id: Option<u64>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<dap::EvaluateResponse>> {
+        let event = dap::OutputEvent {
+            category: None,
+            output: format!("> {expression}"),
+            group: None,
+            variables_reference: None,
+            source: None,
+            line: None,
+            column: None,
+            data: None,
+            location_reference: None,
+        };
+        self.push_output(event);
+        let request = self.state.request_dap(EvaluateCommand {
+            expression,
+            context,
+            frame_id,
+            source: None,
+        });
+        cx.spawn(async move |this, cx| {
+            let response = request.await;
+            this.update(cx, |this, cx| {
+                this.memory.clear(cx.background_executor());
+                this.invalidate_command_type::<ReadMemory>();
+                this.invalidate_command_type::<VariablesCommand>();
+                cx.emit(SessionEvent::Variables);
+                match response {
+                    Ok(response) => {
+                        let event = dap::OutputEvent {
+                            category: None,
+                            output: format!("< {}", response.result),
+                            group: None,
+                            variables_reference: Some(response.variables_reference),
+                            source: None,
+                            line: None,
+                            column: None,
+                            data: None,
+                            location_reference: None,
+                        };
+                        this.push_output(event);
+                        cx.notify();
+                        Ok(response)
+                    }
+                    Err(e) => {
+                        let event = dap::OutputEvent {
+                            category: None,
+                            output: format!("{}", e),
+                            group: None,
+                            variables_reference: None,
+                            source: None,
+                            line: None,
+                            column: None,
+                            data: None,
+                            location_reference: None,
+                        };
+                        this.push_output(event);
+                        cx.notify();
+                        Err(e)
+                    }
+                }
+            })?
+        })
+    }
+
+    pub(crate) fn agent_set_variable(
+        &mut self,
+        frame_id: Option<u64>,
+        variables_reference: u64,
+        name: String,
+        value: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<dap::SetVariableResponse>> {
+        if !self.capabilities.supports_set_variable.unwrap_or_default() {
+            return Task::ready(Err(anyhow!(
+                "debug adapter does not support setting variable values"
+            )));
+        }
+        let request = self.state.request_dap(SetVariableValueCommand {
+            name,
+            value,
+            variables_reference,
+        });
+        cx.spawn(async move |this, cx| {
+            let response = request.await?;
+            this.update(cx, |this, cx| {
+                this.invalidate_command_type::<VariablesCommand>();
+                this.invalidate_command_type::<ReadMemory>();
+                this.memory.clear(cx.background_executor());
+                if let Some(frame_id) = frame_id {
+                    this.refresh_watchers(frame_id, cx);
+                }
+                cx.emit(SessionEvent::Variables);
+                cx.notify();
+            })?;
+            Ok(response)
         })
     }
 
