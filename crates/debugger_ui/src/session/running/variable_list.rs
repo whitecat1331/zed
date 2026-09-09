@@ -899,6 +899,9 @@ impl VariableList {
     }
 
     fn edit_variable(&mut self, _: &EditVariable, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session.read(cx).agent_control() {
+            return;
+        }
         let Some(selection) = self.selection.as_ref() else {
             return;
         };

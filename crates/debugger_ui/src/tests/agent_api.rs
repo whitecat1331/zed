@@ -2,7 +2,10 @@
 use crate::tests::{init_test, init_test_workspace, start_debug_session};
 use dap::{
     ErrorResponse, Message, Scope, StackFrame, Variable,
-    requests::{Continue, Scopes, SetBreakpoints, StackTrace, Threads, Variables},
+    requests::{
+        Continue, Evaluate, Initialize, Scopes, SetBreakpoints, SetVariable, StackTrace, Threads,
+        Variables,
+    },
 };
 use gpui::{BackgroundExecutor, TestAppContext};
 use project::debugger::{
@@ -918,5 +921,146 @@ async fn test_agent_api_snapshot_keeps_synthetic_placeholder_thread(
             .any(|note| note.contains("Synthetic `Dummy` thread has no stack")),
         "expected the synthetic-placeholder note, got {:?}",
         snapshot.notes
+    );
+}
+
+#[gpui::test]
+async fn test_agent_api_evaluate(executor: BackgroundExecutor, cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let session = start_debug_session(&workspace, cx, |_| {}).unwrap();
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+    let client = session.update(cx, |session, _| session.adapter_client().unwrap());
+
+    client.on_request::<Evaluate, _>(move |_, args| {
+        assert_eq!(args.expression, "1 + 1");
+        Ok(dap::EvaluateResponse {
+            result: "2".into(),
+            type_: Some("int".into()),
+            presentation_hint: None,
+            variables_reference: 0,
+            named_variables: None,
+            indexed_variables: None,
+            memory_reference: None,
+            value_location_reference: None,
+        })
+    });
+
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+    let result = cx
+        .update(|cx| {
+            api.evaluate(
+                session_id,
+                "1 + 1".into(),
+                dap::EvaluateArgumentsContext::Repl,
+                None,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.result, "2");
+    assert_eq!(result.type_name.as_deref(), Some("int"));
+    assert_eq!(result.variables_reference, 0);
+}
+
+#[gpui::test]
+async fn test_agent_api_set_variable(executor: BackgroundExecutor, cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let session = start_debug_session(&workspace, cx, |client| {
+        // Advertise setVariable support before the session sends its
+        // `initialize` request, so the capability gate passes.
+        client.on_request::<Initialize, _>(move |_, _| {
+            Ok(dap::Capabilities {
+                supports_set_variable: Some(true),
+                ..Default::default()
+            })
+        });
+        client.on_request::<SetVariable, _>(move |_, args| {
+            assert_eq!(args.name, "a");
+            assert_eq!(args.value, "2");
+            assert_eq!(args.variables_reference, 100);
+            Ok(dap::SetVariableResponse {
+                value: "2".into(),
+                type_: Some("int".into()),
+                variables_reference: Some(0),
+                named_variables: None,
+                indexed_variables: None,
+                memory_reference: None,
+                value_location_reference: None,
+            })
+        });
+    })
+    .unwrap();
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+    let result = cx
+        .update(|cx| api.set_variable(session_id, None, 100, "a".into(), "2".into(), cx))
+        .await
+        .unwrap();
+
+    assert_eq!(result.value, "2");
+    assert_eq!(result.type_name.as_deref(), Some("int"));
+    assert_eq!(result.variables_reference, Some(0));
+}
+
+#[gpui::test]
+async fn test_agent_api_set_variable_rejects_when_unsupported(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let session = start_debug_session(&workspace, cx, |_| {}).unwrap();
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+
+    cx.run_until_parked();
+
+    // The fake adapter advertises no capabilities, so `set_variable` must
+    // fail fast with a clear unsupported-capability error rather than sending
+    // a `setVariable` request.
+    let api = agent_api(&project, cx);
+    let error = cx
+        .update(|cx| api.set_variable(session_id, None, 100, "a".into(), "2".into(), cx))
+        .await
+        .expect_err("set_variable should fail when the adapter lacks support");
+
+    assert!(
+        error.to_string().contains("does not support"),
+        "unexpected error: {error}"
     );
 }

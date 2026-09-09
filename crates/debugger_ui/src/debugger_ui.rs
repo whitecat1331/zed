@@ -363,6 +363,9 @@ pub fn init(cx: &mut App) {
                     window.on_action(
                         TypeId::of::<editor::actions::EvaluateSelectedText>(),
                         move |_, _, window, cx| {
+                            if active_session.read(cx).agent_control() {
+                                return;
+                            }
                             let status = maybe!({
                                 let text = editor
                                     .update(cx, |editor, cx| {

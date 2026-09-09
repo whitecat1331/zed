@@ -104,6 +104,7 @@ impl Console {
 
         let _subscriptions = vec![
             cx.subscribe(&stack_frame_list, Self::handle_stack_frame_list_events),
+            cx.observe(&session, |_, _, cx| cx.notify()),
             cx.on_focus(&focus_handle, window, |console, window, cx| {
                 if console.is_running(cx) {
                     console.query_bar.focus_handle(cx).focus(window, cx);
@@ -258,6 +259,9 @@ impl Console {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.session.read(cx).agent_control() {
+            return;
+        }
         let expression = self.query_bar.update(cx, |editor, cx| {
             let expression = editor.text(cx);
             cx.defer_in(window, |editor, window, cx| {
@@ -310,6 +314,9 @@ impl Console {
     }
 
     fn evaluate(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session.read(cx).agent_control() {
+            return;
+        }
         let expression = self.query_bar.update(cx, |editor, cx| {
             let expression = editor.text(cx);
             cx.defer_in(window, |editor, window, cx| {
@@ -447,6 +454,7 @@ impl Console {
 impl Render for Console {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let query_focus_handle = self.query_bar.focus_handle(cx);
+        let agent_control = self.session.read(cx).agent_control();
         self.update_output(window, cx);
 
         v_flex()
@@ -476,17 +484,24 @@ impl Render for Console {
                             })
                             .layer(ui::ElevationIndex::ModalSurface)
                             .size(ui::ButtonSize::Compact)
+                            .disabled(agent_control)
                             .child(Label::new("Evaluate"))
                             .tooltip({
                                 let query_focus_handle = query_focus_handle.clone();
 
-                                move |_window, cx| {
-                                    Tooltip::for_action_in(
-                                        "Evaluate",
-                                        &Confirm,
-                                        &query_focus_handle,
-                                        cx,
-                                    )
+                                move |window, cx| {
+                                    if agent_control {
+                                        Tooltip::text("Agent is controlling the debugger")(
+                                            window, cx,
+                                        )
+                                    } else {
+                                        Tooltip::for_action_in(
+                                            "Evaluate",
+                                            &Confirm,
+                                            &query_focus_handle,
+                                            cx,
+                                        )
+                                    }
                                 }
                             }),
                             self.render_submit_menu(
