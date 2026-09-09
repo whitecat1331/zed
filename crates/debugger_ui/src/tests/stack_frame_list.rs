@@ -16,7 +16,7 @@ use gpui::{BackgroundExecutor, TestAppContext, VisualTestContext};
 use project::{FakeFs, Project};
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use unindent::Unindent as _;
 use util::{path, rel_path::rel_path};
 use workspace::Item;
@@ -1400,4 +1400,108 @@ async fn test_go_to_stack_frame_roots_worktree_at_parent_directory(
         PathBuf::from(path!("/outside")).into()
     );
     assert_eq!(relative_path.as_ref(), rel_path("lib.js"));
+}
+
+#[gpui::test]
+async fn test_synthetic_dummy_thread_does_not_request_stack_frames(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(path!("/project"), json!({ "main.js": "" }))
+        .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let cx = &mut VisualTestContext::from_window(*workspace, cx);
+    let session = start_debug_session(&workspace, cx, |_| {}).unwrap();
+    let client = session.update(cx, |session, _| session.adapter_client().unwrap());
+
+    // Delve synthesizes a "Dummy" thread before the first real goroutine exists;
+    // it has no stack, and requesting one fails with "unknown goroutine 1". The
+    // fix short-circuits Session::stack_frames for it, so a StackTrace request
+    // must never be issued and the frame panel must not surface an error banner.
+    client.on_request::<Threads, _>(move |_, _| {
+        Ok(dap::ThreadsResponse {
+            threads: vec![dap::Thread {
+                id: 1,
+                name: "Dummy".into(),
+            }],
+        })
+    });
+
+    let stack_trace_requested = Arc::new(AtomicBool::new(false));
+    client.on_request::<StackTrace, _>({
+        let stack_trace_requested = stack_trace_requested.clone();
+        move |_, _| {
+            stack_trace_requested.store(true, Ordering::SeqCst);
+            Ok(dap::StackTraceResponse {
+                stack_frames: Vec::new(),
+                total_frames: None,
+            })
+        }
+    });
+
+    client
+        .fake_event(dap::messages::Events::Stopped(dap::StoppedEvent {
+            reason: dap::StoppedEventReason::Pause,
+            description: None,
+            thread_id: Some(1),
+            preserve_focus_hint: None,
+            text: None,
+            all_threads_stopped: None,
+            hit_breakpoint_ids: None,
+        }))
+        .await;
+
+    cx.run_until_parked();
+
+    // trigger to load threads
+    active_debug_session_panel(workspace, cx).update(cx, |session, cx| {
+        session.running_state().update(cx, |running_state, cx| {
+            running_state
+                .session()
+                .update(cx, |session, cx| session.threads(cx));
+        });
+    });
+
+    cx.run_until_parked();
+
+    // select first thread (the Dummy thread)
+    active_debug_session_panel(workspace, cx).update_in(cx, |session, window, cx| {
+        session.running_state().update(cx, |running_state, cx| {
+            running_state.select_current_thread(
+                &running_state
+                    .session()
+                    .update(cx, |session, cx| session.threads(cx)),
+                window,
+                cx,
+            );
+        });
+    });
+
+    cx.run_until_parked();
+
+    active_debug_session_panel(workspace, cx).update(cx, |session, cx| {
+        let stack_frame_list = session
+            .running_state()
+            .update(cx, |state, _| state.stack_frame_list().clone());
+
+        stack_frame_list.update(cx, |stack_frame_list, cx| {
+            assert!(
+                stack_frame_list.dap_stack_frames(cx).is_empty(),
+                "expected no stack frames for the synthetic Dummy thread"
+            );
+        });
+    });
+
+    // Let any (incorrectly issued) StackTrace request land before asserting.
+    cx.run_until_parked();
+
+    assert!(
+        !stack_trace_requested.load(Ordering::SeqCst),
+        "expected Session::stack_frames to short-circuit the Dummy thread without issuing a StackTrace request"
+    );
 }
