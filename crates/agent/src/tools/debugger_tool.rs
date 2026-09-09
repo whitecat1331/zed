@@ -247,6 +247,7 @@ pub enum ControlAction {
     StepOver,
     StepIn,
     StepOut,
+    StepBack,
     RunToLine,
 }
 
@@ -785,6 +786,18 @@ impl DebuggerTool {
                 });
                 task.await
             }
+            ControlAction::StepBack => {
+                let task = cx.update(|cx| {
+                    api.step_thread(
+                        session_id,
+                        thread_id,
+                        AgentDebuggerStepKind::Back,
+                        timeout,
+                        cx,
+                    )
+                });
+                task.await
+            }
             ControlAction::RunToLine => {
                 let path = input
                     .path
@@ -831,6 +844,7 @@ impl ControlAction {
             ControlAction::StepOver => "step over",
             ControlAction::StepIn => "step in",
             ControlAction::StepOut => "step out",
+            ControlAction::StepBack => "step back",
             ControlAction::RunToLine => "run to line",
         }
     }
@@ -842,6 +856,7 @@ impl ControlAction {
             ControlAction::StepOver => "step_over",
             ControlAction::StepIn => "step_in",
             ControlAction::StepOut => "step_out",
+            ControlAction::StepBack => "step_back",
             ControlAction::RunToLine => "run_to_line",
         }
     }
@@ -1426,6 +1441,7 @@ async fn choose_thread_for_action(
         | ControlAction::StepOver
         | ControlAction::StepIn
         | ControlAction::StepOut
+        | ControlAction::StepBack
         | ControlAction::RunToLine => AgentDebuggerThreadStatus::Stopped,
     };
 
@@ -1477,6 +1493,7 @@ async fn choose_thread_for_action(
                 | ControlAction::StepOver
                 | ControlAction::StepIn
                 | ControlAction::StepOut
+                | ControlAction::StepBack
                 | ControlAction::RunToLine => {
                     if has_threads {
                         Err(anyhow!(

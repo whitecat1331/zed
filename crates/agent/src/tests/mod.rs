@@ -1448,6 +1448,28 @@ fn test_debugger_tool_permission_rules_match_resolved_control_ids() {
     ));
 }
 
+#[test]
+fn test_debugger_tool_step_back_permission_name() {
+    let inputs = control_permission_inputs_for_test(
+        "control",
+        ControlInput {
+            session_id: None,
+            thread_id: None,
+            action: ControlAction::StepBack,
+            path: None,
+            line: None,
+            timeout_ms: None,
+            snapshot_limits: None,
+        },
+        12,
+        34,
+    );
+    assert_eq!(
+        inputs,
+        vec!["control action:step_back session_id:12 thread_id:34"]
+    );
+}
+
 #[gpui::test]
 async fn test_debugger_tool_permission_rules_match_resolved_paths(cx: &mut TestAppContext) {
     let ThreadTest { thread, fs, .. } = setup(cx, TestModel::Fake).await;
