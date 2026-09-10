@@ -4,8 +4,8 @@ use dap::{
     ErrorResponse, Message, Scope, StackFrame, Variable,
     adapters::DebugTaskDefinition,
     requests::{
-        Continue, Disconnect, Evaluate, Initialize, Restart, RestartFrame, Scopes, SetBreakpoints,
-        SetVariable, StackTrace, StepBack, Threads, Variables,
+        Attach, Continue, Disconnect, Evaluate, Initialize, Restart, RestartFrame, Scopes,
+        SetBreakpoints, SetVariable, StackTrace, StepBack, Threads, Variables,
     },
 };
 use gpui::{BackgroundExecutor, TestAppContext};
@@ -1375,6 +1375,7 @@ async fn test_agent_api_detach(executor: BackgroundExecutor, cx: &mut TestAppCon
         {
             let disconnect_received = disconnect_received.clone();
             move |client| {
+                client.on_request::<Attach, _>(move |_, _| Ok(()));
                 client.on_request::<Disconnect, _>({
                     let disconnect_received = disconnect_received.clone();
                     move |_, args| {
