@@ -1,10 +1,11 @@
 #![expect(clippy::result_large_err)]
-use crate::tests::{init_test, init_test_workspace, start_debug_session};
+use crate::tests::{init_test, init_test_workspace, start_debug_session, start_debug_session_with};
 use dap::{
     ErrorResponse, Message, Scope, StackFrame, Variable,
+    adapters::DebugTaskDefinition,
     requests::{
-        Continue, Evaluate, Initialize, Scopes, SetBreakpoints, SetVariable, StackTrace, StepBack,
-        Threads, Variables,
+        Continue, Disconnect, Evaluate, Initialize, Restart, RestartFrame, Scopes, SetBreakpoints,
+        SetVariable, StackTrace, StepBack, Threads, Variables,
     },
 };
 use gpui::{BackgroundExecutor, TestAppContext};
@@ -1186,3 +1187,248 @@ async fn test_agent_api_step_back_rejects_when_unsupported(
     );
 }
 
+#[gpui::test]
+async fn test_agent_api_restart(executor: BackgroundExecutor, cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let restart_received = Arc::new(Mutex::new(false));
+    let session = start_debug_session(&workspace, cx, {
+        let restart_received = restart_received.clone();
+        move |client| {
+            client.on_request::<Initialize, _>(move |_, _| {
+                Ok(dap::Capabilities {
+                    supports_restart_request: Some(true),
+                    ..Default::default()
+                })
+            });
+            client.on_request::<Restart, _>({
+                let restart_received = restart_received.clone();
+                move |_, _| {
+                    *restart_received.lock().unwrap() = true;
+                    Ok(())
+                }
+            });
+        }
+    })
+    .unwrap();
+
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+    cx.update(|cx| api.restart_session(session_id, cx))
+        .await
+        .expect("restart should succeed when the adapter supports it");
+
+    assert!(*restart_received.lock().unwrap());
+}
+
+#[gpui::test]
+async fn test_agent_api_restart_rejects_when_unsupported(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let session = start_debug_session(&workspace, cx, |_| {}).unwrap();
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+
+    cx.run_until_parked();
+
+    // The fake adapter advertises no capabilities, so `restart` must fail fast
+    // with a clear unsupported-capability error rather than sending a restart
+    // request.
+    let api = agent_api(&project, cx);
+    let error = cx
+        .update(|cx| api.restart_session(session_id, cx))
+        .await
+        .expect_err("restart should fail when the adapter lacks support");
+
+    assert!(
+        error.to_string().contains("does not support"),
+        "unexpected error: {error}"
+    );
+}
+
+#[gpui::test]
+async fn test_agent_api_restart_stack_frame(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let restart_frame_id = Arc::new(Mutex::new(None));
+    let session = start_debug_session(&workspace, cx, {
+        let restart_frame_id = restart_frame_id.clone();
+        move |client| {
+            client.on_request::<Initialize, _>(move |_, _| {
+                Ok(dap::Capabilities {
+                    supports_restart_frame: Some(true),
+                    ..Default::default()
+                })
+            });
+            client.on_request::<RestartFrame, _>({
+                let restart_frame_id = restart_frame_id.clone();
+                move |_, args| {
+                    *restart_frame_id.lock().unwrap() = Some(args.frame_id);
+                    Ok(())
+                }
+            });
+        }
+    })
+    .unwrap();
+
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+    cx.update(|cx| api.restart_stack_frame(session_id, 7, cx))
+        .await
+        .expect("restart frame should succeed when the adapter supports it");
+
+    assert_eq!(*restart_frame_id.lock().unwrap(), Some(7));
+}
+
+#[gpui::test]
+async fn test_agent_api_restart_stack_frame_rejects_when_unsupported(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let session = start_debug_session(&workspace, cx, |_| {}).unwrap();
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+    let error = cx
+        .update(|cx| api.restart_stack_frame(session_id, 7, cx))
+        .await
+        .expect_err("restart frame should fail when the adapter lacks support");
+
+    assert!(
+        error.to_string().contains("does not support"),
+        "unexpected error: {error}"
+    );
+}
+
+#[gpui::test]
+async fn test_agent_api_detach(executor: BackgroundExecutor, cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let disconnect_received = Arc::new(Mutex::new(false));
+    let session = start_debug_session_with(
+        &workspace,
+        cx,
+        DebugTaskDefinition {
+            adapter: "fake-adapter".into(),
+            label: "test".into(),
+            config: json!({ "request": "attach" }),
+            tcp_connection: None,
+        },
+        {
+            let disconnect_received = disconnect_received.clone();
+            move |client| {
+                client.on_request::<Disconnect, _>({
+                    let disconnect_received = disconnect_received.clone();
+                    move |_, args| {
+                        assert_eq!(args.terminate_debuggee, Some(false));
+                        assert_eq!(args.suspend_debuggee, Some(false));
+                        *disconnect_received.lock().unwrap() = true;
+                        Ok(())
+                    }
+                });
+            }
+        },
+    )
+    .unwrap();
+
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+    cx.update(|cx| api.detach_session(session_id, cx))
+        .await
+        .expect("detach should succeed for an attach session");
+
+    assert!(*disconnect_received.lock().unwrap());
+}
+
+#[gpui::test]
+async fn test_agent_api_detach_rejects_when_not_attached(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let session = start_debug_session(&workspace, cx, |_| {}).unwrap();
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+    let error = cx
+        .update(|cx| api.detach_session(session_id, cx))
+        .await
+        .expect_err("detach should fail for a launch session");
+
+    assert!(
+        error.to_string().contains("not attached"),
+        "unexpected error: {error}"
+    );
+}
