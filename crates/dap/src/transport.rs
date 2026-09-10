@@ -112,10 +112,15 @@ impl PendingRequests {
     }
 
     fn flush(&mut self, e: anyhow::Error) {
-        let Some(inner) = self.inner.as_mut() else {
-            return;
+        // Clear the map (rather than just draining it) so any request sent
+        // after the connection has closed fails fast with "client is closed"
+        // instead of awaiting a response that will never arrive — the
+        // transport read loop has already exited and won't flush again.
+        let inner = match self.inner.take() {
+            Some(inner) => inner,
+            None => return,
         };
-        for (_, sender) in inner.drain() {
+        for (_, sender) in inner {
             sender.send(Err(e.cloned())).ok();
         }
     }
@@ -144,7 +149,6 @@ impl PendingRequests {
 
     pub(crate) fn shutdown(&mut self) {
         self.flush(anyhow!("transport shutdown"));
-        self.inner = None;
     }
 }
 
