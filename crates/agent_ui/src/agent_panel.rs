@@ -4265,6 +4265,90 @@ impl AgentPanel {
         }
     }
 
+    /// If the active native thread's on-disk copy is newer than the
+    /// in-memory copy (e.g. another Zed instance wrote to the shared threads
+    /// database), discard the stale in-memory session and reload it from
+    /// disk. Used when the user re-activates an already-open thread in the
+    /// sidebar.
+    pub fn reload_active_thread_if_stale(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(conversation_view) = self.active_conversation_view().cloned() else {
+            return;
+        };
+        let Some(acp_thread) = conversation_view.read(cx).root_thread(cx) else {
+            return;
+        };
+        // Never replace a thread that is actively generating in this instance.
+        if acp_thread.read(cx).status() == ThreadStatus::Generating {
+            return;
+        }
+
+        let Some(thread_id) = self.active_thread_id(cx) else {
+            return;
+        };
+        let Some(metadata) = ThreadMetadataStore::try_global(cx)
+            .and_then(|store| store.read(cx).entry(thread_id).cloned())
+        else {
+            return;
+        };
+        // Drafts have no persisted content to reload from.
+        if metadata.is_draft() {
+            return;
+        }
+
+        let session_id = acp_thread.read(cx).session_id().clone();
+        let Some(memory_updated_at) = self
+            .active_native_agent_thread(cx)
+            .map(|thread| thread.read(cx).updated_at())
+        else {
+            return;
+        };
+
+        let connection = acp_thread
+            .read(cx)
+            .connection()
+            .clone()
+            .downcast::<agent::NativeAgentConnection>()
+            .map(|connection| (*connection).clone());
+        let Some(connection) = connection else {
+            return;
+        };
+
+        let agent = Agent::from(metadata.agent_id.clone());
+        let disk_future = connection.thread_updated_at(session_id.clone(), cx);
+
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Some(disk_updated_at)) = disk_future.await else {
+                return;
+            };
+            if disk_updated_at <= memory_updated_at {
+                return;
+            }
+
+            this.update_in(cx, |this, window, cx| {
+                // Discard the stale in-memory session before rebuilding so
+                // `load_agent_thread` reads the newer on-disk copy rather than
+                // reusing the cached session. Skipping the save is important:
+                // saving here would clobber the newer on-disk content.
+                connection.discard_session(&session_id, cx);
+                this.base_view = BaseView::Uninitialized;
+                this.retained_threads.remove(&thread_id);
+                this.refresh_base_view_subscriptions(window, cx);
+                this.load_agent_thread(
+                    agent,
+                    thread_id,
+                    Some(metadata.folder_paths().clone()),
+                    metadata.title.clone(),
+                    false,
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                );
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn set_base_view(
         &mut self,
         new_view: BaseView,

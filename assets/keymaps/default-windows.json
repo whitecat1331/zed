@@ -597,6 +597,19 @@
     },
   },
   {
+    // These must appear after the `Editor` block above: at the same context
+    // depth the later binding wins, and `shift-alt-a` would otherwise trigger
+    // `editor::ToggleBlockComments` in the composer.
+    "context": "AcpThread > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "shift-alt-q": "agent::AllowAlways",
+      "shift-alt-a": "agent::AllowOnce",
+      "ctrl-alt-a": "agent::OpenPermissionDropdown",
+      "shift-alt-x": "agent::RejectOnce",
+    },
+  },
+  {
     "context": "Editor && extension == md",
     "use_key_equivalents": true,
     "bindings": {

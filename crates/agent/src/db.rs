@@ -630,6 +630,27 @@ impl ThreadsDatabase {
         })
     }
 
+    /// Returns the persisted `updated_at` for a thread without deserializing
+    /// its full content. Used to detect when another Zed instance has written
+    /// a newer copy of a thread to the shared database.
+    pub fn thread_updated_at(&self, id: acp::SessionId) -> Task<Result<Option<DateTime<Utc>>>> {
+        let connection = self.connection.clone();
+
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            let mut select = connection.select_row_bound::<Arc<str>, String>(indoc! {"
+                SELECT updated_at FROM threads WHERE id = ? LIMIT 1
+            "})?;
+
+            let Some(updated_at) = select(id.0)? else {
+                return Ok(None);
+            };
+            Ok(Some(
+                DateTime::parse_from_rfc3339(&updated_at)?.with_timezone(&Utc),
+            ))
+        })
+    }
+
     pub fn save_thread(
         &self,
         id: acp::SessionId,

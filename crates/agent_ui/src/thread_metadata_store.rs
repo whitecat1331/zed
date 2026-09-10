@@ -1462,6 +1462,28 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN title_override TEXT;
         ),
+        sql!(
+            DELETE FROM sidebar_threads
+            WHERE thread_id IN (
+                SELECT thread_id FROM (
+                    SELECT thread_id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY session_id
+                               ORDER BY archived ASC, updated_at DESC
+                           ) AS rn
+                    FROM sidebar_threads
+                    WHERE session_id IS NOT NULL
+                )
+                WHERE rn > 1
+            );
+
+            DELETE FROM thread_archived_worktrees
+            WHERE thread_id NOT IN (SELECT thread_id FROM sidebar_threads);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sidebar_threads_session_id
+            ON sidebar_threads(session_id)
+            WHERE session_id IS NOT NULL;
+        ),
     ];
 }
 
@@ -1533,6 +1555,20 @@ impl ThreadMetadataDb {
         let archived = row.archived;
 
         self.write(move |conn| {
+            // A session's `thread_id` can change (e.g. cross-window activation
+            // mints a new local id), but there must be at most one row per
+            // session. Remove any stale row still carrying the old thread_id
+            // before upserting so the metadata migrates instead of duplicating.
+            if let Some(session_id) = session_id.as_ref() {
+                let mut delete = Statement::prepare(
+                    conn,
+                    "DELETE FROM sidebar_threads WHERE session_id = ? AND thread_id != ?",
+                )?;
+                delete.bind(session_id, 1)?;
+                delete.bind(&thread_id, 2)?;
+                delete.exec()?;
+            }
+
             let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override) \
                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
                        ON CONFLICT(thread_id) DO UPDATE SET \

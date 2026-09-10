@@ -1820,6 +1820,27 @@ impl NativeAgent {
         }
     }
 
+    /// Removes a session from memory without persisting it.
+    ///
+    /// This is the reload path for a thread whose on-disk copy is newer than
+    /// the in-memory copy (e.g. another Zed instance wrote to the shared
+    /// threads database). We must not run the normal release save here,
+    /// because saving the stale in-memory snapshot would clobber that newer
+    /// content.
+    fn discard_session(&mut self, session_id: &acp::SessionId, cx: &mut Context<Self>) {
+        let Some(session) = self.sessions.remove(session_id) else {
+            return;
+        };
+        let project_id = session.project_id;
+        session.save_worker.detach_and_log_err(cx);
+
+        let has_remaining = self.sessions.values().any(|s| s.project_id == project_id);
+        if !has_remaining {
+            self.projects.remove(&project_id);
+            self.publish_skill_index(cx);
+        }
+    }
+
     fn save_thread(&mut self, thread: Entity<Thread>, cx: &mut Context<Self>) {
         let id = thread.read(cx).id().clone();
         let Some(session) = self.sessions.get(&id) else {
@@ -2231,6 +2252,29 @@ impl NativeAgentConnection {
             .sessions
             .get(session_id)
             .map(|session| session.thread.clone())
+    }
+
+    /// Returns the persisted `updated_at` for a session, if it exists in the
+    /// shared threads database. Used to detect external changes (e.g. another
+    /// Zed instance writing to the same thread).
+    pub fn thread_updated_at(
+        &self,
+        id: acp::SessionId,
+        cx: &mut App,
+    ) -> Task<Result<Option<DateTime<Utc>>>> {
+        let database_future = ThreadsDatabase::connect(cx);
+        cx.background_spawn(async move {
+            let database = database_future.await.map_err(|err| anyhow!(err))?;
+            database.thread_updated_at(id).await
+        })
+    }
+
+    /// Discards a session from memory without saving it. This must only be
+    /// used when the caller is about to reload the session from disk because
+    /// the on-disk copy is newer than the in-memory copy.
+    pub fn discard_session(&self, session_id: &acp::SessionId, cx: &mut App) {
+        self.0
+            .update(cx, |agent, cx| agent.discard_session(session_id, cx));
     }
 
     /// Forwards to [`NativeAgent::ensure_skills_scan_started`]. The

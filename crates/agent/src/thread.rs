@@ -1539,6 +1539,10 @@ impl Thread {
         &self.id
     }
 
+    pub fn updated_at(&self) -> DateTime<Utc> {
+        self.updated_at
+    }
+
     // Only used by Seatbelt-style sandboxes (macOS); Linux relies on bwrap's
     // tmpfs `/tmp` and Windows on the WSL bwrap tmpfs, so neither needs a
     // per-thread temp directory.
