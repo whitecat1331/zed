@@ -5322,6 +5322,35 @@ impl Sidebar {
         close_item_tasks
     }
 
+    #[cfg(test)]
+    fn archive_thread(
+        &mut self,
+        session_id: &acp::SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = ThreadMetadataStore::global(cx);
+        let metadata = store.read(cx).entry_by_session(session_id).cloned();
+        let metadata_thread_id = metadata.as_ref().map(|metadata| metadata.thread_id);
+        let thread_entry = self.contents.entries.iter().find_map(|entry| match entry {
+            ListEntry::Thread(thread) => metadata_thread_id
+                .map_or_else(
+                    || thread.metadata.session_id.as_ref() == Some(session_id),
+                    |thread_id| thread.metadata.thread_id == thread_id,
+                )
+                .then(|| thread.clone()),
+            _ => None,
+        });
+        let Some(thread_id) = metadata_thread_id.or_else(|| {
+            thread_entry
+                .as_ref()
+                .map(|thread| thread.metadata.thread_id)
+        }) else {
+            return;
+        };
+        self.archive_thread_entry(thread_id, window, cx);
+    }
+
     fn archive_thread_entry(
         &mut self,
         thread_id: ThreadId,
