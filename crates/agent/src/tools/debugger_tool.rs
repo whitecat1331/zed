@@ -892,7 +892,7 @@ impl BreakpointInput {
 
 struct ResolvedControlInput {
     session_id: SessionId,
-    thread_id: Option<ThreadId>,
+    thread_id: Option<project::debugger::session::ThreadId>,
     action: ControlAction,
     path: Option<PathBuf>,
     line: Option<u32>,
