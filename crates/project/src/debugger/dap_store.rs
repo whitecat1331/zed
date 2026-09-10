@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use collections::HashMap;
 use dap::{
     Capabilities, DapRegistry, DebugRequest, EvaluateArgumentsContext, StackFrameId,
+    StartDebuggingRequestArguments,
     adapters::{
         DapDelegate, DebugAdapterBinary, DebugAdapterName, DebugTaskDefinition, TcpArguments,
     },
@@ -496,12 +497,16 @@ impl DapStore {
         cx.notify();
 
         cx.subscribe(&session, {
-            move |this: &mut DapStore, _, event: &SessionStateEvent, cx| match event {
+            move |this: &mut DapStore, session, event: &SessionStateEvent, cx| match event {
                 SessionStateEvent::Shutdown => {
                     this.retire_terminated_session(session_id, cx)
                         .detach_and_log_err(cx);
                 }
-                SessionStateEvent::Restart | SessionStateEvent::SpawnChildSession { .. } => {}
+                SessionStateEvent::Restart => {}
+                SessionStateEvent::SpawnChildSession { request } => {
+                    this.spawn_child_session(session, request.clone(), cx)
+                        .detach_and_log_err(cx);
+                }
                 SessionStateEvent::Running => {
                     cx.emit(DapStoreEvent::DebugClientStarted(session_id));
                 }
@@ -510,6 +515,56 @@ impl DapStore {
         .detach();
 
         session
+    }
+
+    /// Creates and boots a child session in response to an adapter's
+    /// `startDebugging` reverse request.
+    ///
+    /// This lives in the `DapStore` (not the UI layer) so that child sessions
+    /// are created regardless of whether the parent session was registered with
+    /// the debugger panel — in particular, the agent's manual relaunch path
+    /// recreates the parent directly in the project layer and must still be
+    /// able to produce vscode-js-debug's parent/child session pair.
+    pub fn spawn_child_session(
+        &mut self,
+        parent_session: Entity<Session>,
+        request: StartDebuggingRequestArguments,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some(worktree) = parent_session.read(cx).worktree() else {
+            log::error!("Attempted to start a child-session from a non-running session");
+            return Task::ready(Err(anyhow!(
+                "attempted to start a child session from a non-running session"
+            )));
+        };
+
+        let adapter = parent_session.read(cx).adapter();
+        let label = DapRegistry::global(cx)
+            .adapter(&adapter)
+            .and_then(|adapter| adapter.label_for_child_session(&request))
+            .map(SharedString::from);
+        let quirks = parent_session.read(cx).quirks();
+        let Some(mut binary) = parent_session.read(cx).binary().cloned() else {
+            log::error!("Attempted to start a child-session without a binary");
+            return Task::ready(Err(anyhow!(
+                "attempted to start a child session without a binary"
+            )));
+        };
+        let task_context = parent_session.read(cx).task_context().clone();
+        binary.request_args = request;
+
+        let dap_store = cx.weak_entity();
+        let session = self.new_session(
+            label,
+            adapter,
+            task_context,
+            Some(parent_session),
+            quirks,
+            cx,
+        );
+        session.update(cx, |session, cx| {
+            session.boot(binary, worktree, dap_store, cx)
+        })
     }
 
     pub fn boot_session(

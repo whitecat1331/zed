@@ -470,47 +470,38 @@ impl DebugPanel {
 
     pub fn handle_start_debugging_request(
         &mut self,
-        request: &StartDebuggingRequestArguments,
+        _request: &StartDebuggingRequestArguments,
         parent_session: Entity<Session>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(worktree) = parent_session.read(cx).worktree() else {
-            log::error!("Attempted to start a child-session from a non-running session");
+        // The DapStore now creates the child session when the adapter sends its
+        // `startDebugging` reverse request (DapStore::spawn_child_session), so
+        // this handler only registers the already-created child for display.
+        // vscode-js-debug spawns a single child per parent, so the first child
+        // is the one this request created.
+        let dap_store = self.project.read(cx).dap_store();
+        let child_session_id = parent_session
+            .read(cx)
+            .child_session_ids()
+            .into_iter()
+            .next();
+        let Some(child_session_id) = child_session_id else {
+            log::error!("Attempted to register a child-session that was not created");
+            return;
+        };
+        let child_session = dap_store.read(cx).session_by_id(child_session_id);
+        let Some(child_session) = child_session else {
+            log::error!("Attempted to register a child-session that was not created");
             return;
         };
 
-        let dap_store_handle = self.project.read(cx).dap_store();
-        let label = self.label_for_child_session(&parent_session, request, cx);
-        let adapter = parent_session.read(cx).adapter();
-        let quirks = parent_session.read(cx).quirks();
-        let Some(mut binary) = parent_session.read(cx).binary().cloned() else {
-            log::error!("Attempted to start a child-session without a binary");
-            return;
-        };
-        let task_context = parent_session.read(cx).task_context().clone();
-        binary.request_args = request.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let (session, task) = dap_store_handle.update(cx, |dap_store, cx| {
-                let session = dap_store.new_session(
-                    label,
-                    adapter,
-                    task_context,
-                    Some(parent_session.clone()),
-                    quirks,
-                    cx,
-                );
-
-                let task = session.update(cx, |session, cx| {
-                    session.boot(binary, worktree, dap_store_handle.downgrade(), cx)
-                });
-                (session, task)
-            });
             // Focus child sessions if the parent has never emitted a stopped event;
             // this improves our JavaScript experience, as it always spawns a "main" session that then spawns subsessions.
             let parent_ever_stopped = parent_session.update(cx, |this, _| this.has_ever_stopped());
-            Self::register_session(this, session, !parent_ever_stopped, cx).await?;
-            task.await
+            Self::register_session(this, child_session, !parent_ever_stopped, cx).await?;
+            Ok::<(), anyhow::Error>(())
         })
         .detach_and_log_err(cx);
     }
@@ -1324,21 +1315,6 @@ impl DebugPanel {
             }
             cx.emit(PanelEvent::ZoomIn);
         }
-    }
-
-    fn label_for_child_session(
-        &self,
-        parent_session: &Entity<Session>,
-        request: &StartDebuggingRequestArguments,
-        cx: &mut Context<'_, Self>,
-    ) -> Option<SharedString> {
-        let adapter = parent_session.read(cx).adapter();
-        if let Some(adapter) = DapRegistry::global(cx).adapter(&adapter)
-            && let Some(label) = adapter.label_for_child_session(request)
-        {
-            return Some(label.into());
-        }
-        None
     }
 
     fn retain_sessions(&mut self, keep: &dyn Fn(&Entity<DebugSession>) -> bool) {
