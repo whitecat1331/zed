@@ -838,6 +838,55 @@ impl DapStore {
         })
     }
 
+    pub fn restart_session(
+        &mut self,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some(session) = self.session_by_id(session_id) else {
+            return Task::ready(Err(anyhow!(
+                "Could not find debugger session {session_id:?}"
+            )));
+        };
+
+        let mut root = session;
+        while let Some(parent) = root.read(cx).parent_session().cloned() {
+            root = parent;
+        }
+
+        let root_id = root.read(cx).session_id();
+        let Some(worktree) = root.read(cx).worktree() else {
+            return Task::ready(Err(anyhow!(
+                "debugger session has no worktree; cannot restart"
+            )));
+        };
+        let label = root.read(cx).label();
+        let quirks = root.read(cx).quirks();
+        let adapter = root.read(cx).adapter();
+        let Some(binary) = root.read(cx).binary().cloned() else {
+            return Task::ready(Err(anyhow!(
+                "debugger session has no launch config; cannot restart"
+            )));
+        };
+        let task_context = root.read(cx).task_context().clone();
+
+        cx.spawn(async move |this, cx| {
+            this.update(cx, |this, cx| this.shutdown_session(root_id, cx))?
+                .await
+                .log_err();
+
+            let boot_task = this.update(cx, |this, cx| {
+                let dap_store = cx.weak_entity();
+                let session = this.new_session(label, adapter, task_context, None, quirks, cx);
+                session.update(cx, |session, cx| {
+                    session.boot(binary, worktree, dap_store, cx)
+                })
+            })?;
+
+            boot_task.await
+        })
+    }
+
     pub fn shared(
         &mut self,
         project_id: u64,

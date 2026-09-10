@@ -2595,7 +2595,11 @@ impl Session {
             )));
         }
 
-        let request = self.state.request_dap(RestartCommand { raw: Value::Null });
+        let raw = self
+            .binary()
+            .map(|binary| binary.request_args.configuration.clone())
+            .unwrap_or(Value::Null);
+        let request = self.state.request_dap(RestartCommand { raw });
         cx.spawn(async move |_, _| {
             request.await?;
             Ok(())

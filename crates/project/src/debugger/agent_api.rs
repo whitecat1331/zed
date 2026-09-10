@@ -606,10 +606,21 @@ impl AgentDebuggerApi {
         let dap_store = self.dap_store.clone();
         cx.spawn(async move |cx| {
             let session = session_by_id(&dap_store, session_id, cx)?;
-            session
+            let restart = session
                 .update(cx, |session, cx| session.agent_restart(cx))
-                .await?;
-            Ok(())
+                .await;
+
+            match restart {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    log::warn!(
+                        "DAP restart failed for session {session_id:?} ({error}); falling back to manual relaunch"
+                    );
+                    dap_store
+                        .update(cx, |dap_store, cx| dap_store.restart_session(session_id, cx))
+                        .await
+                }
+            }
         })
     }
 
