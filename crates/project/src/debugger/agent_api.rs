@@ -602,13 +602,29 @@ impl AgentDebuggerApi {
         })
     }
 
+    /// How long to wait for a DAP `restart` response before falling back to a
+    /// manual relaunch. Some adapters advertise `supports_restart_request` but
+    /// never respond (e.g. CodeLLDB), so this must be bounded.
+    const RESTART_TIMEOUT: Duration = Duration::from_secs(15);
+
     pub fn restart_session(&self, session_id: SessionId, cx: &mut App) -> Task<Result<()>> {
         let dap_store = self.dap_store.clone();
         cx.spawn(async move |cx| {
             let session = session_by_id(&dap_store, session_id, cx)?;
-            let restart = session
+            let mut restart_task = session
                 .update(cx, |session, cx| session.agent_restart(cx))
-                .await;
+                .fuse();
+            let mut timeout = cx
+                .background_executor()
+                .timer(Self::RESTART_TIMEOUT)
+                .fuse();
+
+            let restart = select_biased! {
+                result = restart_task => result,
+                _ = timeout => Err(anyhow!(
+                    "timed out waiting for the debug adapter to restart"
+                )),
+            };
 
             match restart {
                 Ok(()) => Ok(()),
