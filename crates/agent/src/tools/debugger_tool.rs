@@ -45,6 +45,10 @@ const SESSION_BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 ///   explicit `session_id` and `thread_id` when possible.
 /// - `continue`, `step`, `pause`, and `run_to_line` wait for the debugger to
 ///   stop, exit, or time out, then return a fresh snapshot.
+/// - `detach` disconnects from an attach session without terminating the
+///   debuggee; `restart` sends the DAP restart request; `restart_frame`
+///   restarts the current stack frame and requires a `frame_id` from a
+///   snapshot. These return an acknowledgement rather than a fresh snapshot.
 /// - `start_session` runs code through Zed's debugger UI; pass the launch
 ///   config fields at the scenario top level (`{"adapter", "label",
 ///   "request", "program", "cwd", ...}`). A nested `"config"` object is
@@ -74,7 +78,7 @@ pub enum DebuggerOperation {
     SetBreakpoints,
     /// Remove source breakpoints.
     RemoveBreakpoints,
-    /// Continue, pause, step, or run to a line.
+    /// Continue, pause, step, run to a line, detach, restart, or restart a stack frame.
     Control,
     /// List registered debug adapters and their configuration schemas.
     ListAdapters,
@@ -136,7 +140,7 @@ pub struct DebuggerToolInput {
     /// Expression to evaluate, used by evaluate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expression: Option<String>,
-    /// Stack frame id, used by evaluate and set_variable to scope the request.
+    /// Stack frame id, used by evaluate, set_variable, and control `restart_frame`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_id: Option<u64>,
     /// Variable container reference, used by set_variable.
@@ -221,6 +225,7 @@ pub struct ControlInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<u64>,
     /// DAP thread id. When omitted, chooses a suitable thread based on the action.
+    /// Not used by `detach`, `restart`, or `restart_frame`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<i64>,
     /// Execution control action.
@@ -231,6 +236,9 @@ pub struct ControlInput {
     /// 1-based line for `run_to_line`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
+    /// Stack frame id for `restart_frame`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_id: Option<u64>,
     /// Maximum time to wait for the debugger to stop. Defaults to 30000ms; maximum 300000ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
@@ -249,6 +257,9 @@ pub enum ControlAction {
     StepOut,
     StepBack,
     RunToLine,
+    Detach,
+    Restart,
+    RestartFrame,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -500,6 +511,7 @@ impl DebuggerTool {
                         .context("action is required for debugger control")?,
                     path: input.path,
                     line: input.line,
+                    frame_id: input.frame_id,
                     timeout_ms: input.timeout_ms,
                     snapshot_limits: input.snapshot_limits,
                 };
@@ -516,6 +528,13 @@ impl DebuggerTool {
                 .await?;
 
                 let (session_id, control_result) = self.run_control(resolved_input, cx).await?;
+                let Some(control_result) = control_result else {
+                    return Ok(success(
+                        operation,
+                        format!("controlled debugger execution ({})", action.label()),
+                        json!({ "action": action.label() }),
+                    ));
+                };
                 let preferred_thread_id = control_result.stopped_thread_id;
                 let api = cx.update(|cx| self.api(cx));
                 let snapshot_task = cx.update(|cx| {
@@ -710,15 +729,19 @@ impl DebuggerTool {
                 .context("line is required for debugger control run_to_line")?;
         }
 
-        let (api, session_id, thread_id) = cx.update(|cx| {
+        let (api, session_id) = cx.update(|cx| {
             let api = self.api(cx);
             let session_id = resolve_session_id(&self.project, &api, input.session_id, cx)?;
-            let thread_id = input.thread_id.map(project::debugger::session::ThreadId);
-            anyhow::Ok((api, session_id, thread_id))
+            anyhow::Ok((api, session_id))
         })?;
-        let thread_id = match thread_id {
-            Some(thread_id) => thread_id,
-            None => choose_thread_for_action(&api, session_id, input.action, cx).await?,
+
+        let thread_id = if input.action.requires_thread() {
+            match input.thread_id.map(project::debugger::session::ThreadId) {
+                Some(thread_id) => Some(thread_id),
+                None => Some(choose_thread_for_action(&api, session_id, input.action, cx).await?),
+            }
+        } else {
+            None
         };
 
         Ok(ResolvedControlInput {
@@ -727,6 +750,7 @@ impl DebuggerTool {
             action: input.action,
             path: input.path,
             line: input.line,
+            frame_id: input.frame_id,
             timeout_ms: input.timeout_ms,
         })
     }
@@ -735,22 +759,30 @@ impl DebuggerTool {
         &self,
         input: ResolvedControlInput,
         cx: &mut gpui::AsyncApp,
-    ) -> Result<(SessionId, AgentDebuggerControlResult)> {
+    ) -> Result<(SessionId, Option<AgentDebuggerControlResult>)> {
         let timeout = Duration::from_millis(control_timeout_ms(input.timeout_ms)?);
         let session_id = input.session_id;
-        let thread_id = input.thread_id;
         let api = cx.update(|cx| self.api(cx));
 
-        match input.action {
+        let result = match input.action {
             ControlAction::Continue => {
+                let thread_id = input
+                    .thread_id
+                    .context("thread_id is required for debugger control continue")?;
                 let task = cx.update(|cx| api.continue_thread(session_id, thread_id, timeout, cx));
-                task.await
+                Some(task.await?)
             }
             ControlAction::Pause => {
+                let thread_id = input
+                    .thread_id
+                    .context("thread_id is required for debugger control pause")?;
                 let task = cx.update(|cx| api.pause_thread(session_id, thread_id, timeout, cx));
-                task.await
+                Some(task.await?)
             }
             ControlAction::StepOver => {
+                let thread_id = input
+                    .thread_id
+                    .context("thread_id is required for debugger control step_over")?;
                 let task = cx.update(|cx| {
                     api.step_thread(
                         session_id,
@@ -760,9 +792,12 @@ impl DebuggerTool {
                         cx,
                     )
                 });
-                task.await
+                Some(task.await?)
             }
             ControlAction::StepIn => {
+                let thread_id = input
+                    .thread_id
+                    .context("thread_id is required for debugger control step_in")?;
                 let task = cx.update(|cx| {
                     api.step_thread(
                         session_id,
@@ -772,9 +807,12 @@ impl DebuggerTool {
                         cx,
                     )
                 });
-                task.await
+                Some(task.await?)
             }
             ControlAction::StepOut => {
+                let thread_id = input
+                    .thread_id
+                    .context("thread_id is required for debugger control step_out")?;
                 let task = cx.update(|cx| {
                     api.step_thread(
                         session_id,
@@ -784,9 +822,12 @@ impl DebuggerTool {
                         cx,
                     )
                 });
-                task.await
+                Some(task.await?)
             }
             ControlAction::StepBack => {
+                let thread_id = input
+                    .thread_id
+                    .context("thread_id is required for debugger control step_back")?;
                 let task = cx.update(|cx| {
                     api.step_thread(
                         session_id,
@@ -796,9 +837,12 @@ impl DebuggerTool {
                         cx,
                     )
                 });
-                task.await
+                Some(task.await?)
             }
             ControlAction::RunToLine => {
+                let thread_id = input
+                    .thread_id
+                    .context("thread_id is required for debugger control run_to_line")?;
                 let path = input
                     .path
                     .context("path is required for debugger control run_to_line")?;
@@ -807,10 +851,29 @@ impl DebuggerTool {
                     .context("line is required for debugger control run_to_line")?;
                 let task =
                     cx.update(|cx| api.run_to_line(session_id, thread_id, path, line, timeout, cx));
-                task.await
+                Some(task.await?)
             }
-        }
-        .map(|result| (session_id, result))
+            ControlAction::Detach => {
+                let task = cx.update(|cx| api.detach_session(session_id, cx));
+                task.await?;
+                None
+            }
+            ControlAction::Restart => {
+                let task = cx.update(|cx| api.restart_session(session_id, cx));
+                task.await?;
+                None
+            }
+            ControlAction::RestartFrame => {
+                let frame_id = input
+                    .frame_id
+                    .context("frame_id is required for debugger control restart_frame")?;
+                let task = cx.update(|cx| api.restart_stack_frame(session_id, frame_id, cx));
+                task.await?;
+                None
+            }
+        };
+
+        Ok((session_id, result))
     }
 }
 
@@ -829,10 +892,11 @@ impl BreakpointInput {
 
 struct ResolvedControlInput {
     session_id: SessionId,
-    thread_id: project::debugger::session::ThreadId,
+    thread_id: Option<ThreadId>,
     action: ControlAction,
     path: Option<PathBuf>,
     line: Option<u32>,
+    frame_id: Option<u64>,
     timeout_ms: Option<u64>,
 }
 
@@ -846,6 +910,9 @@ impl ControlAction {
             ControlAction::StepOut => "step out",
             ControlAction::StepBack => "step back",
             ControlAction::RunToLine => "run to line",
+            ControlAction::Detach => "detach",
+            ControlAction::Restart => "restart",
+            ControlAction::RestartFrame => "restart frame",
         }
     }
 
@@ -858,7 +925,23 @@ impl ControlAction {
             ControlAction::StepOut => "step_out",
             ControlAction::StepBack => "step_back",
             ControlAction::RunToLine => "run_to_line",
+            ControlAction::Detach => "detach",
+            ControlAction::Restart => "restart",
+            ControlAction::RestartFrame => "restart_frame",
         }
+    }
+
+    fn requires_thread(self) -> bool {
+        matches!(
+            self,
+            ControlAction::Continue
+                | ControlAction::Pause
+                | ControlAction::StepOver
+                | ControlAction::StepIn
+                | ControlAction::StepOut
+                | ControlAction::StepBack
+                | ControlAction::RunToLine
+        )
     }
 }
 
@@ -947,11 +1030,15 @@ fn breakpoint_location_permission_inputs<'a>(
 }
 
 fn control_permission_input(input: &ResolvedControlInput) -> String {
+    let thread_id = input
+        .thread_id
+        .map(|thread_id| thread_id.0.to_string())
+        .unwrap_or_else(|| "none".to_string());
     let mut value = format!(
         "action:{} session_id:{} thread_id:{}",
         input.action.permission_name(),
         input.session_id.0,
-        input.thread_id.0
+        thread_id
     );
 
     if input.action == ControlAction::RunToLine {
@@ -965,6 +1052,14 @@ fn control_permission_input(input: &ResolvedControlInput) -> String {
             .map(|line| line.to_string())
             .unwrap_or_else(|| "missing".to_string());
         value.push_str(&format!(" path:{path} line:{line}"));
+    }
+
+    if input.action == ControlAction::RestartFrame {
+        let frame_id = input
+            .frame_id
+            .map(|frame_id| frame_id.to_string())
+            .unwrap_or_else(|| "missing".to_string());
+        value.push_str(&format!(" frame_id:{frame_id}"));
     }
 
     value
@@ -1017,10 +1112,11 @@ pub fn control_permission_inputs_for_test(
         operation,
         [control_permission_input(&ResolvedControlInput {
             session_id: SessionId::from_proto(resolved_session_id),
-            thread_id: project::debugger::session::ThreadId(resolved_thread_id),
+            thread_id: Some(project::debugger::session::ThreadId(resolved_thread_id)),
             action: input.action,
             path: input.path,
             line: input.line,
+            frame_id: input.frame_id,
             timeout_ms: input.timeout_ms,
         })],
     )
@@ -1442,7 +1538,12 @@ async fn choose_thread_for_action(
         | ControlAction::StepIn
         | ControlAction::StepOut
         | ControlAction::StepBack
-        | ControlAction::RunToLine => AgentDebuggerThreadStatus::Stopped,
+        | ControlAction::RunToLine
+        // These never reach the thread picker (`requires_thread` is false), but
+        // the match must stay exhaustive.
+        | ControlAction::Detach
+        | ControlAction::Restart
+        | ControlAction::RestartFrame => AgentDebuggerThreadStatus::Stopped,
     };
 
     // The session state machine races adapter boot: right after
@@ -1494,7 +1595,10 @@ async fn choose_thread_for_action(
                 | ControlAction::StepIn
                 | ControlAction::StepOut
                 | ControlAction::StepBack
-                | ControlAction::RunToLine => {
+                | ControlAction::RunToLine
+                | ControlAction::Detach
+                | ControlAction::Restart
+                | ControlAction::RestartFrame => {
                     if has_threads {
                         Err(anyhow!(
                             "No stopped debugger thread is available in session {:?}. The debugger must be paused at a breakpoint before this action can run; pause the session or wait for a breakpoint to hit.",
@@ -1762,6 +1866,58 @@ mod tests {
         assert_eq!(
             inputs,
             vec!["set_variable session_id:7 name:\"count\" value:\"42\"".to_string()]
+        );
+    }
+
+    #[test]
+    fn control_action_serializes_snake_case() {
+        for (action, expected) in [
+            (ControlAction::Continue, "continue"),
+            (ControlAction::Pause, "pause"),
+            (ControlAction::StepOver, "step_over"),
+            (ControlAction::StepIn, "step_in"),
+            (ControlAction::StepOut, "step_out"),
+            (ControlAction::StepBack, "step_back"),
+            (ControlAction::RunToLine, "run_to_line"),
+            (ControlAction::Detach, "detach"),
+            (ControlAction::Restart, "restart"),
+            (ControlAction::RestartFrame, "restart_frame"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(action).unwrap(),
+                Value::String(expected.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn control_permission_input_includes_restart_frame_id() {
+        let restart_frame = ResolvedControlInput {
+            session_id: SessionId::from_proto(7),
+            thread_id: None,
+            action: ControlAction::RestartFrame,
+            path: None,
+            line: None,
+            frame_id: Some(3),
+            timeout_ms: None,
+        };
+        assert_eq!(
+            control_permission_input(&restart_frame),
+            "action:restart_frame session_id:7 thread_id:none frame_id:3"
+        );
+
+        let detach = ResolvedControlInput {
+            session_id: SessionId::from_proto(7),
+            thread_id: None,
+            action: ControlAction::Detach,
+            path: None,
+            line: None,
+            frame_id: None,
+            timeout_ms: None,
+        };
+        assert_eq!(
+            control_permission_input(&detach),
+            "action:detach session_id:7 thread_id:none"
         );
     }
 }
