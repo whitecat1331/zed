@@ -2567,6 +2567,59 @@ impl Session {
         }
     }
 
+    pub(crate) fn agent_detach(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        if !self.is_attached() {
+            return Task::ready(Err(anyhow!(
+                "debugger session is not attached; detach is only available for attach sessions"
+            )));
+        }
+
+        let request = self.state.request_dap(DisconnectCommand {
+            restart: Some(false),
+            terminate_debuggee: Some(false),
+            suspend_debuggee: Some(false),
+        });
+        cx.spawn(async move |_, _| {
+            request.await?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn agent_restart(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        if !RestartCommand::is_supported(&self.capabilities) {
+            return Task::ready(Err(anyhow!("debug adapter does not support restart")));
+        }
+        if self.as_running().is_none() || self.is_terminated() {
+            return Task::ready(Err(anyhow!(
+                "debugger session is not running; cannot restart"
+            )));
+        }
+
+        let request = self.state.request_dap(RestartCommand { raw: Value::Null });
+        cx.spawn(async move |_, _| {
+            request.await?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn agent_restart_stack_frame(
+        &mut self,
+        frame_id: u64,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        if !RestartStackFrameCommand::is_supported(&self.capabilities) {
+            return Task::ready(Err(anyhow!("debug adapter does not support restart frame")));
+        }
+
+        let request = self.state.request_dap(RestartStackFrameCommand {
+            stack_frame_id: frame_id,
+        });
+        cx.spawn(async move |_, _| {
+            request.await?;
+            Ok(())
+        })
+    }
+
     pub fn pause_thread(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
         self.request(
             PauseCommand {

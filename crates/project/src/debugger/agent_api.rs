@@ -591,6 +591,46 @@ impl AgentDebuggerApi {
         })
     }
 
+    pub fn detach_session(&self, session_id: SessionId, cx: &mut App) -> Task<Result<()>> {
+        let dap_store = self.dap_store.clone();
+        cx.spawn(async move |cx| {
+            let session = session_by_id(&dap_store, session_id, cx)?;
+            session
+                .update(cx, |session, cx| session.agent_detach(cx))
+                .await?;
+            Ok(())
+        })
+    }
+
+    pub fn restart_session(&self, session_id: SessionId, cx: &mut App) -> Task<Result<()>> {
+        let dap_store = self.dap_store.clone();
+        cx.spawn(async move |cx| {
+            let session = session_by_id(&dap_store, session_id, cx)?;
+            session
+                .update(cx, |session, cx| session.agent_restart(cx))
+                .await?;
+            Ok(())
+        })
+    }
+
+    pub fn restart_stack_frame(
+        &self,
+        session_id: SessionId,
+        frame_id: u64,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let dap_store = self.dap_store.clone();
+        cx.spawn(async move |cx| {
+            let session = session_by_id(&dap_store, session_id, cx)?;
+            session
+                .update(cx, |session, cx| {
+                    session.agent_restart_stack_frame(frame_id, cx)
+                })
+                .await?;
+            Ok(())
+        })
+    }
+
     pub fn acquire_agent_control(
         &self,
         session_id: SessionId,
