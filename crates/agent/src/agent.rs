@@ -811,15 +811,16 @@ impl NativeAgent {
                 Ok(Some(fingerprint)) => {
                     if last_fingerprint.as_ref() != Some(&fingerprint) {
                         let had_baseline = last_fingerprint.is_some();
-                        last_fingerprint = Some(fingerprint);
                         if had_baseline {
                             log::info!("[THREAD_SYNC] content fingerprint changed: {fingerprint}");
-                            if this
+                        }
+                        last_fingerprint = Some(fingerprint);
+                        if had_baseline
+                            && this
                                 .update(cx, |_agent, cx| cx.emit(ThreadsDatabaseChanged))
                                 .is_err()
-                            {
-                                return;
-                            }
+                        {
+                            return;
                         }
                     }
                 }
