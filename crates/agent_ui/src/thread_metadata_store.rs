@@ -2010,6 +2010,43 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_save_dedupes_same_session_across_thread_ids(_cx: &mut TestAppContext) {
+        let now = Utc::now();
+        let first = make_metadata(
+            "session-1",
+            "Original thread",
+            now,
+            PathList::new(&[Path::new("/project-a")]),
+        );
+        let second = make_metadata(
+            "session-1",
+            "Renamed thread",
+            now,
+            PathList::new(&[Path::new("/project-a")]),
+        );
+        let second_thread_id = second.thread_id;
+
+        let thread = std::thread::current();
+        let test_name = thread.name().unwrap_or("unknown_test");
+        let db_name = format!("THREAD_METADATA_DB_{}", test_name);
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+            &db_name,
+        )));
+
+        db.save(first).await.unwrap();
+        db.save(second).await.unwrap();
+
+        let rows = db.list().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "a session_id must map to a single surviving row after its thread_id changes"
+        );
+        assert_eq!(rows[0].thread_id, second_thread_id);
+        assert_eq!(rows[0].title.as_deref(), Some("Renamed thread"));
+    }
+
+    #[gpui::test]
     async fn test_store_set_title_override_updates_cached_metadata(cx: &mut TestAppContext) {
         init_test(cx);
 
