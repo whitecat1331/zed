@@ -9,6 +9,7 @@ mod templates;
 mod tests;
 mod thread;
 mod thread_store;
+mod thread_sync;
 mod tool_permissions;
 mod tools;
 
@@ -26,6 +27,7 @@ pub use shell_command_parser::extract_commands;
 pub use templates::*;
 pub use thread::*;
 pub use thread_store::*;
+pub use thread_sync::*;
 pub use tool_permissions::*;
 pub use tools::*;
 
@@ -645,6 +647,8 @@ impl NativeAgent {
                     Self::run_threads_db_observer(this, database_future, cx).await;
                 })
                 .detach();
+
+                ThreadSyncBus::init_global(cx);
             }
 
             Self {
@@ -2438,6 +2442,10 @@ impl NativeAgentConnection {
         cx: &App,
     ) -> Task<Result<acp::PromptResponse>> {
         cx.spawn(async move |cx| {
+            let session_id = acp_thread
+                .update(cx, |thread, _cx| thread.session_id().to_string())
+                .ok();
+
             // Handle response stream and forward to session.acp_thread
             while let Some(result) = events.next().await {
                 match result {
@@ -2457,11 +2465,28 @@ impl NativeAgentConnection {
                                 })?;
                             }
                             ThreadEvent::AgentText(text) => {
+                                if let Some(session_id) = session_id.as_ref() {
+                                    ThreadSyncBus::broadcast_stream_global(
+                                        cx,
+                                        session_id.clone(),
+                                        ThreadSyncStreamEvent::Text(text.clone()),
+                                    );
+                                }
                                 acp_thread.update(cx, |thread, cx| {
                                     thread.push_assistant_content_block(text.into(), false, cx)
                                 })?;
                             }
                             ThreadEvent::AgentThinking(text) => {
+                                if let Some(session_id) = session_id.as_ref() {
+                                    ThreadSyncBus::broadcast_stream_global(
+                                        cx,
+                                        session_id.clone(),
+                                        ThreadSyncStreamEvent::Thinking {
+                                            text: text.clone(),
+                                            signature: None,
+                                        },
+                                    );
+                                }
                                 acp_thread.update(cx, |thread, cx| {
                                     thread.push_assistant_content_block(text.into(), true, cx)
                                 })?;
@@ -2591,6 +2616,13 @@ impl NativeAgentConnection {
                                 })?;
                             }
                             ThreadEvent::Stop(stop_reason) => {
+                                if let Some(session_id) = session_id.as_ref() {
+                                    ThreadSyncBus::broadcast_stream_global(
+                                        cx,
+                                        session_id.clone(),
+                                        ThreadSyncStreamEvent::Stop(format!("{stop_reason:?}")),
+                                    );
+                                }
                                 log::debug!("Assistant message complete: {:?}", stop_reason);
                                 return Ok(acp::PromptResponse::new(stop_reason));
                             }
