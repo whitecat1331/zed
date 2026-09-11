@@ -935,7 +935,7 @@ impl DapStore {
         let definition = DebugTaskDefinition {
             label: label.clone().unwrap_or_default(),
             adapter: adapter.clone(),
-            config: binary.request_args.configuration.clone(),
+            config: binary.request_args.configuration,
             tcp_connection: None,
         };
 
