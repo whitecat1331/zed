@@ -4,7 +4,8 @@ use crate::{
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
     GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
     ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
-    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
+    SystemPromptTemplate, Template, Templates, TerminalTool, ThreadSyncBus, ToolPermissionDecision,
+    WebSearchTool,
     WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
@@ -2595,9 +2596,13 @@ impl Thread {
         let content = content.into_iter().map(Into::into).collect::<Arc<_>>();
         log::debug!("Thread::send content: {:?}", content);
 
-        self.messages
-            .push(Arc::new(Message::User(UserMessage { id, content })));
+        let message = UserMessage { id, content };
+        self.messages.push(Arc::new(Message::User(message.clone())));
         cx.notify();
+
+        if let Some(bus) = ThreadSyncBus::try_global(cx) {
+            bus.read(cx).broadcast_user_message(self.id.to_string(), message);
+        }
 
         self.send_existing(cx)
     }
@@ -2722,8 +2727,28 @@ impl Thread {
             .into_iter()
             .map(|block| UserMessageContent::from_content_block(block, path_style))
             .collect::<Arc<_>>();
-        self.messages
-            .push(Arc::new(Message::User(UserMessage { id, content })));
+        let message = UserMessage { id, content };
+        self.messages.push(Arc::new(Message::User(message.clone())));
+        cx.notify();
+
+        if let Some(bus) = ThreadSyncBus::try_global(cx) {
+            bus.read(cx).broadcast_user_message(self.id.to_string(), message);
+        }
+    }
+
+    /// Applies a user message published by another instance to this thread's
+    /// committed prefix. Deduplicated by message id; does not advance
+    /// `updated_at` or trigger a save (the authoring instance already persists
+    /// it).
+    pub fn apply_remote_user_message(&mut self, message: UserMessage, cx: &mut Context<Self>) {
+        let already_present = self.messages.iter().any(|existing| {
+            matches!(&**existing, Message::User(UserMessage { id, .. }) if id == &message.id)
+        });
+        if already_present {
+            return;
+        }
+
+        self.messages.push(Arc::new(Message::User(message)));
         cx.notify();
     }
 

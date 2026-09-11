@@ -13,7 +13,7 @@ use std::{
 use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, ThreadStatus, line_range_suffix};
 use agent::{
     ContextServerRegistry, SharedThread, ThreadStore, ThreadSyncBus, ThreadSyncBusEvent,
-    ThreadSyncMessage, ThreadSyncStreamEvent,
+    ThreadSyncMessage, ThreadSyncStreamEvent, UserMessage,
 };
 use agent_client_protocol::schema::v1 as acp;
 use agent_servers::AgentServer;
@@ -3061,8 +3061,23 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         let ThreadSyncBusEvent::Message(envelope) = event;
-        let ThreadSyncMessage::Stream { session_id, event, .. } = &envelope.message;
-        self.apply_remote_stream_event(session_id, event, window, cx);
+        match &envelope.message {
+            ThreadSyncMessage::Stream {
+                session_id, event, ..
+            } => {
+                self.apply_remote_stream_event(session_id, event, cx);
+            }
+            ThreadSyncMessage::UserMessage {
+                session_id,
+                message,
+                ..
+            } => {
+                self.apply_remote_user_message(session_id, message, cx);
+            }
+            ThreadSyncMessage::TurnComplete { .. } => {
+                self.reload_active_thread_if_stale(window, cx);
+            }
+        }
     }
 
     /// Mirrors streamed token deltas from another instance into this instance's
@@ -3072,7 +3087,6 @@ impl AgentPanel {
         &mut self,
         session_id: &str,
         event: &ThreadSyncStreamEvent,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(conversation_view) = self.active_conversation_view().cloned() else {
@@ -3101,8 +3115,47 @@ impl AgentPanel {
                 });
             }
             ThreadSyncStreamEvent::Stop(_) => {
-                self.reload_active_thread_if_stale(window, cx);
+                // Finalization is driven by the `TurnComplete` op, which is
+                // published alongside this `Stop` stream event.
             }
+        }
+    }
+
+    /// Applies a user message published by another instance to both the open
+    /// UI thread and the native `agent::Thread` model, so this instance
+    /// generates (and saves) against the same committed prefix.
+    fn apply_remote_user_message(
+        &mut self,
+        session_id: &str,
+        message: &UserMessage,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conversation_view) = self.active_conversation_view().cloned() else {
+            return;
+        };
+        let Some(acp_thread) = conversation_view.read(cx).root_thread(cx) else {
+            return;
+        };
+        if acp_thread.read(cx).session_id().to_string() != session_id {
+            return;
+        }
+        // Never clobber a thread that is actively generating in this instance.
+        if acp_thread.read(cx).status() == ThreadStatus::Generating {
+            return;
+        }
+
+        // Mirror the user message into the UI view.
+        acp_thread.update(cx, |thread, cx| {
+            for content in &*message.content {
+                thread.push_user_content_block(Some(message.id.clone()), content.clone().into(), cx);
+            }
+        });
+
+        // Append the user message to the model's committed prefix.
+        if let Some(native_thread) = self.active_native_agent_thread(cx) {
+            native_thread.update(cx, |thread, cx| {
+                thread.apply_remote_user_message(message.clone(), cx);
+            });
         }
     }
 

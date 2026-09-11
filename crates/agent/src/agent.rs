@@ -2622,6 +2622,10 @@ impl NativeAgentConnection {
                                         session_id.clone(),
                                         ThreadSyncStreamEvent::Stop(format!("{stop_reason:?}")),
                                     );
+                                    ThreadSyncBus::broadcast_turn_complete_global(
+                                        cx,
+                                        session_id.clone(),
+                                    );
                                 }
                                 log::debug!("Assistant message complete: {:?}", stop_reason);
                                 return Ok(acp::PromptResponse::new(stop_reason));

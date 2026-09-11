@@ -48,12 +48,29 @@ pub enum ThreadSyncMessage {
         op_id: String,
         event: ThreadSyncStreamEvent,
     },
+    /// A user message appended to the committed prefix of a thread. Other
+    /// instances apply this to their `Thread.messages` so they generate (and
+    /// save) against the same history.
+    UserMessage {
+        session_id: String,
+        client_id: String,
+        op_id: String,
+        message: crate::thread::UserMessage,
+    },
+    /// Signals that a turn has been flushed into the thread's persisted model.
+    TurnComplete {
+        session_id: String,
+        client_id: String,
+        op_id: String,
+    },
 }
 
 impl ThreadSyncMessage {
     pub fn client_id(&self) -> &str {
         match self {
-            ThreadSyncMessage::Stream { client_id, .. } => client_id,
+            ThreadSyncMessage::Stream { client_id, .. }
+            | ThreadSyncMessage::UserMessage { client_id, .. }
+            | ThreadSyncMessage::TurnComplete { client_id, .. } => client_id,
         }
     }
 }
@@ -178,6 +195,29 @@ impl ThreadSyncBus {
             .ok();
     }
 
+    /// Publishes a committed user message to the other instances.
+    pub fn broadcast_user_message(&self, session_id: String, message: crate::thread::UserMessage) {
+        self.outbound_tx
+            .try_send(ThreadSyncMessage::UserMessage {
+                session_id,
+                client_id: self.client_id.clone(),
+                op_id: uuid::Uuid::new_v4().to_string(),
+                message,
+            })
+            .ok();
+    }
+
+    /// Publishes a turn-completion signal to the other instances.
+    pub fn broadcast_turn_complete(&self, session_id: String) {
+        self.outbound_tx
+            .try_send(ThreadSyncMessage::TurnComplete {
+                session_id,
+                client_id: self.client_id.clone(),
+                op_id: uuid::Uuid::new_v4().to_string(),
+            })
+            .ok();
+    }
+
     /// Publishes a stream event from an async context, if the bus has been
     /// initialized. No-op when the bus is absent (tests, or before init).
     pub fn broadcast_stream_global(
@@ -190,6 +230,17 @@ impl ThreadSyncBus {
         }
         cx.read_global::<GlobalThreadSyncBus, ()>(|bus, app| {
             bus.0.read(app).broadcast_stream(session_id, event)
+        });
+    }
+
+    /// Publishes a turn-completion signal from an async context, if the bus has
+    /// been initialized. No-op when the bus is absent (tests, or before init).
+    pub fn broadcast_turn_complete_global(cx: &AsyncApp, session_id: String) {
+        if !cx.has_global::<GlobalThreadSyncBus>() {
+            return;
+        }
+        cx.read_global::<GlobalThreadSyncBus, ()>(|bus, app| {
+            bus.0.read(app).broadcast_turn_complete(session_id)
         });
     }
 
