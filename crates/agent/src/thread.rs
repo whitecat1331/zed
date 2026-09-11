@@ -831,6 +831,19 @@ pub trait ThreadEnvironment {
             "Starting debug sessions is not supported in this environment"
         )))
     }
+
+    /// Restarts an existing debug session through the host UI, if the environment provides one.
+    fn restart_session(
+        &self,
+        session_id: u64,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<()>> {
+        let _ = session_id;
+        let _ = cx;
+        Task::ready(Err(anyhow::anyhow!(
+            "Restarting debug sessions is not supported in this environment"
+        )))
+    }
 }
 
 /// A request to create a new sibling thread.

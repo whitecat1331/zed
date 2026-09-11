@@ -355,6 +355,13 @@ pub trait DebuggerProvider {
         cx: &mut App,
     ) -> Result<DebugSessionStartInfo>;
 
+    fn restart_session(
+        &self,
+        session_id: u64,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<()>>;
+
     fn spawn_task_or_modal(
         &self,
         workspace: &mut Workspace,

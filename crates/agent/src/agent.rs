@@ -445,6 +445,12 @@ pub trait DebuggerHost {
         request: DebugSessionRequest,
         cx: &mut AsyncApp,
     ) -> Task<Result<DebugSessionInfo>>;
+
+    fn restart_session(
+        &self,
+        session_id: u64,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<()>>;
 }
 
 pub struct NativeAgent {
@@ -3530,6 +3536,24 @@ impl ThreadEnvironment for NativeThreadEnvironment {
             Err(err) => return Task::ready(Err(err)),
         };
         host.start_debug_session(request, cx)
+    }
+
+    fn restart_session(
+        &self,
+        session_id: u64,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<()>> {
+        let host = match self.agent.read_with(cx, |agent, _| agent.debugger_host()) {
+            Ok(Some(host)) => host,
+            Ok(None) => {
+                return Task::ready(Err(anyhow!(
+                    "No debugger host is registered. This usually means the \
+                     agent panel hasn't been initialized in this workspace."
+                )));
+            }
+            Err(err) => return Task::ready(Err(err)),
+        };
+        host.restart_session(session_id, cx)
     }
 }
 

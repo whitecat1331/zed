@@ -221,6 +221,20 @@ impl Workspace {
         )
     }
 
+    pub fn restart_debug_session(
+        &mut self,
+        session_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some(provider) = self.debugger_provider.as_ref() else {
+            return Task::ready(Err(anyhow!(
+                "No debugger provider is registered for this workspace"
+            )));
+        };
+        provider.restart_session(session_id, window, cx)
+    }
+
     pub fn spawn_in_terminal(
         self: &mut Workspace,
         spawn_in_terminal: SpawnInTerminal,

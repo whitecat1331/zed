@@ -5020,6 +5020,27 @@ impl agent::DebuggerHost for AgentPanelDebuggerHost {
             })
         })
     }
+
+    fn restart_session(
+        &self,
+        session_id: u64,
+        cx: &mut gpui::AsyncApp,
+    ) -> Task<Result<()>> {
+        let panel = self.panel.clone();
+        let window = self.window;
+        cx.spawn(async move |cx| {
+            let workspace = panel.read_with(cx, |panel, _cx| panel.workspace.clone())?;
+            let workspace = workspace
+                .upgrade()
+                .ok_or_else(|| anyhow!("Workspace is no longer available"))?;
+            let task = window.update(cx, |_root, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.restart_debug_session(session_id, window, cx)
+                })
+            })?;
+            task.await
+        })
+    }
 }
 
 fn task_context_for_worktree(

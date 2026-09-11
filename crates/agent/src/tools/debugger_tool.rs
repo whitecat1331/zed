@@ -859,7 +859,7 @@ impl DebuggerTool {
                 None
             }
             ControlAction::Restart => {
-                let task = cx.update(|cx| api.restart_session(session_id, cx));
+                let task = self.environment.restart_session(session_id.to_proto(), cx);
                 task.await?;
                 None
             }

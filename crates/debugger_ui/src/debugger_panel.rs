@@ -409,21 +409,26 @@ impl DebugPanel {
         mut curr_session: Entity<Session>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Task<Result<()>> {
         while let Some(parent_session) = curr_session.read(cx).parent_session().cloned() {
             curr_session = parent_session;
         }
 
         let Some(worktree) = curr_session.read(cx).worktree() else {
-            log::error!("Attempted to restart a non-running session");
-            return;
+            return Task::ready(Err(anyhow!(
+                "Attempted to restart a non-running session"
+            )));
         };
 
         let dap_store_handle = self.project.read(cx).dap_store();
         let label = curr_session.read(cx).label();
         let quirks = curr_session.read(cx).quirks();
         let adapter = curr_session.read(cx).adapter();
-        let binary = curr_session.read(cx).binary().cloned().unwrap();
+        let Some(binary) = curr_session.read(cx).binary().cloned() else {
+            return Task::ready(Err(anyhow!(
+                "debugger session has no launch config; cannot restart"
+            )));
+        };
         let task_context = curr_session.read(cx).task_context().clone();
 
         let curr_session_id = curr_session.read(cx).session_id();
@@ -465,7 +470,26 @@ impl DebugPanel {
 
             Ok(())
         })
-        .detach_and_log_err(cx);
+    }
+
+    pub(crate) fn restart_session_by_id(
+        &mut self,
+        session_id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let dap_store = self.project.read(cx).dap_store();
+        let Some(session) = dap_store.read(cx).session_by_id(session_id) else {
+            return Task::ready(Err(anyhow!(
+                "Could not find debugger session {session_id:?}"
+            )));
+        };
+
+        let mut root = session;
+        while let Some(parent) = root.read(cx).parent_session().cloned() {
+            root = parent;
+        }
+        self.handle_restart_request(root, window, cx)
     }
 
     pub fn handle_start_debugging_request(
@@ -1438,7 +1462,8 @@ async fn register_session_inner(
             window,
             move |this, session, event: &SessionStateEvent, window, cx| match event {
                 SessionStateEvent::Restart => {
-                    this.handle_restart_request(session.clone(), window, cx);
+                    this.handle_restart_request(session.clone(), window, cx)
+                        .detach_and_log_err(cx);
                 }
                 SessionStateEvent::SpawnChildSession { request } => {
                     this.handle_start_debugging_request(request, session.clone(), window, cx);
@@ -1958,6 +1983,17 @@ impl workspace::DebuggerProvider for DebuggerProvider {
     ) -> Result<DebugSessionStartInfo> {
         self.0.update(cx, |debug_panel, cx| {
             debug_panel.start_session_result(definition, context, buffer, worktree_id, window, cx)
+        })
+    }
+
+    fn restart_session(
+        &self,
+        session_id: u64,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        self.0.update(cx, |debug_panel, cx| {
+            debug_panel.restart_session_by_id(SessionId::from_proto(session_id), window, cx)
         })
     }
 
