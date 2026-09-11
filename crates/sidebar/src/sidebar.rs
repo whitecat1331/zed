@@ -3927,11 +3927,6 @@ impl Sidebar {
         if self.is_thread_active_in_workspace(&metadata.thread_id, workspace, cx) {
             workspace.update(cx, |workspace, cx| {
                 workspace.focus_panel::<AgentPanel>(window, cx);
-                if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                    panel.update(cx, |panel, cx| {
-                        panel.reload_active_thread_if_stale(window, cx);
-                    });
-                }
             });
             return;
         }
