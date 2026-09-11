@@ -508,6 +508,8 @@ pub struct ThreadMetadataStore {
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
     in_flight_archives: HashMap<ThreadId, (Task<()>, async_channel::Sender<()>)>,
     _db_operations_task: Task<()>,
+    #[cfg(not(any(test, feature = "test-support")))]
+    _change_observer_task: Task<()>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -1235,6 +1237,9 @@ impl ThreadMetadataStore {
             }
         });
 
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _change_observer_task = Self::start_change_observer(cx);
+
         let mut this = Self {
             db,
             threads: HashMap::default(),
@@ -1246,9 +1251,50 @@ impl ThreadMetadataStore {
             pending_thread_ops_tx: tx,
             in_flight_archives: HashMap::default(),
             _db_operations_task,
+            #[cfg(not(any(test, feature = "test-support")))]
+            _change_observer_task,
         };
         let _ = this.reload(cx);
         this
+    }
+
+    /// Polls the sidebar metadata database for external writes and reloads the
+    /// in-memory cache when the fingerprint changes. The first read only
+    /// establishes a baseline so startup does not trigger a spurious reload.
+    #[cfg(not(any(test, feature = "test-support")))]
+    fn start_change_observer(cx: &mut Context<Self>) -> Task<()> {
+        let poll_interval = std::time::Duration::from_millis(500);
+
+        cx.spawn(async move |this, cx| {
+            let mut last_fingerprint: Option<String> = None;
+            loop {
+                let Some(database) = this.update(cx, |store, _cx| store.db.clone()).ok() else {
+                    return;
+                };
+
+                let fingerprint = cx
+                    .background_spawn(async move { database.change_fingerprint() })
+                    .await;
+
+                if let Ok(Some(fingerprint)) = fingerprint {
+                    if last_fingerprint.as_ref() != Some(&fingerprint) {
+                        let had_baseline = last_fingerprint.is_some();
+                        last_fingerprint = Some(fingerprint);
+                        if had_baseline
+                            && this
+                                .update(cx, |store, cx| {
+                                    let _ = store.reload(cx);
+                                })
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+
+                cx.background_executor().timer(poll_interval).await;
+            }
+        })
     }
 
     fn dedup_db_operations(operations: Vec<DbOperation>) -> Vec<DbOperation> {
@@ -1509,6 +1555,17 @@ impl ThreadMetadataDb {
     /// Only returns threads that have a `session_id`.
     pub fn list(&self) -> anyhow::Result<Vec<ThreadMetadata>> {
         self.select::<ThreadMetadata>(Self::LIST_QUERY)?()
+    }
+
+    /// Returns a cheap fingerprint of the sidebar metadata table — row count,
+    /// newest `updated_at`, and the number of archived rows — used by the
+    /// cross-instance change observer to detect external list changes.
+    #[cfg(not(any(test, feature = "test-support")))]
+    pub fn change_fingerprint(&self) -> anyhow::Result<Option<String>> {
+        let mut select = self.select_row_bound::<(), String>(
+            "SELECT COUNT(*) || ':' || COALESCE(MAX(updated_at), '') || ':' || COALESCE(SUM(archived), 0) FROM sidebar_threads",
+        )?;
+        select(())
     }
 
     /// Upsert metadata for a thread.
