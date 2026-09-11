@@ -925,17 +925,28 @@ impl DapStore {
         };
         let task_context = root.read(cx).task_context().clone();
 
+        // Re-resolve the adapter binary rather than reusing the stored one. The
+        // stored binary carries the fixed TCP port of the previous adapter
+        // process; reusing it on relaunch makes the freshly spawned adapter
+        // connect on that stale port, which can leave vscode-js-debug's
+        // parent/child model in a state where it never re-issues its
+        // `startDebugging` reverse request and so never spawns the child
+        // debuggee session.
+        let definition = DebugTaskDefinition {
+            label: label.clone().unwrap_or_default(),
+            adapter: adapter.clone(),
+            config: binary.request_args.configuration.clone(),
+            tcp_connection: None,
+        };
+
         cx.spawn(async move |this, cx| {
             this.update(cx, |this, cx| this.shutdown_session(root_id, cx))?
                 .await
                 .log_err();
 
             let boot_task = this.update(cx, |this, cx| {
-                let dap_store = cx.weak_entity();
                 let session = this.new_session(label, adapter, task_context, None, quirks, cx);
-                session.update(cx, |session, cx| {
-                    session.boot(binary, worktree, dap_store, cx)
-                })
+                this.boot_session(session, definition, worktree, cx)
             })?;
 
             boot_task.await

@@ -1214,6 +1214,10 @@ impl Session {
 
         let mut success = true;
         if let Some(Ok(request)) = launch_request {
+            log::info!(
+                "Debug session {:?} received startDebugging reverse request",
+                self.id
+            );
             cx.emit(SessionStateEvent::SpawnChildSession { request });
         } else {
             log::error!(
