@@ -6,6 +6,11 @@
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
 [![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
 
+> **Hard fork notice.** This is a hard fork of [`zed-industries/zed`](https://github.com/zed-industries/zed).
+> It no longer tracks upstream `main` as a merge/rebase target; worthwhile upstream changes are cherry-picked in.
+> The fork's core, fork-specific work is the revived agent **debugger tool** (`revive-debugger-tool`).
+> AI-assisted contributions are governed by [AI_POLICY.md](./AI_POLICY.md).
+
 Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
 
 ---

@@ -59,8 +59,8 @@ submitted. **If you'd like your PR to have the best chance of being merged**:
 - If the change is visible in the UI, attach **screenshots or screen recordings**.
 - Make the PR about **one thing only**, e.g. if it's a bugfix, don't add two
   features and a refactoring on top of that.
-- Keep AI assistance under your judgement and responsibility: it's unlikely
-  we'll merge a vibe-coded PR that the author doesn't understand.
+- AI-assisted work must satisfy the [AI Policy](./AI_POLICY.md): disclose the
+  primary author and model(s), and attach debugger-harness acceptance evidence.
 
 **A note on open pull requests:** currently we cap them at **three per author**.
 We're lucky to get a lot of contributions, and the pattern we've seen is that landing
@@ -81,17 +81,17 @@ Although there are few hard and fast rules, **typically we don't merge**:
 - Giant refactorings.
 - Non-trivial changes with no tests.
 - Stylistic code changes that do not alter any app logic. Reducing allocations, removing `.unwrap()`s, fixing typos is great; making code "more readable" — maybe not so much.
-- Anything that seems AI-generated without understanding the output.
+- AI-assisted changes that do not meet the [AI Policy](./AI_POLICY.md) (no
+  disclosure, or no debugger-harness evidence).
 
 ### AI Policy
 
-We welcome the use of LLMs for coding, but we hold a high bar for all contributions, and **we expect a human in the loop who genuinely understands the work an LLM produces** on their behalf. For that reason, we **don't accept contributions from autonomous agents**. Pull requests that appear to violate this may be closed, sometimes without notice.
+This fork's AI policy **replaces** upstream Zed's. See [AI_POLICY.md](./AI_POLICY.md).
 
-**Don't rely on LLMs to write the whole thing for you when communicating with the maintainers** (meaning replies to comments, PR descriptions, and alike). The readers are humans, and we'd like to hear from you, not from a model (we have models at home). If you're a non-native English speaker using an LLM to thoroughly edit or translate your messages to the maintainers, we'd encourage you to **put the machine translation in a quote block and include the original text in your native language after it**.
-
-If you think it's helpful/necessary to **share context from a chat with an LLM**, please put the **relevant part of it** in a quote block (e.g., using `>`), **disclose it as AI-generated**, and add your own commentary explaining **why it's relevant and what you take from it**.
-
-This policy was adapted from [ripgrep's AI policy](https://github.com/BurntSushi/ripgrep/blob/f0cec341ab95c25c691ad3d5754d4bd9eedde21f/AI_POLICY.md).
+In short: AI-assisted contributions are welcome, including work produced by
+autonomous agents, but every AI-assisted PR must (1) disclose the primary author
+and model(s), and (2) include full debugger-harness acceptance evidence. A PR
+that uses AI without both will not be considered.
 
 ### Internal advice for reviewers
 
