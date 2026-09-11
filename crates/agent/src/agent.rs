@@ -446,11 +446,7 @@ pub trait DebuggerHost {
         cx: &mut AsyncApp,
     ) -> Task<Result<DebugSessionInfo>>;
 
-    fn restart_session(
-        &self,
-        session_id: u64,
-        cx: &mut AsyncApp,
-    ) -> Task<Result<()>>;
+    fn restart_session(&self, session_id: u64, cx: &mut AsyncApp) -> Task<Result<()>>;
 }
 
 pub struct NativeAgent {
@@ -798,9 +794,16 @@ impl NativeAgent {
     ) {
         let poll_interval = Duration::from_millis(500);
 
-        let Ok(database) = database_future.await.map_err(|err| anyhow!(err)) else {
-            return;
+        let database = match database_future.await {
+            Ok(database) => database,
+            Err(err) => {
+                log::error!(
+                    "[THREAD_SYNC] content observer failed to open threads database: {err:?}"
+                );
+                return;
+            }
         };
+        log::info!("[THREAD_SYNC] content observer started");
 
         let mut last_fingerprint: Option<String> = None;
         loop {
@@ -809,26 +812,32 @@ impl NativeAgent {
                     if last_fingerprint.as_ref() != Some(&fingerprint) {
                         let had_baseline = last_fingerprint.is_some();
                         last_fingerprint = Some(fingerprint);
-                        if had_baseline
-                            && this
+                        if had_baseline {
+                            log::info!("[THREAD_SYNC] content fingerprint changed: {fingerprint}");
+                            if this
                                 .update(cx, |_agent, cx| cx.emit(ThreadsDatabaseChanged))
                                 .is_err()
-                        {
-                            return;
+                            {
+                                return;
+                            }
                         }
                     }
                 }
                 Ok(None) => {
-                    if last_fingerprint.is_some()
-                        && this
+                    if last_fingerprint.is_some() {
+                        log::info!("[THREAD_SYNC] content table emptied");
+                        if this
                             .update(cx, |_agent, cx| cx.emit(ThreadsDatabaseChanged))
                             .is_err()
-                    {
-                        return;
+                        {
+                            return;
+                        }
                     }
                     last_fingerprint = None;
                 }
-                Err(_) => {}
+                Err(err) => {
+                    log::warn!("[THREAD_SYNC] content fingerprint query failed: {err:?}");
+                }
             }
 
             cx.background_executor().timer(poll_interval).await;
@@ -3605,11 +3614,7 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         host.start_debug_session(request, cx)
     }
 
-    fn restart_session(
-        &self,
-        session_id: u64,
-        cx: &mut AsyncApp,
-    ) -> Task<Result<()>> {
+    fn restart_session(&self, session_id: u64, cx: &mut AsyncApp) -> Task<Result<()>> {
         let host = match self.agent.read_with(cx, |agent, _| agent.debugger_host()) {
             Ok(Some(host)) => host,
             Ok(None) => {

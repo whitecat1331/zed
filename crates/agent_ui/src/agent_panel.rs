@@ -1186,6 +1186,7 @@ pub struct AgentPanel {
     _active_draft_reclaim_observation: Option<Subscription>,
     _thread_metadata_store_subscription: Subscription,
     _threads_db_subscription: Option<Subscription>,
+    _connection_store_observation: Option<Subscription>,
     last_context_source: Option<AgentContextSource>,
 
     is_active: bool,
@@ -1601,12 +1602,20 @@ impl AgentPanel {
             _active_draft_reclaim_observation: None,
             _thread_metadata_store_subscription,
             _threads_db_subscription: None,
+            _connection_store_observation: None,
             last_context_source: None,
             is_active: false,
         };
 
         panel.ensure_native_agent_connection(cx);
         panel.observe_threads_database_changes(window, cx);
+        let connection_store = panel.connection_store.clone();
+        panel._connection_store_observation =
+            Some(
+                cx.observe_in(&connection_store, window, |this, _store, window, cx| {
+                    this.observe_threads_database_changes(window, cx);
+                }),
+            );
         panel
     }
 
@@ -3010,10 +3019,14 @@ impl AgentPanel {
                         &native_agent,
                         window,
                         |this, _agent, _event, window, cx| {
+                            log::info!(
+                                "[THREAD_SYNC] ThreadsDatabaseChanged fired, reloading active thread"
+                            );
                             this.reload_active_thread_if_stale(window, cx);
                         },
                     ),
                 );
+                log::info!("[THREAD_SYNC] subscribed to ThreadsDatabaseChanged");
             })
             .ok();
         })
@@ -4320,6 +4333,7 @@ impl AgentPanel {
     /// database), discard the stale in-memory session and reload it from
     /// disk. Driven by the cross-instance change observer.
     pub fn reload_active_thread_if_stale(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        log::info!("[THREAD_SYNC] reload_active_thread_if_stale called");
         let Some(conversation_view) = self.active_conversation_view().cloned() else {
             return;
         };
@@ -4372,6 +4386,7 @@ impl AgentPanel {
             if disk_updated_at <= memory_updated_at {
                 return;
             }
+            log::info!("[THREAD_SYNC] reloading stale thread (disk newer than memory)");
 
             this.update_in(cx, |this, window, cx| {
                 // Discard the stale in-memory session before rebuilding so
@@ -5070,11 +5085,7 @@ impl agent::DebuggerHost for AgentPanelDebuggerHost {
         })
     }
 
-    fn restart_session(
-        &self,
-        session_id: u64,
-        cx: &mut gpui::AsyncApp,
-    ) -> Task<Result<()>> {
+    fn restart_session(&self, session_id: u64, cx: &mut gpui::AsyncApp) -> Task<Result<()>> {
         let panel = self.panel.clone();
         let window = self.window;
         cx.spawn(async move |cx| {
