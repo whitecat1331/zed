@@ -668,7 +668,7 @@ impl ThreadsDatabase {
                 SELECT COUNT(*) || ':' || COALESCE(MAX(updated_at), '') FROM threads
             "})?;
 
-            Ok(select(())?)
+            select(())
         })
     }
 
