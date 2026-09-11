@@ -497,6 +497,13 @@ enum SkillsState {
 
 impl gpui::EventEmitter<SkillLoadingIssuesUpdated> for NativeAgent {}
 
+/// Emitted when another Zed instance writes to the shared threads database.
+/// The content-sync layer listens for this to reload stale open threads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadsDatabaseChanged;
+
+impl gpui::EventEmitter<ThreadsDatabaseChanged> for NativeAgent {}
+
 static RULES_FILE_REL_PATHS: LazyLock<Vec<Arc<RelPath>>> = LazyLock::new(|| {
     RULES_FILE_NAMES
         .iter()
@@ -633,6 +640,17 @@ impl NativeAgent {
                 cx.set_global(SkillIndex::default());
             }
 
+            // A cross-instance poller would keep GPUI's deterministic test
+            // scheduler permanently busy, so only run it in production.
+            #[cfg(not(any(test, feature = "test-support")))]
+            {
+                let database_future = ThreadsDatabase::connect(cx);
+                cx.spawn(async move |this, cx| {
+                    Self::run_threads_db_observer(this, database_future, cx).await;
+                })
+                .detach();
+            }
+
             Self {
                 sessions: HashMap::default(),
                 pending_sessions: HashMap::default(),
@@ -765,6 +783,55 @@ impl NativeAgent {
             if updated.is_err() || watched_root_removed {
                 return;
             }
+        }
+    }
+
+    /// Polls the shared threads database for external writes and emits
+    /// [`ThreadsDatabaseChanged`] when the content fingerprint changes from what
+    /// this process last observed. The first read only establishes a baseline so
+    /// startup does not emit a spurious change.
+    #[cfg(not(any(test, feature = "test-support")))]
+    async fn run_threads_db_observer(
+        this: WeakEntity<Self>,
+        database_future: Shared<Task<Result<Arc<ThreadsDatabase>, Arc<anyhow::Error>>>>,
+        cx: &mut AsyncApp,
+    ) {
+        let poll_interval = Duration::from_millis(500);
+
+        let Ok(database) = database_future.await.map_err(|err| anyhow!(err)) else {
+            return;
+        };
+
+        let mut last_fingerprint: Option<String> = None;
+        loop {
+            match database.change_fingerprint().await {
+                Ok(Some(fingerprint)) => {
+                    if last_fingerprint.as_ref() != Some(&fingerprint) {
+                        let had_baseline = last_fingerprint.is_some();
+                        last_fingerprint = Some(fingerprint);
+                        if had_baseline
+                            && this
+                                .update(cx, |_agent, cx| cx.emit(ThreadsDatabaseChanged))
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    if last_fingerprint.is_some()
+                        && this
+                            .update(cx, |_agent, cx| cx.emit(ThreadsDatabaseChanged))
+                            .is_err()
+                    {
+                        return;
+                    }
+                    last_fingerprint = None;
+                }
+                Err(_) => {}
+            }
+
+            cx.background_executor().timer(poll_interval).await;
         }
     }
 

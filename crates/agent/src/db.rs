@@ -654,6 +654,24 @@ impl ThreadsDatabase {
         })
     }
 
+    /// Returns a cheap fingerprint of the threads table — the row count and the
+    /// newest `updated_at` — used by the cross-instance change observer to detect
+    /// external writes without deserializing thread content. `None` when the
+    /// table is empty.
+    #[cfg(not(any(test, feature = "test-support")))]
+    pub fn change_fingerprint(&self) -> Task<Result<Option<String>>> {
+        let connection = self.connection.clone();
+
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            let mut select = connection.select_row_bound::<(), String>(indoc! {"
+                SELECT COUNT(*) || ':' || COALESCE(MAX(updated_at), '') FROM threads
+            "})?;
+
+            Ok(select(())?)
+        })
+    }
+
     pub fn save_thread(
         &self,
         id: acp::SessionId,
