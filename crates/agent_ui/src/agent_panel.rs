@@ -1185,6 +1185,7 @@ pub struct AgentPanel {
     _draft_editor_observation: Option<Subscription>,
     _active_draft_reclaim_observation: Option<Subscription>,
     _thread_metadata_store_subscription: Subscription,
+    _threads_db_subscription: Option<Subscription>,
     last_context_source: Option<AgentContextSource>,
 
     is_active: bool,
@@ -1493,7 +1494,7 @@ impl AgentPanel {
         })
     }
 
-    pub(crate) fn new(workspace: &Workspace, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let fs = workspace.app_state().fs.clone();
         let user_store = workspace.app_state().user_store.clone();
         let project = workspace.project();
@@ -1565,7 +1566,7 @@ impl AgentPanel {
         })
         .detach();
 
-        let panel = Self {
+        let mut panel = Self {
             workspace_id,
             base_view,
             last_created_entry_kind: AgentPanelEntryKind::Thread,
@@ -1599,11 +1600,13 @@ impl AgentPanel {
             _draft_editor_observation: None,
             _active_draft_reclaim_observation: None,
             _thread_metadata_store_subscription,
+            _threads_db_subscription: None,
             last_context_source: None,
             is_active: false,
         };
 
         panel.ensure_native_agent_connection(cx);
+        panel.observe_threads_database_changes(window, cx);
         panel
     }
 
@@ -2970,6 +2973,53 @@ impl AgentPanel {
         });
     }
 
+    /// Subscribes to the native agent's `ThreadsDatabaseChanged` event once the
+    /// connection is established, so an external write to the shared threads
+    /// database reloads the active stale thread.
+    fn observe_threads_database_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self._threads_db_subscription.is_some() {
+            return;
+        }
+
+        let Some(connect_task) = self.connection_store.update(cx, |store, cx| {
+            store
+                .entry(&Agent::NativeAgent)
+                .map(|entry| entry.read(cx).wait_for_connection())
+        }) else {
+            return;
+        };
+
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(state) = connect_task.await else {
+                return;
+            };
+            let Some(native_agent) = state
+                .connection
+                .downcast::<agent::NativeAgentConnection>()
+                .map(|connection| connection.0.clone())
+            else {
+                return;
+            };
+
+            this.update_in(cx, |this, window, cx| {
+                if this._threads_db_subscription.is_some() {
+                    return;
+                }
+                this._threads_db_subscription = Some(
+                    cx.subscribe_in::<agent::NativeAgent, agent::ThreadsDatabaseChanged>(
+                        &native_agent,
+                        window,
+                        |this, _agent, _event, window, cx| {
+                            this.reload_active_thread_if_stale(window, cx);
+                        },
+                    ),
+                );
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub fn activate_draft(
         &mut self,
         focus: bool,
@@ -4268,8 +4318,7 @@ impl AgentPanel {
     /// If the active native thread's on-disk copy is newer than the
     /// in-memory copy (e.g. another Zed instance wrote to the shared threads
     /// database), discard the stale in-memory session and reload it from
-    /// disk. Used when the user re-activates an already-open thread in the
-    /// sidebar.
+    /// disk. Driven by the cross-instance change observer.
     pub fn reload_active_thread_if_stale(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(conversation_view) = self.active_conversation_view().cloned() else {
             return;
