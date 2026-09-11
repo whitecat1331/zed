@@ -18,8 +18,9 @@ Using AI — assistants, coding agents, or models — to write code, documentati
 or any other contribution **is allowed**, including work that is wholly
 AI-generated. There is no blanket ban on autonomous agents.
 
-That permission carries two non-negotiable obligations. A PR that uses AI and
-does not satisfy both **will not be considered**.
+That permission carries two **hard** obligations (A and B) and one **soft**
+obligation (C). A PR that uses AI and does not satisfy A and B **will not be
+considered**. A PR that also satisfies C is **reviewed first**.
 
 ## A. Disclose the primary author
 
@@ -51,11 +52,28 @@ by the `debugger-loop`:
 Attach the report to the PR and state the commit SHA the evidence was produced
 against. The evidence must correspond to the **exact commit** the PR is based on.
 
-## If either rule is unmet
+## C. Show the root cause → fix → verification (soft)
+
+This is **soft-required**: a PR that includes it is reviewed **first**; one that
+omits it is not rejected, only deprioritized. It is the proof that the author
+understands the change, not just that a script passed.
+
+- **Bug fix:** state the **root cause** (found), the **fix** (what changed and
+  why), and the **verification** (how you know it is correct — tests, harness
+  evidence, or both).
+- **Feature / refactor / docs:** state the **motivation**, the **approach**, and
+  the **verification**. There is no "found" for a change that was not a bug.
+
+Keep it proportional to the change — a one-line fix owes a one-line root cause
+and a one-line verification, not an essay.
+
+## If a hard rule is unmet
 
 A PR that uses AI without a clear AI Disclosure, or without the required
-debugger-harness evidence, will be **closed or left unreviewed**. The bar is the
-evidence, not the tools that produced the change.
+debugger-harness evidence, will be **closed or left unreviewed**. A PR that omits
+the root-cause narrative (C) is **not** rejected — it is simply reviewed after
+PRs that include it. The bar is the evidence, not the tools that produced the
+change.
 
 ## Rationale
 

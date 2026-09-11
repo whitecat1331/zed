@@ -21,6 +21,15 @@
 - How can other people (reviewers) test your changes? Is there anything specific they need to know?
 - If relevant, what platforms did you test these changes on, and are there any important ones you can't test?
 
+## Root cause → fix → verification
+
+> Soft-required for AI-assisted PRs (see [AI_POLICY.md](./AI_POLICY.md)). PRs that
+> fill this out are reviewed first.
+
+- **Root cause** (bug fix) or **motivation** (feature/refactor):
+- **Fix** / **approach** (what changed and why):
+- **Verification** (how you know it's correct — tests, harness evidence, or both):
+
 ## Debugger harness evidence
 
 > Required if AI was used (see [AI_POLICY.md](./AI_POLICY.md)). If no AI was used, write "N/A — no AI used".
