@@ -2,14 +2,19 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender};
 use collections::HashMap;
-use gpui::{App, AppContext, AsyncApp, BackgroundExecutor, Context, Entity, EventEmitter, Global, Task};
+use gpui::{
+    App, AppContext, AsyncApp, BackgroundExecutor, Context, Entity, EventEmitter, Global, Task,
+};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use smol::io::{AsyncReadExt, AsyncWriteExt};
@@ -23,23 +28,49 @@ const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ThreadSyncStreamEvent {
     Text(String),
-    Thinking { text: String, signature: Option<String> },
+    Thinking {
+        text: String,
+        signature: Option<String>,
+    },
     Stop(String),
 }
 
-/// A message on the local cross-instance thread sync bus.
+/// An operation on the local cross-instance thread sync log. The hub assigns a
+/// sequence number to every operation and broadcasts it to all peers, so every
+/// instance applies the same operations in the same total order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ThreadSyncMessage {
     Stream {
         session_id: String,
+        /// Stable identity of the process that authored this operation.
+        client_id: String,
+        /// Per-operation unique id, used to de-duplicate self-echoes.
+        op_id: String,
         event: ThreadSyncStreamEvent,
     },
 }
 
-/// Emitted on the foreground when a peer publishes a message.
+impl ThreadSyncMessage {
+    pub fn client_id(&self) -> &str {
+        match self {
+            ThreadSyncMessage::Stream { client_id, .. } => client_id,
+        }
+    }
+}
+
+/// A sequenced operation: the hub-assigned `seq` plus the operation itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadSyncEnvelope {
+    pub seq: u64,
+    pub message: ThreadSyncMessage,
+}
+
+/// Emitted on the foreground when a peer publishes a message. The pump filters
+/// out envelopes authored by this process, so a process never applies its own
+/// stream twice.
 #[derive(Debug, Clone)]
 pub enum ThreadSyncBusEvent {
-    Message(ThreadSyncMessage),
+    Message(ThreadSyncEnvelope),
 }
 
 impl EventEmitter<ThreadSyncBusEvent> for ThreadSyncBus {}
@@ -49,10 +80,11 @@ struct GlobalThreadSyncBus(Entity<ThreadSyncBus>);
 impl Global for GlobalThreadSyncBus {}
 
 /// The local inter-process bus that broadcasts streamed thread content between
-/// Zed instances. One process acts as the hub and the rest connect as clients;
-/// the hub forwards every message to the other peers without echoing it back to
-/// its sender.
+/// Zed instances. One process acts as the hub and the rest connect as clients.
+/// The hub sequences every operation and broadcasts it back to all clients
+/// (including the originator); each client drops its own echoes by `client_id`.
 pub struct ThreadSyncBus {
+    client_id: String,
     outbound_tx: Sender<ThreadSyncMessage>,
     _pump_task: Task<()>,
     _network_task: Task<()>,
@@ -71,8 +103,14 @@ struct ControlFile {
 }
 
 enum Role {
-    Hub { listener: TcpListener, secret: String },
-    Client { stream: TcpStream, secret: String },
+    Hub {
+        listener: TcpListener,
+        secret: String,
+    },
+    Client {
+        stream: TcpStream,
+        secret: String,
+    },
 }
 
 impl ThreadSyncBus {
@@ -90,13 +128,22 @@ impl ThreadSyncBus {
     }
 
     fn new(cx: &mut Context<Self>) -> Self {
+        let client_id = uuid::Uuid::new_v4().to_string();
         let (outbound_tx, outbound_rx) = async_channel::unbounded();
-        let (inbound_tx, inbound_rx) = async_channel::unbounded();
+        let (inbound_tx, inbound_rx) = async_channel::unbounded::<ThreadSyncEnvelope>();
 
+        let pump_client_id = client_id.clone();
         let pump_task = cx.spawn(async move |this, cx| {
-            while let Ok(message) = inbound_rx.recv().await {
+            while let Ok(envelope) = inbound_rx.recv().await {
+                // The hub broadcasts every operation back to its originator so
+                // every instance applies the same total order. Drop our own
+                // echoes here: the generating process already applied them via
+                // the normal stream path.
+                if envelope.message.client_id() == pump_client_id {
+                    continue;
+                }
                 if this
-                    .update(cx, |_bus, cx| cx.emit(ThreadSyncBusEvent::Message(message)))
+                    .update(cx, |_bus, cx| cx.emit(ThreadSyncBusEvent::Message(envelope)))
                     .is_err()
                 {
                     return;
@@ -110,6 +157,7 @@ impl ThreadSyncBus {
         });
 
         Self {
+            client_id,
             outbound_tx,
             _pump_task: pump_task,
             _network_task: network_task,
@@ -121,13 +169,22 @@ impl ThreadSyncBus {
     /// best-effort and the completed turn is recovered from disk).
     pub fn broadcast_stream(&self, session_id: String, event: ThreadSyncStreamEvent) {
         self.outbound_tx
-            .try_send(ThreadSyncMessage::Stream { session_id, event })
+            .try_send(ThreadSyncMessage::Stream {
+                session_id,
+                client_id: self.client_id.clone(),
+                op_id: uuid::Uuid::new_v4().to_string(),
+                event,
+            })
             .ok();
     }
 
     /// Publishes a stream event from an async context, if the bus has been
     /// initialized. No-op when the bus is absent (tests, or before init).
-    pub fn broadcast_stream_global(cx: &AsyncApp, session_id: String, event: ThreadSyncStreamEvent) {
+    pub fn broadcast_stream_global(
+        cx: &AsyncApp,
+        session_id: String,
+        event: ThreadSyncStreamEvent,
+    ) {
         if !cx.has_global::<GlobalThreadSyncBus>() {
             return;
         }
@@ -139,7 +196,7 @@ impl ThreadSyncBus {
     async fn run_network(
         executor: BackgroundExecutor,
         outbound_rx: Receiver<ThreadSyncMessage>,
-        inbound_tx: Sender<ThreadSyncMessage>,
+        inbound_tx: Sender<ThreadSyncEnvelope>,
     ) {
         loop {
             match acquire_role().await {
@@ -165,20 +222,25 @@ impl ThreadSyncBus {
         listener: TcpListener,
         secret: String,
         outbound_rx: &Receiver<ThreadSyncMessage>,
-        inbound_tx: &Sender<ThreadSyncMessage>,
+        inbound_tx: &Sender<ThreadSyncEnvelope>,
     ) {
-        let clients: Arc<Mutex<HashMap<u64, Sender<ThreadSyncMessage>>>> =
+        let clients: Arc<Mutex<HashMap<u64, Sender<ThreadSyncEnvelope>>>> =
             Arc::new(Mutex::new(HashMap::default()));
+        let next_seq = Arc::new(AtomicU64::new(0));
 
-        // Forward this process's own messages to every client. They were
-        // already applied locally by the normal stream path, so no local emit.
+        // Sequence and forward this process's own messages to every client.
+        // They were already applied locally by the normal stream path, so there
+        // is no local emit here.
         let outbound_rx = outbound_rx.clone();
         let pump_clients = clients.clone();
+        let pump_seq = next_seq.clone();
         executor
             .spawn(async move {
                 while let Ok(message) = outbound_rx.recv().await {
+                    let seq = pump_seq.fetch_add(1, Ordering::Relaxed);
+                    let envelope = ThreadSyncEnvelope { seq, message };
                     for client in pump_clients.lock().values() {
-                        client.try_send(message.clone()).ok();
+                        client.try_send(envelope.clone()).ok();
                     }
                 }
             })
@@ -210,19 +272,21 @@ impl ThreadSyncBus {
             let mut write_stream = stream.clone();
             executor
                 .spawn(async move {
-                    while let Ok(message) = client_rx.recv().await {
-                        if write_frame(&mut write_stream, &message).await.is_err() {
+                    while let Ok(envelope) = client_rx.recv().await {
+                        if write_frame(&mut write_stream, &envelope).await.is_err() {
                             return;
                         }
                     }
                 })
                 .detach();
 
-            // Reader: forward this client's messages to the local pump and to
-            // the other clients (but not back to the sender).
+            // Reader: sequence this client's operations and forward them to the
+            // local pump and to every client (including the originator, which
+            // de-duplicates its own echo on the foreground).
             let mut read_stream = stream;
             let inbound_tx = inbound_tx.clone();
             let reader_clients = clients.clone();
+            let reader_seq = next_seq.clone();
             executor
                 .spawn(async move {
                     loop {
@@ -230,11 +294,11 @@ impl ThreadSyncBus {
                         else {
                             return;
                         };
-                        inbound_tx.send(message.clone()).await.ok();
-                        for (id, client) in reader_clients.lock().iter() {
-                            if *id != client_id {
-                                client.try_send(message.clone()).ok();
-                            }
+                        let seq = reader_seq.fetch_add(1, Ordering::Relaxed);
+                        let envelope = ThreadSyncEnvelope { seq, message };
+                        inbound_tx.send(envelope.clone()).await.ok();
+                        for client in reader_clients.lock().values() {
+                            client.try_send(envelope.clone()).ok();
                         }
                     }
                 })
@@ -247,7 +311,7 @@ impl ThreadSyncBus {
         mut stream: TcpStream,
         secret: String,
         outbound_rx: &Receiver<ThreadSyncMessage>,
-        inbound_tx: &Sender<ThreadSyncMessage>,
+        inbound_tx: &Sender<ThreadSyncEnvelope>,
     ) {
         if write_frame(&mut stream, &Hello { secret }).await.is_err() {
             return;
@@ -267,9 +331,9 @@ impl ThreadSyncBus {
 
         // Reader: run inline so `run_network` knows when the hub dropped us.
         loop {
-            match read_frame::<ThreadSyncMessage>(&mut stream).await {
-                Ok(message) => {
-                    inbound_tx.send(message).await.ok();
+            match read_frame::<ThreadSyncEnvelope>(&mut stream).await {
+                Ok(envelope) => {
+                    inbound_tx.send(envelope).await.ok();
                 }
                 Err(_) => {
                     drop(writer);

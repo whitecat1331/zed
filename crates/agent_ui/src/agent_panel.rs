@@ -3060,7 +3060,8 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let ThreadSyncBusEvent::Message(ThreadSyncMessage::Stream { session_id, event }) = event;
+        let ThreadSyncBusEvent::Message(envelope) = event;
+        let ThreadSyncMessage::Stream { session_id, event, .. } = &envelope.message;
         self.apply_remote_stream_event(session_id, event, window, cx);
     }
 
