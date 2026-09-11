@@ -6,6 +6,12 @@ tracks upstream `main` as a merge or rebase target; worthwhile upstream changes
 are cherry-picked in. This policy governs how artificial-intelligence tooling
 may be used to contribute to this fork.
 
+## Repository disclosure
+
+The majority of this fork was developed using **DeepSeek V4 Pro**, with
+assistance from **Claude Sonnet 4.6** and **Gemini 3.1 Pro**. This disclosure
+applies to the fork's own work, not only to external contributions.
+
 ## AI is welcome
 
 Using AI — assistants, coding agents, or models — to write code, documentation,

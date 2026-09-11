@@ -11,6 +11,9 @@
 > The fork's core, fork-specific work is the revived agent **debugger tool** (`revive-debugger-tool`).
 > AI-assisted contributions are governed by [AI_POLICY.md](./AI_POLICY.md).
 
+> **AI disclosure.** The majority of this fork was developed using DeepSeek V4 Pro,
+> with assistance from Claude Sonnet 4.6 and Gemini 3.1 Pro.
+
 Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
 
 ---
