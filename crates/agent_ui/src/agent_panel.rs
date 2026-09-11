@@ -11,7 +11,10 @@ use std::{
 };
 
 use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, ThreadStatus, line_range_suffix};
-use agent::{ContextServerRegistry, SharedThread, ThreadStore};
+use agent::{
+    ContextServerRegistry, SharedThread, ThreadStore, ThreadSyncBus, ThreadSyncBusEvent,
+    ThreadSyncMessage, ThreadSyncStreamEvent,
+};
 use agent_client_protocol::schema::v1 as acp;
 use agent_servers::AgentServer;
 use agent_settings::UserAgentsMd;
@@ -1186,6 +1189,7 @@ pub struct AgentPanel {
     _active_draft_reclaim_observation: Option<Subscription>,
     _thread_metadata_store_subscription: Subscription,
     _threads_db_subscription: Option<Subscription>,
+    _thread_sync_subscription: Option<Subscription>,
     _connection_store_observation: Option<Subscription>,
     last_context_source: Option<AgentContextSource>,
 
@@ -1602,6 +1606,7 @@ impl AgentPanel {
             _active_draft_reclaim_observation: None,
             _thread_metadata_store_subscription,
             _threads_db_subscription: None,
+            _thread_sync_subscription: None,
             _connection_store_observation: None,
             last_context_source: None,
             is_active: false,
@@ -2986,7 +2991,7 @@ impl AgentPanel {
     /// connection is established, so an external write to the shared threads
     /// database reloads the active stale thread.
     fn observe_threads_database_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self._threads_db_subscription.is_some() {
+        if self._threads_db_subscription.is_some() && self._thread_sync_subscription.is_some() {
             return;
         }
 
@@ -3011,26 +3016,93 @@ impl AgentPanel {
             };
 
             this.update_in(cx, |this, window, cx| {
-                if this._threads_db_subscription.is_some() {
-                    return;
+                if this._threads_db_subscription.is_none() {
+                    this._threads_db_subscription = Some(
+                        cx.subscribe_in::<agent::NativeAgent, agent::ThreadsDatabaseChanged>(
+                            &native_agent,
+                            window,
+                            |this, _agent, _event, window, cx| {
+                                log::info!(
+                                    "[THREAD_SYNC] ThreadsDatabaseChanged fired, reloading active thread"
+                                );
+                                this.reload_active_thread_if_stale(window, cx);
+                            },
+                        ),
+                    );
+                    log::info!("[THREAD_SYNC] subscribed to ThreadsDatabaseChanged");
                 }
-                this._threads_db_subscription = Some(
-                    cx.subscribe_in::<agent::NativeAgent, agent::ThreadsDatabaseChanged>(
-                        &native_agent,
-                        window,
-                        |this, _agent, _event, window, cx| {
-                            log::info!(
-                                "[THREAD_SYNC] ThreadsDatabaseChanged fired, reloading active thread"
-                            );
-                            this.reload_active_thread_if_stale(window, cx);
-                        },
-                    ),
-                );
-                log::info!("[THREAD_SYNC] subscribed to ThreadsDatabaseChanged");
+
+                if this._thread_sync_subscription.is_none()
+                    && let Some(bus) = ThreadSyncBus::try_global(cx)
+                {
+                    this._thread_sync_subscription = Some(
+                        cx.subscribe_in::<ThreadSyncBus, ThreadSyncBusEvent>(
+                            &bus,
+                            window,
+                            |this, _bus, event, window, cx| {
+                                this.handle_thread_sync_event(event, window, cx);
+                            },
+                        ),
+                    );
+                    log::info!("[THREAD_SYNC] subscribed to thread sync bus");
+                }
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Handles a message from another instance by mirroring its streamed
+    /// content into the matching open thread, or by reloading on completion.
+    fn handle_thread_sync_event(
+        &mut self,
+        event: &ThreadSyncBusEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ThreadSyncBusEvent::Message(ThreadSyncMessage::Stream { session_id, event }) = event;
+        self.apply_remote_stream_event(session_id, event, window, cx);
+    }
+
+    /// Mirrors streamed token deltas from another instance into this instance's
+    /// open copy of `session_id`, using the same assistant-content path the
+    /// local stream uses. Never touches a thread that is itself generating here.
+    fn apply_remote_stream_event(
+        &mut self,
+        session_id: &str,
+        event: &ThreadSyncStreamEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conversation_view) = self.active_conversation_view().cloned() else {
+            return;
+        };
+        let Some(acp_thread) = conversation_view.read(cx).root_thread(cx) else {
+            return;
+        };
+        if acp_thread.read(cx).session_id().to_string() != session_id {
+            return;
+        }
+        // Never clobber a thread that is actively generating in this instance.
+        if acp_thread.read(cx).status() == ThreadStatus::Generating {
+            return;
+        }
+
+        match event {
+            ThreadSyncStreamEvent::Text(text) => {
+                acp_thread.update(cx, |thread, cx| {
+                    thread.push_assistant_content_block(text.clone().into(), false, cx);
+                });
+            }
+            ThreadSyncStreamEvent::Thinking { text, .. } => {
+                acp_thread.update(cx, |thread, cx| {
+                    thread.push_assistant_content_block(text.clone().into(), true, cx);
+                });
+            }
+            ThreadSyncStreamEvent::Stop(_) => {
+                self.reload_active_thread_if_stale(window, cx);
+            }
+        }
     }
 
     pub fn activate_draft(
