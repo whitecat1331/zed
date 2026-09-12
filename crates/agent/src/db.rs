@@ -408,7 +408,7 @@ impl ThreadsDatabase {
         let task = executor
             .spawn({
                 let executor = executor.clone();
-                let tokio_handle = tokio_handle.clone();
+                let tokio_handle = tokio_handle;
                 async move {
                     let spawn_handle = tokio_handle.clone();
                     let database = spawn_handle
