@@ -38,6 +38,7 @@ fs.workspace = true
 futures.workspace = true
 git.workspace = true
 gpui.workspace = true
+gpui_tokio.workspace = true
 handlebars = { workspace = true, features = ["rust-embed"] }
 heck.workspace = true
 html_to_markdown.workspace = true
@@ -65,7 +66,7 @@ shell_command_parser.workspace = true
 sqlez.workspace = true
 smallvec.workspace = true
 smol.workspace = true
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
 streaming_diff.workspace = true
 strsim.workspace = true
 task.workspace = true
@@ -73,6 +74,7 @@ telemetry.workspace = true
 tempfile.workspace = true
 text.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 ui.workspace = true
 url.workspace = true
 util.workspace = true
@@ -102,7 +104,6 @@ eval_utils.workspace = true
 fs = { workspace = true, "features" = ["test-support"] }
 git = { workspace = true, "features" = ["test-support"] }
 gpui = { workspace = true, "features" = ["test-support"] }
-gpui_tokio.workspace = true
 language = { workspace = true, "features" = ["test-support"] }
 language_model = { workspace = true, "features" = ["test-support"] }
 lsp = { workspace = true, "features" = ["test-support"] }

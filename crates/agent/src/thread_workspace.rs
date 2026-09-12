@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use indoc::indoc;
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 use util::path_list::PathList;
 use uuid::Uuid;
 
@@ -66,6 +66,10 @@ impl WorkspaceStore {
             .with_context(|| format!("failed to connect to thread database at {url}"))?;
         Self::ensure_schema(&pool).await?;
         Ok(Self { pool })
+    }
+
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     async fn ensure_schema(pool: &PgPool) -> Result<()> {

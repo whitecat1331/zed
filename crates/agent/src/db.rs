@@ -1,8 +1,9 @@
+use crate::thread_workspace::WorkspaceStore;
 use crate::{AgentMessage, AgentMessageContent, UserMessage, UserMessageContent};
 use acp_thread::ClientUserMessageId;
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::AgentProfileId;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use collections::{HashMap, IndexMap};
 use futures::{FutureExt, future::Shared};
@@ -11,15 +12,10 @@ use indoc::indoc;
 use language_model::Speed;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use sqlez::{
-    bindable::{Bind, Column},
-    connection::Connection,
-    statement::Statement,
-};
+use sqlx::PgPool;
 use std::{io::ErrorKind, path::PathBuf, sync::Arc};
 use ui::{App, SharedString};
 use util::path_list::PathList;
-use zed_env_vars::ZED_STATELESS;
 
 pub type DbMessage = crate::Message;
 pub type DbSummary = crate::legacy_thread::DetailedSummaryState;
@@ -367,31 +363,27 @@ pub enum DataType {
     Zstd,
 }
 
-impl Bind for DataType {
-    fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
-        let value = match self {
+impl DataType {
+    fn as_str(&self) -> &'static str {
+        match self {
             DataType::Json => "json",
             DataType::Zstd => "zstd",
-        };
-        value.bind(statement, start_index)
+        }
     }
-}
 
-impl Column for DataType {
-    fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
-        let (value, next_index) = String::column(statement, start_index)?;
-        let data_type = match value.as_str() {
-            "json" => DataType::Json,
-            "zstd" => DataType::Zstd,
-            _ => anyhow::bail!("Unknown data type: {}", value),
-        };
-        Ok((data_type, next_index))
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "json" => Ok(DataType::Json),
+            "zstd" => Ok(DataType::Zstd),
+            _ => anyhow::bail!("Unknown data type: {value}"),
+        }
     }
 }
 
 pub(crate) struct ThreadsDatabase {
     executor: BackgroundExecutor,
-    connection: Arc<Mutex<Connection>>,
+    tokio_handle: tokio::runtime::Handle,
+    workspace_store: WorkspaceStore,
     /// In production, saves take real time (serialization, zstd, disk I/O) while
     /// the user keeps typing, so new save requests routinely arrive mid-write.
     /// The test executor completes writes instantly, so tests use this gate to
@@ -410,14 +402,17 @@ impl ThreadsDatabase {
             return cx.global::<GlobalThreadsDatabase>().0.clone();
         }
         let executor = cx.background_executor().clone();
+        let tokio_handle = gpui_tokio::Tokio::handle(cx);
         let task = executor
             .spawn({
                 let executor = executor.clone();
+                let tokio_handle = tokio_handle.clone();
                 async move {
-                    match ThreadsDatabase::new(executor) {
-                        Ok(db) => Ok(Arc::new(db)),
-                        Err(err) => Err(Arc::new(err)),
-                    }
+                    let database = tokio_handle
+                        .spawn(async move { ThreadsDatabase::new(executor, tokio_handle).await })
+                        .await
+                        .map_err(|err| anyhow::anyhow!("thread database task failed: {err}"))??;
+                    Ok(Arc::new(database))
                 }
             })
             .shared();
@@ -426,79 +421,41 @@ impl ThreadsDatabase {
         task
     }
 
-    pub fn new(executor: BackgroundExecutor) -> Result<Self> {
-        let connection = if *ZED_STATELESS {
-            Connection::open_memory(Some("THREAD_FALLBACK_DB"))
-        } else if cfg!(any(feature = "test-support", test)) {
-            // rust stores the name of the test on the current thread.
-            // We use this to automatically create a database that will
-            // be shared within the test (for the test_retrieve_old_thread)
-            // but not with concurrent tests.
-            let thread = std::thread::current();
-            let test_name = thread.name();
-            Connection::open_memory(Some(&format!(
-                "THREAD_FALLBACK_{}",
-                test_name.unwrap_or_default()
-            )))
-        } else {
-            let threads_dir = paths::data_dir().join("threads");
-            std::fs::create_dir_all(&threads_dir)?;
-            let sqlite_path = threads_dir.join("threads.db");
-            Connection::open_file(&sqlite_path.to_string_lossy())
-        };
-
-        connection.exec("PRAGMA journal_mode=WAL;")?()?;
-        connection.exec("PRAGMA busy_timeout=1000;")?()?;
-
-        connection.exec(indoc! {"
+    async fn new(
+        executor: BackgroundExecutor,
+        tokio_handle: tokio::runtime::Handle,
+    ) -> Result<Self> {
+        let workspace_store = WorkspaceStore::connect().await?;
+        sqlx::query(indoc! {"
             CREATE TABLE IF NOT EXISTS threads (
-                id TEXT PRIMARY KEY,
-                summary TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                data_type TEXT NOT NULL,
-                data BLOB NOT NULL
+                id            TEXT PRIMARY KEY,
+                workspace_id  UUID NOT NULL REFERENCES workspaces(workspace_id),
+                parent_id     TEXT,
+                summary       TEXT NOT NULL,
+                updated_at    TIMESTAMPTZ NOT NULL,
+                created_at    TIMESTAMPTZ,
+                folder_paths       TEXT,
+                folder_paths_order TEXT,
+                data_type     TEXT NOT NULL,
+                data          BYTEA NOT NULL
             )
-        "})?()
-        .map_err(|e| e.context("Failed to create threads table"))?;
-
-        if let Ok(mut s) = connection.exec(indoc! {"
-            ALTER TABLE threads ADD COLUMN parent_id TEXT
         "})
-        {
-            s().ok();
-        }
+        .execute(workspace_store.pool())
+        .await
+        .context("failed to create threads table")?;
 
-        if let Ok(mut s) = connection.exec(indoc! {"
-            ALTER TABLE threads ADD COLUMN folder_paths TEXT;
-            ALTER TABLE threads ADD COLUMN folder_paths_order TEXT;
-        "})
-        {
-            s().ok();
-        }
-
-        if let Ok(mut s) = connection.exec(indoc! {"
-            ALTER TABLE threads ADD COLUMN created_at TEXT;
-        "})
-        {
-            if s().is_ok() {
-                connection.exec(indoc! {"
-                    UPDATE threads SET created_at = updated_at WHERE created_at IS NULL
-                "})?()?;
-            }
-        }
-
-        let db = Self {
+        Ok(Self {
             executor,
-            connection: Arc::new(Mutex::new(connection)),
+            tokio_handle,
+            workspace_store,
             #[cfg(test)]
             write_gate: Mutex::new(None),
-        };
-
-        Ok(db)
+        })
     }
 
-    fn save_thread_sync(
-        connection: &Arc<Mutex<Connection>>,
+    async fn save_thread_sync(
+        pool: &PgPool,
+        workspace_store: &WorkspaceStore,
         id: acp::SessionId,
         thread: DbThread,
         folder_paths: &PathList,
@@ -513,11 +470,11 @@ impl ThreadsDatabase {
         }
 
         let title = thread.title.to_string();
-        let updated_at = thread.updated_at.to_rfc3339();
+        let updated_at = thread.updated_at;
         let parent_id = thread
             .subagent_context
             .as_ref()
-            .map(|ctx| ctx.parent_thread_id.0.clone());
+            .map(|ctx| ctx.parent_thread_id.0.to_string());
         let serialized_folder_paths = folder_paths.serialize();
         let (folder_paths_str, folder_paths_order_str): (Option<String>, Option<String>) =
             if folder_paths.is_empty() {
@@ -533,8 +490,6 @@ impl ThreadsDatabase {
             version: DbThread::VERSION,
         })?;
 
-        let connection = connection.lock();
-
         let compressed = zstd::encode_all(json_data.as_bytes(), COMPRESSION_LEVEL)?;
         let data_type = DataType::Zstd;
         let data = compressed;
@@ -542,116 +497,118 @@ impl ThreadsDatabase {
         // Use the thread's updated_at as created_at for new threads.
         // This ensures the creation time reflects when the thread was conceptually
         // created, not when it was saved to the database.
-        let created_at = updated_at.clone();
+        let created_at = updated_at;
 
-        let mut insert = connection.exec_bound::<(Arc<str>, Option<Arc<str>>, Option<String>, Option<String>, String, String, DataType, Vec<u8>, String)>(indoc! {"
-            INSERT INTO threads (id, parent_id, folder_paths, folder_paths_order, summary, updated_at, data_type, data, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            ON CONFLICT(id) DO UPDATE SET
+        let workspace_id = workspace_store.resolve_workspace(folder_paths).await?;
+
+        sqlx::query(indoc! {"
+            INSERT INTO threads (id, workspace_id, parent_id, summary, updated_at, created_at, folder_paths, folder_paths_order, data_type, data)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT (id) DO UPDATE SET
+                workspace_id = excluded.workspace_id,
                 parent_id = excluded.parent_id,
-                folder_paths = excluded.folder_paths,
-                folder_paths_order = excluded.folder_paths_order,
                 summary = excluded.summary,
                 updated_at = excluded.updated_at,
+                created_at = excluded.created_at,
+                folder_paths = excluded.folder_paths,
+                folder_paths_order = excluded.folder_paths_order,
                 data_type = excluded.data_type,
                 data = excluded.data
-        "})?;
-
-        insert((
-            id.0,
-            parent_id,
-            folder_paths_str,
-            folder_paths_order_str,
-            title,
-            updated_at,
-            data_type,
-            data,
-            created_at,
-        ))?;
+        "})
+        .bind(id.0.to_string())
+        .bind(workspace_id)
+        .bind(parent_id)
+        .bind(&title)
+        .bind(updated_at)
+        .bind(created_at)
+        .bind(folder_paths_str)
+        .bind(folder_paths_order_str)
+        .bind(data_type.as_str())
+        .bind(data)
+        .execute(pool)
+        .await?;
 
         Ok(())
     }
 
     pub fn list_threads(&self) -> Task<Result<Vec<DbThreadMetadata>>> {
-        let connection = self.connection.clone();
+        let pool = self.workspace_store.pool().clone();
+        self.spawn_db(async move { Self::list_threads_sync(&pool).await })
+    }
 
-        self.executor.spawn(async move {
-            let connection = connection.lock();
+    async fn list_threads_sync(pool: &PgPool) -> Result<Vec<DbThreadMetadata>> {
+        let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>, String, DateTime<Utc>, Option<DateTime<Utc>>)>(
+            "SELECT id, parent_id, folder_paths, folder_paths_order, summary, updated_at, created_at FROM threads ORDER BY updated_at DESC, created_at DESC NULLS LAST",
+        )
+        .fetch_all(pool)
+        .await?;
 
-            let mut select = connection
-                .select_bound::<(), (Arc<str>, Option<Arc<str>>, Option<String>, Option<String>, String, String, Option<String>)>(indoc! {"
-                SELECT id, parent_id, folder_paths, folder_paths_order, summary, updated_at, created_at FROM threads ORDER BY updated_at DESC, created_at DESC
-            "})?;
-
-            let rows = select(())?;
-            let mut threads = Vec::new();
-
-            for (id, parent_id, folder_paths, folder_paths_order, summary, updated_at, created_at) in rows {
-                let folder_paths = folder_paths
-                    .map(|paths| {
-                        PathList::deserialize(&util::path_list::SerializedPathList {
-                            paths,
-                            order: folder_paths_order.unwrap_or_default(),
-                        })
+        let mut threads = Vec::with_capacity(rows.len());
+        for (id, parent_id, folder_paths, folder_paths_order, summary, updated_at, created_at) in
+            rows
+        {
+            let folder_paths = folder_paths
+                .map(|paths| {
+                    PathList::deserialize(&util::path_list::SerializedPathList {
+                        paths,
+                        order: folder_paths_order.unwrap_or_default(),
                     })
-                    .unwrap_or_default();
-                let created_at = created_at
-                    .as_deref()
-                    .map(DateTime::parse_from_rfc3339)
-                    .transpose()?
-                    .map(|dt| dt.with_timezone(&Utc));
+                })
+                .unwrap_or_default();
 
-                threads.push(DbThreadMetadata {
-                    id: acp::SessionId::new(id),
-                    parent_session_id: parent_id.map(acp::SessionId::new),
-                    title: summary.into(),
-                    updated_at: DateTime::parse_from_rfc3339(&updated_at)?.with_timezone(&Utc),
-                    created_at,
-                    folder_paths,
-                });
-            }
+            threads.push(DbThreadMetadata {
+                id: acp::SessionId::new(Arc::<str>::from(id)),
+                parent_session_id: parent_id
+                    .map(|parent_id| acp::SessionId::new(Arc::<str>::from(parent_id))),
+                title: summary.into(),
+                updated_at,
+                created_at,
+                folder_paths,
+            });
+        }
 
-            Ok(threads)
-        })
+        Ok(threads)
     }
 
     pub fn load_thread(&self, id: acp::SessionId) -> Task<Result<Option<DbThread>>> {
-        let connection = self.connection.clone();
+        let pool = self.workspace_store.pool().clone();
+        self.spawn_db(async move { Self::load_thread_sync(&pool, id).await })
+    }
 
-        self.executor.spawn(async move {
-            let connection = connection.lock();
-            let mut select = connection.select_bound::<Arc<str>, (DataType, Vec<u8>)>(indoc! {"
-                SELECT data_type, data FROM threads WHERE id = ? LIMIT 1
-            "})?;
+    async fn load_thread_sync(pool: &PgPool, id: acp::SessionId) -> Result<Option<DbThread>> {
+        let row = sqlx::query_as::<_, (String, Vec<u8>)>(
+            "SELECT data_type, data FROM threads WHERE id = $1 LIMIT 1",
+        )
+        .bind(id.0.to_string())
+        .fetch_optional(pool)
+        .await?;
 
-            let rows = select(id.0)?;
-            if let Some((data_type, data)) = rows.into_iter().next() {
-                Ok(Some(Self::deserialize_thread(data_type, data)?))
-            } else {
-                Ok(None)
-            }
-        })
+        let Some((data_type, data)) = row else {
+            return Ok(None);
+        };
+        let data_type = DataType::from_str(&data_type)?;
+        Ok(Some(Self::deserialize_thread(data_type, data)?))
     }
 
     /// Returns the persisted `updated_at` for a thread without deserializing
     /// its full content. Used to detect when another Zed instance has written
     /// a newer copy of a thread to the shared database.
     pub fn thread_updated_at(&self, id: acp::SessionId) -> Task<Result<Option<DateTime<Utc>>>> {
-        let connection = self.connection.clone();
+        let pool = self.workspace_store.pool().clone();
+        self.spawn_db(async move { Self::thread_updated_at_sync(&pool, id).await })
+    }
 
-        self.executor.spawn(async move {
-            let connection = connection.lock();
-            let mut select = connection.select_row_bound::<Arc<str>, String>(indoc! {"
-                SELECT updated_at FROM threads WHERE id = ? LIMIT 1
-            "})?;
-
-            let Some(updated_at) = select(id.0)? else {
-                return Ok(None);
-            };
-            Ok(Some(
-                DateTime::parse_from_rfc3339(&updated_at)?.with_timezone(&Utc),
-            ))
-        })
+    async fn thread_updated_at_sync(
+        pool: &PgPool,
+        id: acp::SessionId,
+    ) -> Result<Option<DateTime<Utc>>> {
+        let updated_at = sqlx::query_scalar::<_, DateTime<Utc>>(
+            "SELECT updated_at FROM threads WHERE id = $1 LIMIT 1",
+        )
+        .bind(id.0.to_string())
+        .fetch_optional(pool)
+        .await?;
+        Ok(updated_at)
     }
 
     /// Returns a cheap fingerprint of the threads table — the row count and the
@@ -660,16 +617,22 @@ impl ThreadsDatabase {
     /// table is empty.
     #[cfg(not(any(test, feature = "test-support")))]
     pub fn change_fingerprint(&self) -> Task<Result<Option<String>>> {
-        let connection = self.connection.clone();
+        let pool = self.workspace_store.pool().clone();
+        self.spawn_db(async move { Self::change_fingerprint_sync(&pool).await })
+    }
 
-        self.executor.spawn(async move {
-            let connection = connection.lock();
-            let mut select = connection.select_row_bound::<(), String>(indoc! {"
-                SELECT COUNT(*) || ':' || COALESCE(MAX(updated_at), '') FROM threads
-            "})?;
-
-            select(())
-        })
+    #[cfg(not(any(test, feature = "test-support")))]
+    async fn change_fingerprint_sync(pool: &PgPool) -> Result<Option<String>> {
+        let (count, max_updated_at): (i64, Option<DateTime<Utc>>) =
+            sqlx::query_as("SELECT COUNT(*), MAX(updated_at) FROM threads")
+                .fetch_one(pool)
+                .await?;
+        Ok(Some(format!(
+            "{count}:{}",
+            max_updated_at
+                .map(|updated_at| updated_at.to_rfc3339())
+                .unwrap_or_default()
+        )))
     }
 
     pub fn save_thread(
@@ -678,7 +641,9 @@ impl ThreadsDatabase {
         thread: DbThread,
         folder_paths: PathList,
     ) -> Task<Result<()>> {
-        let connection = self.connection.clone();
+        let pool = self.workspace_store.pool().clone();
+        let workspace_store = self.workspace_store.clone();
+        let tokio_handle = self.tokio_handle.clone();
         #[cfg(test)]
         let write_gate = self.write_gate.lock().clone();
 
@@ -687,13 +652,32 @@ impl ThreadsDatabase {
             if let Some(write_gate) = write_gate {
                 write_gate.await.ok();
             }
-            Self::save_thread_sync(&connection, id, thread, &folder_paths)
+            tokio_handle
+                .spawn(async move {
+                    Self::save_thread_sync(&pool, &workspace_store, id, thread, &folder_paths).await
+                })
+                .await
+                .map_err(|err| anyhow::anyhow!("thread database task failed: {err}"))?
         })
     }
 
     #[cfg(test)]
     pub fn set_write_gate(&self, gate: futures::channel::oneshot::Receiver<()>) {
         *self.write_gate.lock() = Some(gate.shared());
+    }
+
+    fn spawn_db<F, R>(&self, future: F) -> Task<Result<R>>
+    where
+        F: std::future::Future<Output = Result<R>> + Send + 'static,
+        R: Send + 'static,
+    {
+        let tokio_handle = self.tokio_handle.clone();
+        self.executor.spawn(async move {
+            tokio_handle
+                .spawn(future)
+                .await
+                .map_err(|err| anyhow::anyhow!("thread database task failed: {err}"))?
+        })
     }
 
     fn deserialize_thread(data_type: DataType, data: Vec<u8>) -> Result<DbThread> {
@@ -731,91 +715,77 @@ impl ThreadsDatabase {
     }
 
     pub fn delete_thread(&self, id: acp::SessionId) -> Task<Result<()>> {
-        let connection = self.connection.clone();
+        let pool = self.workspace_store.pool().clone();
+        self.spawn_db(async move { Self::delete_thread_sync(&pool, id).await })
+    }
 
-        self.executor.spawn(async move {
-            let sandboxed_terminal_temp_dirs = {
-                let connection = connection.lock();
+    async fn delete_thread_sync(pool: &PgPool, id: acp::SessionId) -> Result<()> {
+        // Collect the target thread together with all of its transitive subagent
+        // threads, capturing their sandbox temp dirs before deleting the rows.
+        let rows = sqlx::query_as::<_, (String, String, Vec<u8>)>(indoc! {"
+            WITH RECURSIVE descendants AS (
+                SELECT id FROM threads WHERE id = $1
+                UNION
+                SELECT t.id FROM threads t JOIN descendants d ON t.parent_id = d.id
+            )
+            SELECT t.id, t.data_type, t.data FROM threads t
+            WHERE t.id IN (SELECT id FROM descendants)
+        "})
+        .bind(id.0.to_string())
+        .fetch_all(pool)
+        .await?;
 
-                let mut select_children =
-                    connection.select_bound::<Arc<str>, Arc<str>>(indoc! {"
-                    SELECT id FROM threads WHERE parent_id = ?
-                "})?;
-
-                // Collect target thread together with all of its transitive
-                // subagent threads
-                let mut ids_to_delete = vec![id.0.clone()];
-                let mut frontier = vec![id.0.clone()];
-                while let Some(parent) = frontier.pop() {
-                    for child in select_children(parent)? {
-                        ids_to_delete.push(child.clone());
-                        frontier.push(child);
-                    }
+        let mut sandboxed_terminal_temp_dirs = Vec::new();
+        let mut ids_to_delete = Vec::with_capacity(rows.len());
+        for (thread_id, data_type, data) in rows {
+            if let Ok(data_type) = DataType::from_str(&data_type) {
+                if let Some(temp_dir) = Self::sandboxed_terminal_temp_dir(data_type, data) {
+                    sandboxed_terminal_temp_dirs.push(temp_dir);
                 }
-
-                let mut select =
-                    connection.select_bound::<Arc<str>, (DataType, Vec<u8>)>(indoc! {"
-                    SELECT data_type, data FROM threads WHERE id = ? LIMIT 1
-                "})?;
-
-                let mut delete = connection.exec_bound::<Arc<str>>(indoc! {"
-                    DELETE FROM threads WHERE id = ?
-                "})?;
-
-                let mut sandboxed_terminal_temp_dirs = Vec::new();
-                for thread_id in ids_to_delete {
-                    if let Some(temp_dir) = select(thread_id.clone())?.into_iter().next().and_then(
-                        |(data_type, data)| Self::sandboxed_terminal_temp_dir(data_type, data),
-                    ) {
-                        sandboxed_terminal_temp_dirs.push(temp_dir);
-                    }
-                    delete(thread_id)?;
-                }
-
-                sandboxed_terminal_temp_dirs
-            };
-
-            for temp_dir in sandboxed_terminal_temp_dirs {
-                Self::remove_sandboxed_terminal_temp_dir(temp_dir);
             }
+            ids_to_delete.push(thread_id);
+        }
 
-            Ok(())
-        })
+        for thread_id in ids_to_delete {
+            sqlx::query("DELETE FROM threads WHERE id = $1")
+                .bind(thread_id)
+                .execute(pool)
+                .await?;
+        }
+
+        for temp_dir in sandboxed_terminal_temp_dirs {
+            Self::remove_sandboxed_terminal_temp_dir(temp_dir);
+        }
+
+        Ok(())
     }
 
     pub fn delete_threads(&self) -> Task<Result<()>> {
-        let connection = self.connection.clone();
+        let pool = self.workspace_store.pool().clone();
+        self.spawn_db(async move { Self::delete_threads_sync(&pool).await })
+    }
 
-        self.executor.spawn(async move {
-            let sandboxed_terminal_temp_dirs = {
-                let connection = connection.lock();
+    async fn delete_threads_sync(pool: &PgPool) -> Result<()> {
+        let rows = sqlx::query_as::<_, (String, Vec<u8>)>("SELECT data_type, data FROM threads")
+            .fetch_all(pool)
+            .await?;
 
-                let mut select = connection.select_bound::<(), (DataType, Vec<u8>)>(indoc! {"
-                    SELECT data_type, data FROM threads
-                "})?;
+        let sandboxed_terminal_temp_dirs = rows
+            .into_iter()
+            .filter_map(|(data_type, data)| {
+                DataType::from_str(&data_type)
+                    .ok()
+                    .and_then(|data_type| Self::sandboxed_terminal_temp_dir(data_type, data))
+            })
+            .collect::<Vec<_>>();
 
-                let sandboxed_terminal_temp_dirs = select(())?
-                    .into_iter()
-                    .filter_map(|(data_type, data)| {
-                        Self::sandboxed_terminal_temp_dir(data_type, data)
-                    })
-                    .collect::<Vec<_>>();
+        sqlx::query("DELETE FROM threads").execute(pool).await?;
 
-                let mut delete = connection.exec_bound::<()>(indoc! {"
-                    DELETE FROM threads
-                "})?;
+        for temp_dir in sandboxed_terminal_temp_dirs {
+            Self::remove_sandboxed_terminal_temp_dir(temp_dir);
+        }
 
-                delete(())?;
-
-                sandboxed_terminal_temp_dirs
-            };
-
-            for temp_dir in sandboxed_terminal_temp_dirs {
-                Self::remove_sandboxed_terminal_temp_dir(temp_dir);
-            }
-
-            Ok(())
-        })
+        Ok(())
     }
 }
 
