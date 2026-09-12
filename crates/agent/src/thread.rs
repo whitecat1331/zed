@@ -1332,6 +1332,10 @@ pub struct Thread {
     /// message mid-task; by default queued messages wait for the turn to finish.
     end_turn_at_next_boundary: bool,
     pending_message: Option<AgentMessage>,
+    /// In-flight assistant content streamed by other instances, keyed by the
+    /// authoring process's `client_id`. Flushed into `messages` on the
+    /// matching `TurnComplete` operation.
+    remote_pending_messages: HashMap<String, AgentMessage>,
     pub(crate) tools: BTreeMap<SharedString, Arc<dyn AnyAgentTool>>,
     request_token_usage: HashMap<ClientUserMessageId, language_model::TokenUsage>,
     cumulative_token_usage: TokenUsage,
@@ -1476,6 +1480,7 @@ impl Thread {
             running_turn: None,
             end_turn_at_next_boundary: false,
             pending_message: None,
+            remote_pending_messages: HashMap::default(),
             tools: BTreeMap::default(),
             request_token_usage: HashMap::default(),
             cumulative_token_usage: TokenUsage::default(),
@@ -1863,6 +1868,7 @@ impl Thread {
             running_turn: None,
             end_turn_at_next_boundary: false,
             pending_message: None,
+            remote_pending_messages: HashMap::default(),
             tools: BTreeMap::default(),
             request_token_usage: db_thread.request_token_usage.clone(),
             cumulative_token_usage: db_thread.cumulative_token_usage,
@@ -2749,6 +2755,59 @@ impl Thread {
         }
 
         self.messages.push(Arc::new(Message::User(message)));
+        cx.notify();
+    }
+
+    /// Appends a streamed text delta from another instance to the remote
+    /// pending message owned by `client_id`.
+    pub fn apply_remote_stream_text(
+        &mut self,
+        client_id: &str,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let message = self
+            .remote_pending_messages
+            .entry(client_id.to_string())
+            .or_default();
+        if let Some(AgentMessageContent::Text(existing)) = message.content.last_mut() {
+            existing.push_str(text);
+        } else {
+            message.content.push(AgentMessageContent::Text(text.to_string()));
+        }
+        cx.notify();
+    }
+
+    /// Appends a streamed thinking delta from another instance to the remote
+    /// pending message owned by `client_id`.
+    pub fn apply_remote_stream_thinking(
+        &mut self,
+        client_id: &str,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let message = self
+            .remote_pending_messages
+            .entry(client_id.to_string())
+            .or_default();
+        message.content.push(AgentMessageContent::Thinking {
+            text: text.to_string(),
+            signature: None,
+        });
+        cx.notify();
+    }
+
+    /// Flushes the remote pending message owned by `client_id` into the
+    /// committed `messages` list, finalizing that instance's turn.
+    pub fn apply_remote_turn_complete(&mut self, client_id: &str, cx: &mut Context<Self>) {
+        let Some(message) = self.remote_pending_messages.remove(client_id) else {
+            return;
+        };
+        if message.content.is_empty() {
+            return;
+        }
+
+        self.messages.push(Arc::new(Message::Agent(message)));
         cx.notify();
     }
 
