@@ -2439,14 +2439,18 @@ impl NativeAgentConnection {
 
                         match event {
                             ThreadEvent::UserMessage(message) => {
+                                // Replay a committed user message as a single new
+                                // entry. `push_user_content_block` would merge it
+                                // into an adjacent user message (its protocol id
+                                // is `None`), which is what caused two prompts to
+                                // be concatenated after a cross-instance reload.
+                                let chunks: Vec<acp::ContentBlock> = message
+                                    .content
+                                    .iter()
+                                    .map(|content| content.clone().into())
+                                    .collect();
                                 acp_thread.update(cx, |thread, cx| {
-                                    for content in &*message.content {
-                                        thread.push_user_content_block(
-                                            Some(message.id.clone()),
-                                            content.clone().into(),
-                                            cx,
-                                        );
-                                    }
+                                    thread.push_user_message(Some(message.id.clone()), chunks, cx);
                                 })?;
                             }
                             ThreadEvent::AgentText(text) => {
