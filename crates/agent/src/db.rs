@@ -446,6 +446,24 @@ impl ThreadsDatabase {
         .await
         .context("failed to create threads table")?;
 
+        for statement in [
+            indoc! {"
+                CREATE OR REPLACE FUNCTION notify_threads_changed() RETURNS trigger AS $$
+                BEGIN
+                    NOTIFY threads_changed;
+                    RETURN NULL;
+                END;
+                $$ LANGUAGE plpgsql;
+            "},
+            "DROP TRIGGER IF EXISTS threads_changed_trigger ON threads",
+            "CREATE TRIGGER threads_changed_trigger AFTER INSERT OR UPDATE OR DELETE ON threads FOR EACH ROW EXECUTE FUNCTION notify_threads_changed()",
+        ] {
+            sqlx::query(statement)
+                .execute(workspace_store.pool())
+                .await
+                .context("failed to create threads change trigger")?;
+        }
+
         Ok(Self {
             executor,
             tokio_handle,
@@ -613,30 +631,6 @@ impl ThreadsDatabase {
         Ok(updated_at)
     }
 
-    /// Returns a cheap fingerprint of the threads table — the row count and the
-    /// newest `updated_at` — used by the cross-instance change observer to detect
-    /// external writes without deserializing thread content. `None` when the
-    /// table is empty.
-    #[cfg(not(any(test, feature = "test-support")))]
-    pub fn change_fingerprint(&self) -> Task<Result<Option<String>>> {
-        let pool = self.workspace_store.pool().clone();
-        self.spawn_db(async move { Self::change_fingerprint_sync(&pool).await })
-    }
-
-    #[cfg(not(any(test, feature = "test-support")))]
-    async fn change_fingerprint_sync(pool: &PgPool) -> Result<Option<String>> {
-        let (count, max_updated_at): (i64, Option<DateTime<Utc>>) =
-            sqlx::query_as("SELECT COUNT(*), MAX(updated_at) FROM threads")
-                .fetch_one(pool)
-                .await?;
-        Ok(Some(format!(
-            "{count}:{}",
-            max_updated_at
-                .map(|updated_at| updated_at.to_rfc3339())
-                .unwrap_or_default()
-        )))
-    }
-
     pub fn save_thread(
         &self,
         id: acp::SessionId,
@@ -680,6 +674,42 @@ impl ThreadsDatabase {
                 .await
                 .map_err(|err| anyhow::anyhow!("thread database task failed: {err}"))?
         })
+    }
+
+    /// Returns a channel that yields once per committed change to the shared
+    /// threads table, driven by Postgres `LISTEN/NOTIFY` instead of polling.
+    #[cfg(not(any(test, feature = "test-support")))]
+    pub fn listen(&self, channel: &'static str) -> async_channel::Receiver<()> {
+        let (sender, receiver) = async_channel::unbounded();
+        let pool = self.workspace_store.pool().clone();
+        let tokio_handle = self.tokio_handle.clone();
+        let _ = tokio_handle.spawn(async move {
+            let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
+                Ok(listener) => listener,
+                Err(error) => {
+                    log::error!("[THREAD_SYNC] failed to open change listener: {error:#}");
+                    return;
+                }
+            };
+            if let Err(error) = listener.listen(channel).await {
+                log::error!("[THREAD_SYNC] failed to listen on {channel}: {error:#}");
+                return;
+            }
+            loop {
+                match listener.recv().await {
+                    Ok(_) => {
+                        if sender.send(()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        log::warn!("[THREAD_SYNC] change listener error: {error:#}");
+                        break;
+                    }
+                }
+            }
+        });
+        receiver
     }
 
     fn deserialize_thread(data_type: DataType, data: Vec<u8>) -> Result<DbThread> {

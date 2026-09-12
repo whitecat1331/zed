@@ -1318,41 +1318,27 @@ impl ThreadMetadataStore {
         this
     }
 
-    /// Polls the sidebar metadata database for external writes and reloads the
-    /// in-memory cache when the fingerprint changes. The first read only
-    /// establishes a baseline so startup does not trigger a spurious reload.
+    /// Subscribes to the sidebar metadata database via `LISTEN/NOTIFY` and
+    /// reloads the in-memory cache on each committed change from another process.
     #[cfg(not(any(test, feature = "test-support")))]
     fn start_change_observer(cx: &mut Context<Self>) -> Task<()> {
-        let poll_interval = std::time::Duration::from_millis(500);
-
         cx.spawn(async move |this, cx| {
-            let mut last_fingerprint: Option<String> = None;
+            let Some(database) = this.update(cx, |store, _cx| store.db.clone()).ok() else {
+                return;
+            };
+            let notifications = database.listen("sidebar_threads_changed");
             loop {
-                let Some(database) = this.update(cx, |store, _cx| store.db.clone()).ok() else {
+                if notifications.recv().await.is_err() {
                     return;
-                };
-
-                let fingerprint = cx
-                    .background_spawn(async move { database.change_fingerprint().await })
-                    .await;
-
-                if let Ok(Some(fingerprint)) = fingerprint {
-                    if last_fingerprint.as_ref() != Some(&fingerprint) {
-                        let had_baseline = last_fingerprint.is_some();
-                        last_fingerprint = Some(fingerprint);
-                        if had_baseline
-                            && this
-                                .update(cx, |store, cx| {
-                                    let _ = store.reload(cx);
-                                })
-                                .is_err()
-                        {
-                            return;
-                        }
-                    }
                 }
-
-                cx.background_executor().timer(poll_interval).await;
+                if this
+                    .update(cx, |store, cx| {
+                        let _ = store.reload(cx);
+                    })
+                    .is_err()
+                {
+                    return;
+                }
             }
         })
     }
@@ -1518,6 +1504,16 @@ const THREAD_METADATA_SCHEMA: &[&str] = &[
             PRIMARY KEY (thread_id, archived_worktree_id)
         )"
     ),
+    indoc!(
+        "CREATE OR REPLACE FUNCTION notify_sidebar_threads_changed() RETURNS trigger AS $$
+        BEGIN
+            NOTIFY sidebar_threads_changed;
+            RETURN NULL;
+        END;
+        $$ LANGUAGE plpgsql;"
+    ),
+    "DROP TRIGGER IF EXISTS sidebar_threads_changed_trigger ON sidebar_threads",
+    "CREATE TRIGGER sidebar_threads_changed_trigger AFTER INSERT OR UPDATE OR DELETE ON sidebar_threads FOR EACH ROW EXECUTE FUNCTION notify_sidebar_threads_changed()",
 ];
 
 impl ThreadMetadataDb {
@@ -1555,6 +1551,42 @@ impl ThreadMetadataDb {
             .await
             .context("thread metadata database task failed")?
     }
+
+    /// Returns a channel that yields once per committed change to the shared
+    /// sidebar metadata table, driven by Postgres `LISTEN/NOTIFY`.
+    #[cfg(not(any(test, feature = "test-support")))]
+    pub fn listen(&self, channel: &'static str) -> async_channel::Receiver<()> {
+        let (sender, receiver) = async_channel::unbounded();
+        let pool = self.pool.clone();
+        let tokio_handle = self.tokio_handle.clone();
+        let _ = tokio_handle.spawn(async move {
+            let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
+                Ok(listener) => listener,
+                Err(error) => {
+                    log::error!("failed to open thread metadata change listener: {error:#}");
+                    return;
+                }
+            };
+            if let Err(error) = listener.listen(channel).await {
+                log::error!("failed to listen on {channel}: {error:#}");
+                return;
+            }
+            loop {
+                match listener.recv().await {
+                    Ok(_) => {
+                        if sender.send(()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        log::warn!("thread metadata change listener error: {error:#}");
+                        break;
+                    }
+                }
+            }
+        });
+        receiver
+    }
 }
 
 impl ThreadMetadataDb {
@@ -1586,31 +1618,6 @@ impl ThreadMetadataDb {
         self.run_db(async move {
             let rows = sqlx::query(Self::LIST_QUERY).fetch_all(&pool).await?;
             rows.iter().map(ThreadMetadata::from_row).collect()
-        })
-        .await
-    }
-
-    /// Returns a cheap fingerprint of the sidebar metadata table — row count,
-    /// newest `updated_at`, and the number of archived rows — used by the
-    /// cross-instance change observer to detect external list changes.
-    #[cfg(not(any(test, feature = "test-support")))]
-    pub async fn change_fingerprint(&self) -> anyhow::Result<Option<String>> {
-        let pool = self.pool.clone();
-        self.run_db(async move {
-            let (count, max_updated_at, archived_sum): (i64, Option<DateTime<Utc>>, i64) =
-                sqlx::query_as(
-                    "SELECT COUNT(*), MAX(updated_at), COALESCE(SUM(archived::int), 0) FROM sidebar_threads",
-                )
-                .fetch_one(&pool)
-                .await?;
-            Ok(Some(format!(
-                "{}:{}:{}",
-                count,
-                max_updated_at
-                    .map(|dt| dt.to_rfc3339())
-                    .unwrap_or_default(),
-                archived_sum
-            )))
         })
         .await
     }

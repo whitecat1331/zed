@@ -788,18 +788,14 @@ impl NativeAgent {
         }
     }
 
-    /// Polls the shared threads database for external writes and emits
-    /// [`ThreadsDatabaseChanged`] when the content fingerprint changes from what
-    /// this process last observed. The first read only establishes a baseline so
-    /// startup does not emit a spurious change.
+    /// Subscribes to the shared threads database via `LISTEN/NOTIFY` and emits
+    /// [`ThreadsDatabaseChanged`] on each committed change from another process.
     #[cfg(not(any(test, feature = "test-support")))]
     async fn run_threads_db_observer(
         this: WeakEntity<Self>,
         database_future: Shared<Task<Result<Arc<ThreadsDatabase>, Arc<anyhow::Error>>>>,
         cx: &mut AsyncApp,
     ) {
-        let poll_interval = Duration::from_millis(500);
-
         let database = match database_future.await {
             Ok(database) => database,
             Err(err) => {
@@ -811,43 +807,17 @@ impl NativeAgent {
         };
         log::info!("[THREAD_SYNC] content observer started");
 
-        let mut last_fingerprint: Option<String> = None;
+        let notifications = database.listen("threads_changed");
         loop {
-            match database.change_fingerprint().await {
-                Ok(Some(fingerprint)) => {
-                    if last_fingerprint.as_ref() != Some(&fingerprint) {
-                        let had_baseline = last_fingerprint.is_some();
-                        if had_baseline {
-                            log::info!("[THREAD_SYNC] content fingerprint changed: {fingerprint}");
-                        }
-                        last_fingerprint = Some(fingerprint);
-                        if had_baseline
-                            && this
-                                .update(cx, |_agent, cx| cx.emit(ThreadsDatabaseChanged))
-                                .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-                Ok(None) => {
-                    if last_fingerprint.is_some() {
-                        log::info!("[THREAD_SYNC] content table emptied");
-                        if this
-                            .update(cx, |_agent, cx| cx.emit(ThreadsDatabaseChanged))
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    last_fingerprint = None;
-                }
-                Err(err) => {
-                    log::warn!("[THREAD_SYNC] content fingerprint query failed: {err:?}");
-                }
+            if notifications.recv().await.is_err() {
+                return;
             }
-
-            cx.background_executor().timer(poll_interval).await;
+            if this
+                .update(cx, |_agent, cx| cx.emit(ThreadsDatabaseChanged))
+                .is_err()
+            {
+                return;
+            }
         }
     }
 
