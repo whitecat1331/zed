@@ -3083,6 +3083,9 @@ impl AgentPanel {
             } => {
                 self.apply_remote_turn_complete(session_id, client_id, cx);
             }
+            ThreadSyncMessage::AgentMessage { to_session, body, .. } => {
+                self.apply_remote_agent_message(to_session, body, cx);
+            }
         }
     }
 
@@ -3191,6 +3194,31 @@ impl AgentPanel {
         if let Some(native_thread) = self.active_native_agent_thread(cx) {
             native_thread.update(cx, |thread, cx| {
                 thread.apply_remote_turn_complete(client_id, cx);
+            });
+        }
+    }
+
+    /// Delivers a directed message from another thread to the target thread's
+    /// model as a synthetic user message.
+    fn apply_remote_agent_message(
+        &mut self,
+        to_session: &str,
+        body: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conversation_view) = self.active_conversation_view().cloned() else {
+            return;
+        };
+        let Some(acp_thread) = conversation_view.read(cx).root_thread(cx) else {
+            return;
+        };
+        if acp_thread.read(cx).session_id().to_string() != to_session {
+            return;
+        }
+        if let Some(native_thread) = self.active_native_agent_thread(cx) {
+            let body = body.to_string();
+            native_thread.update(cx, |thread, cx| {
+                thread.apply_remote_agent_message(body, cx);
             });
         }
     }

@@ -2811,6 +2811,28 @@ impl Thread {
         cx.notify();
     }
 
+    /// Publishes a directed message from this thread to another thread.
+    pub fn send_agent_message(&self, to_session: &str, body: String, cx: &App) {
+        if let Some(bus) = ThreadSyncBus::try_global(cx) {
+            bus.read(cx).broadcast_agent_message(
+                self.id.to_string(),
+                to_session.to_string(),
+                body,
+            );
+        }
+    }
+
+    /// Delivers a directed message from another thread as a synthetic user
+    /// message appended to this thread's committed prefix.
+    pub fn apply_remote_agent_message(&mut self, body: String, cx: &mut Context<Self>) {
+        let message = UserMessage {
+            id: ClientUserMessageId::new(),
+            content: vec![UserMessageContent::Text(body)].into(),
+        };
+        self.messages.push(Arc::new(Message::User(message)));
+        cx.notify();
+    }
+
     pub fn push_acp_agent_block(&mut self, block: acp::ContentBlock, cx: &mut Context<Self>) {
         let text = match block {
             acp::ContentBlock::Text(text_content) => text_content.text,

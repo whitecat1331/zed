@@ -63,6 +63,15 @@ pub enum ThreadSyncMessage {
         client_id: String,
         op_id: String,
     },
+    /// A directed message from one thread to another (cross-instance agent
+    /// coordination).
+    AgentMessage {
+        from_session: String,
+        to_session: String,
+        client_id: String,
+        op_id: String,
+        body: String,
+    },
 }
 
 impl ThreadSyncMessage {
@@ -70,7 +79,8 @@ impl ThreadSyncMessage {
         match self {
             ThreadSyncMessage::Stream { client_id, .. }
             | ThreadSyncMessage::UserMessage { client_id, .. }
-            | ThreadSyncMessage::TurnComplete { client_id, .. } => client_id,
+            | ThreadSyncMessage::TurnComplete { client_id, .. }
+            | ThreadSyncMessage::AgentMessage { client_id, .. } => client_id,
         }
     }
 }
@@ -214,6 +224,19 @@ impl ThreadSyncBus {
                 session_id,
                 client_id: self.client_id.clone(),
                 op_id: uuid::Uuid::new_v4().to_string(),
+            })
+            .ok();
+    }
+
+    /// Publishes a directed message from one thread to another.
+    pub fn broadcast_agent_message(&self, from_session: String, to_session: String, body: String) {
+        self.outbound_tx
+            .try_send(ThreadSyncMessage::AgentMessage {
+                from_session,
+                to_session,
+                client_id: self.client_id.clone(),
+                op_id: uuid::Uuid::new_v4().to_string(),
+                body,
             })
             .ok();
     }
