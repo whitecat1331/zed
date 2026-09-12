@@ -454,7 +454,7 @@ impl ThreadsDatabase {
             indoc! {"
                 CREATE OR REPLACE FUNCTION notify_threads_changed() RETURNS trigger AS $$
                 BEGIN
-                    NOTIFY threads_changed;
+                    PERFORM pg_notify('threads_changed', COALESCE(NEW.id, OLD.id));
                     RETURN NULL;
                 END;
                 $$ LANGUAGE plpgsql;
@@ -538,6 +538,7 @@ impl ThreadsDatabase {
                 folder_paths_order = excluded.folder_paths_order,
                 data_type = excluded.data_type,
                 data = excluded.data
+            WHERE excluded.updated_at >= threads.updated_at
         "})
         .bind(id.0.to_string())
         .bind(workspace_id)
@@ -683,7 +684,7 @@ impl ThreadsDatabase {
     /// Returns a channel that yields once per committed change to the shared
     /// threads table, driven by Postgres `LISTEN/NOTIFY` instead of polling.
     #[cfg(not(any(test, feature = "test-support")))]
-    pub fn listen(&self, channel: &'static str) -> async_channel::Receiver<()> {
+    pub fn listen(&self, channel: &'static str) -> async_channel::Receiver<String> {
         let (sender, receiver) = async_channel::unbounded();
         let pool = self.workspace_store.pool().clone();
         let tokio_handle = self.tokio_handle.clone();
@@ -701,8 +702,12 @@ impl ThreadsDatabase {
             }
             loop {
                 match listener.recv().await {
-                    Ok(_) => {
-                        if sender.send(()).await.is_err() {
+                    Ok(notification) => {
+                        if sender
+                            .send(notification.payload().to_string())
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }

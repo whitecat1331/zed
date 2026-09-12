@@ -2478,6 +2478,7 @@ impl Thread {
             }
         }
         self.clear_summary();
+        self.updated_at = Utc::now();
         cx.notify();
         Ok(())
     }
@@ -2576,6 +2577,7 @@ impl Thread {
         cx: &mut Context<Self>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
         self.messages.push(Arc::new(Message::Resume));
+        self.updated_at = Utc::now();
         cx.notify();
 
         log::debug!("Total messages in thread: {}", self.messages.len());
@@ -2599,6 +2601,7 @@ impl Thread {
 
         let message = UserMessage { id, content };
         self.messages.push(Arc::new(Message::User(message)));
+        self.updated_at = Utc::now();
         cx.notify();
 
         self.send_existing(cx)
@@ -2726,6 +2729,7 @@ impl Thread {
             .collect::<Arc<_>>();
         let message = UserMessage { id, content };
         self.messages.push(Arc::new(Message::User(message)));
+        self.updated_at = Utc::now();
         cx.notify();
     }
 
@@ -2802,6 +2806,7 @@ impl Thread {
             content: vec![AgentMessageContent::Text(text)],
             ..Default::default()
         })));
+        self.updated_at = Utc::now();
         cx.notify();
     }
 
@@ -2850,7 +2855,10 @@ impl Thread {
                         match error.downcast::<CompletionError>() {
                             Ok(CompletionError::Refusal) => {
                                 event_stream.send_stop(acp::StopReason::Refusal);
-                                _ = this.update(cx, |this, _| this.messages.truncate(message_ix));
+                                _ = this.update(cx, |this, _| {
+                                    this.messages.truncate(message_ix);
+                                    this.updated_at = Utc::now();
+                                });
                             }
                             Ok(CompletionError::MaxTokens) => {
                                 event_stream.send_stop(acp::StopReason::MaxTokens);
@@ -3202,6 +3210,7 @@ impl Thread {
                         if message.tool_results.is_empty() {
                             intent = CompletionIntent::UserPrompt;
                             this.messages.push(Arc::new(Message::Resume));
+                            this.updated_at = Utc::now();
                         }
                     }
                 })?;
@@ -3387,6 +3396,7 @@ impl Thread {
                     this.messages.push(compaction);
                 }
             }
+            this.updated_at = Utc::now();
             cx.notify();
         })?;
 

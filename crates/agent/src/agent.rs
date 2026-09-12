@@ -499,8 +499,12 @@ impl gpui::EventEmitter<SkillLoadingIssuesUpdated> for NativeAgent {}
 
 /// Emitted when another Zed instance writes to the shared threads database.
 /// The content-sync layer listens for this to reload stale open threads.
+/// `session_id` is the id of the thread whose persisted row changed (from the
+/// `NOTIFY threads_changed` payload), or `None` when unavailable.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ThreadsDatabaseChanged;
+pub struct ThreadsDatabaseChanged {
+    pub session_id: Option<String>,
+}
 
 impl gpui::EventEmitter<ThreadsDatabaseChanged> for NativeAgent {}
 
@@ -809,11 +813,15 @@ impl NativeAgent {
 
         let notifications = database.listen("threads_changed");
         loop {
-            if notifications.recv().await.is_err() {
+            let Ok(session_id) = notifications.recv().await else {
                 return;
-            }
+            };
             if this
-                .update(cx, |_agent, cx| cx.emit(ThreadsDatabaseChanged))
+                .update(cx, |_agent, cx| {
+                    cx.emit(ThreadsDatabaseChanged {
+                        session_id: Some(session_id),
+                    })
+                })
                 .is_err()
             {
                 return;

@@ -3021,11 +3021,16 @@ impl AgentPanel {
                         cx.subscribe_in::<agent::NativeAgent, agent::ThreadsDatabaseChanged>(
                             &native_agent,
                             window,
-                            |this, _agent, _event, window, cx| {
+                            |this, _agent, event, window, cx| {
                                 log::info!(
-                                    "[THREAD_SYNC] ThreadsDatabaseChanged fired, reloading active thread"
+                                    "[THREAD_SYNC] ThreadsDatabaseChanged fired for {:?}, reloading thread",
+                                    event.session_id
                                 );
-                                this.reload_active_thread_if_stale(window, cx);
+                                this.reload_thread_if_stale(
+                                    event.session_id.as_deref(),
+                                    window,
+                                    cx,
+                                );
                             },
                         ),
                     );
@@ -4474,6 +4479,95 @@ impl AgentPanel {
         }
     }
 
+    /// Reloads the thread whose persisted row changed (from the `NOTIFY`
+    /// payload), reconciling the active view in place or dropping a parked
+    /// view so it reloads fresh from Postgres on next activation.
+    fn reload_thread_if_stale(
+        &mut self,
+        session_id: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session_id) = session_id else {
+            self.reload_active_thread_if_stale(window, cx);
+            return;
+        };
+
+        let active_matches = self.active_conversation_view().is_some_and(|view| {
+            view.read(cx)
+                .root_thread(cx)
+                .is_some_and(|thread| thread.read(cx).session_id().to_string() == session_id)
+        });
+        if active_matches {
+            self.reload_active_thread_if_stale(window, cx);
+            return;
+        }
+
+        let retained_view = self
+            .retained_threads
+            .values()
+            .find(|view| {
+                view.read(cx)
+                    .root_thread(cx)
+                    .is_some_and(|thread| thread.read(cx).session_id().to_string() == session_id)
+            })
+            .cloned();
+        let Some(conversation_view) = retained_view else {
+            return;
+        };
+
+        let Some(acp_thread) = conversation_view.read(cx).root_thread(cx) else {
+            return;
+        };
+        // Never interrupt a locally-generating parked turn.
+        if acp_thread.read(cx).is_locally_generating() {
+            return;
+        }
+
+        let thread_id = conversation_view.read(cx).thread_id;
+        let Some(metadata) = ThreadMetadataStore::try_global(cx)
+            .and_then(|store| store.read(cx).entry(thread_id).cloned())
+        else {
+            return;
+        };
+        if metadata.is_draft() {
+            return;
+        }
+
+        let Some(native_thread) = conversation_view.read(cx).as_native_thread(cx) else {
+            return;
+        };
+        let memory_updated_at = native_thread.read(cx).updated_at();
+        let session_id = acp_thread.read(cx).session_id().clone();
+
+        let connection = acp_thread
+            .read(cx)
+            .connection()
+            .clone()
+            .downcast::<agent::NativeAgentConnection>()
+            .map(|connection| (*connection).clone());
+        let Some(connection) = connection else {
+            return;
+        };
+
+        let disk_future = connection.thread_updated_at(session_id.clone(), cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Some(disk_updated_at)) = disk_future.await else {
+                return;
+            };
+            if disk_updated_at <= memory_updated_at {
+                return;
+            }
+            log::info!("[THREAD_SYNC] dropping stale parked thread (disk newer than memory)");
+            this.update_in(cx, |this, _window, cx| {
+                connection.discard_session(&session_id, cx);
+                this.retained_threads.remove(&thread_id);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// If the active native thread's on-disk copy is newer than the
     /// in-memory copy (e.g. another Zed instance wrote to the shared threads
     /// database), discard the stale in-memory session and reload it from
@@ -4792,6 +4886,10 @@ impl AgentPanel {
                 window,
                 cx,
             );
+            // The retained view may be stale if another instance wrote to this
+            // thread while it was parked. Reconcile against Postgres so
+            // reactivation reflects the latest cross-instance content.
+            self.reload_active_thread_if_stale(window, cx);
             return;
         }
 
