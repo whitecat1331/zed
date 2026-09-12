@@ -616,14 +616,24 @@ impl ThreadMetadataStore {
             return;
         }
 
-        let db = ThreadMetadataDb::global(cx);
+        let db = match ThreadMetadataDb::global(cx) {
+            Ok(db) => db,
+            Err(error) => {
+                log::error!(
+                    "failed to initialize thread metadata database: {error:#}. Run script/bootstrap-postgres.sh (Linux/macOS) or script/bootstrap-postgres.ps1 (Windows) to install PostgreSQL, or set agent.threads_database_url / ZED_THREADS_DATABASE_URL to point at an existing PostgreSQL."
+                );
+                return;
+            }
+        };
         let thread_store = cx.new(|cx| Self::new(db, cx));
         cx.set_global(GlobalThreadMetadataStore(thread_store));
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn init_global(cx: &mut App) {
-        let db = ThreadMetadataDb::global(cx);
+        let Ok(db) = ThreadMetadataDb::global(cx) else {
+            return;
+        };
         let thread_store = cx.new(|cx| Self::new(db, cx));
         cx.set_global(GlobalThreadMetadataStore(thread_store));
     }
@@ -1517,19 +1527,19 @@ const THREAD_METADATA_SCHEMA: &[&str] = &[
 ];
 
 impl ThreadMetadataDb {
-    pub fn global(cx: &App) -> Self {
+    pub fn global(cx: &App) -> anyhow::Result<Self> {
         let tokio_handle = gpui_tokio::Tokio::handle(cx);
-        let pool = gpui::block_on(tokio_handle.spawn(Self::connect_pool()))
+        let database_url = threads_database_url(cx);
+        let pool = gpui::block_on(tokio_handle.spawn(Self::connect_pool(database_url)))
             .context("thread metadata database task failed")
-            .and_then(|result| result)
-            .expect("failed to initialize thread metadata database");
-        Self { pool, tokio_handle }
+            .and_then(|result| result)?;
+        Ok(Self { pool, tokio_handle })
     }
 
-    async fn connect_pool() -> anyhow::Result<PgPool> {
+    async fn connect_pool(database_url: String) -> anyhow::Result<PgPool> {
         let pool = PgPoolOptions::new()
             .max_connections(5)
-            .connect(&threads_database_url())
+            .connect(&database_url)
             .await
             .context("failed to connect to thread metadata database")?;
         for statement in THREAD_METADATA_SCHEMA {

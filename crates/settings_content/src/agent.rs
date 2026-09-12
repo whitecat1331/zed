@@ -361,6 +361,11 @@ pub struct AgentSettingsContent {
     /// These are populated when choosing "Allow always" from a sandbox
     /// escalation prompt.
     pub sandbox_permissions: Option<SandboxPermissionsContent>,
+
+    /// Optional PostgreSQL connection URL for agent thread storage. Overrides
+    /// the `ZED_THREADS_DATABASE_URL` environment variable. When unset, Zed
+    /// defaults to `postgres://localhost/zed_threads`.
+    pub threads_database_url: Option<String>,
 }
 
 impl AgentSettingsContent {

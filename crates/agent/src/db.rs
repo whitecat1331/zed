@@ -1,4 +1,4 @@
-use crate::thread_workspace::WorkspaceStore;
+use crate::thread_workspace::{WorkspaceStore, threads_database_url};
 use crate::{AgentMessage, AgentMessageContent, UserMessage, UserMessageContent};
 use acp_thread::ClientUserMessageId;
 use agent_client_protocol::schema::v1 as acp;
@@ -404,6 +404,7 @@ impl ThreadsDatabase {
         }
         let executor = cx.background_executor().clone();
         let tokio_handle = gpui_tokio::Tokio::handle(cx);
+        let database_url = threads_database_url(cx);
         let task = executor
             .spawn({
                 let executor = executor.clone();
@@ -411,7 +412,9 @@ impl ThreadsDatabase {
                 async move {
                     let spawn_handle = tokio_handle.clone();
                     let database = spawn_handle
-                        .spawn(async move { ThreadsDatabase::new(executor, tokio_handle).await })
+                        .spawn(async move {
+                            ThreadsDatabase::new(executor, tokio_handle, database_url).await
+                        })
                         .await
                         .map_err(|err| anyhow::anyhow!("thread database task failed: {err}"))??;
                     Ok(Arc::new(database))
@@ -426,8 +429,9 @@ impl ThreadsDatabase {
     async fn new(
         executor: BackgroundExecutor,
         tokio_handle: tokio::runtime::Handle,
+        database_url: String,
     ) -> Result<Self> {
-        let workspace_store = WorkspaceStore::connect().await?;
+        let workspace_store = WorkspaceStore::connect_with_url(&database_url).await?;
         sqlx::query(indoc! {"
             CREATE TABLE IF NOT EXISTS threads (
                 id            TEXT PRIMARY KEY,

@@ -1,5 +1,8 @@
+use agent_settings::AgentSettings;
 use anyhow::{Context, Result};
+use gpui::App;
 use indoc::indoc;
+use settings::Settings as _;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use util::path_list::PathList;
@@ -8,11 +11,13 @@ use uuid::Uuid;
 /// Fallback PostgreSQL connection URL when `ZED_THREADS_DATABASE_URL` is unset.
 pub const DEFAULT_THREADS_DATABASE_URL: &str = "postgres://localhost/zed_threads";
 
-/// The PostgreSQL connection URL for agent thread storage, read from
-/// `ZED_THREADS_DATABASE_URL` (falling back to a localhost default).
-pub fn threads_database_url() -> String {
-    zed_env_vars::ZED_THREADS_DATABASE_URL
-        .clone()
+/// The PostgreSQL connection URL for agent thread storage, resolved from the
+/// `agent.threads_database_url` setting, then `ZED_THREADS_DATABASE_URL`, then a
+/// localhost default.
+pub fn threads_database_url(cx: &App) -> String {
+    AgentSettings::try_get(cx)
+        .and_then(|settings| settings.threads_database_url.clone())
+        .or_else(|| zed_env_vars::ZED_THREADS_DATABASE_URL.clone())
         .unwrap_or_else(|| DEFAULT_THREADS_DATABASE_URL.to_string())
 }
 
@@ -50,14 +55,6 @@ pub struct WorkspaceStore {
 }
 
 impl WorkspaceStore {
-    /// Connect to the configured thread database and ensure the schema exists.
-    ///
-    /// Must be awaited inside a Tokio runtime (e.g. via
-    /// `gpui_tokio::Tokio::spawn_result`), because sqlx's pool is built on it.
-    pub async fn connect() -> Result<Self> {
-        Self::connect_with_url(&threads_database_url()).await
-    }
-
     pub async fn connect_with_url(url: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(5)

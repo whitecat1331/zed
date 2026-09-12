@@ -243,6 +243,9 @@ pub struct AgentSettings {
     pub show_merge_conflict_indicator: bool,
     pub tool_permissions: ToolPermissions,
     pub sandbox_permissions: SandboxPermissions,
+
+    /// Optional PostgreSQL connection URL for agent thread storage.
+    pub threads_database_url: Option<String>,
 }
 
 impl AgentSettings {
@@ -820,6 +823,7 @@ impl Settings for AgentSettings {
             show_merge_conflict_indicator: agent.show_merge_conflict_indicator.unwrap(),
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
             sandbox_permissions: compile_sandbox_permissions(agent.sandbox_permissions),
+            threads_database_url: agent.threads_database_url,
         }
     }
 }
