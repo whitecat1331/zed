@@ -97,6 +97,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_json_lenient.workspace = true
 settings.workspace = true
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
 streaming_diff.workspace = true
 task.workspace = true
 telemetry.workspace = true
@@ -105,6 +106,7 @@ terminal_view.workspace = true
 text.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 ui.workspace = true
 unicode-script.workspace = true
 unicode-segmentation.workspace = true

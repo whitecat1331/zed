@@ -3,27 +3,20 @@ use std::{
     sync::Arc,
 };
 
-use agent::{ThreadStore, ZED_AGENT_ID};
+use agent::{ThreadStore, ZED_AGENT_ID, threads_database_url};
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet};
-use db::{
-    kvp::KeyValueStore,
-    sqlez::{
-        bindable::{Bind, Column},
-        domain::Domain,
-        statement::Statement,
-        thread_safe_connection::ThreadSafeConnection,
-    },
-    sqlez_macros::sql,
-};
+use db::kvp::KeyValueStore;
 use fs::Fs;
 use futures::{FutureExt, future::Shared};
 use gpui::{AppContext as _, Entity, Global, Subscription, Task, TaskExt};
+use indoc::indoc;
 pub use project::WorktreePaths;
 use project::{AgentId, linked_worktree_short_name};
 use remote::{RemoteConnectionOptions, same_remote_connection_identity};
+use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use ui::{App, Context, SharedString, ThreadItemWorktreeInfo, WorktreeKind};
 use util::ResultExt as _;
 use workspace::{PathList, SerializedWorkspaceLocation, WorkspaceDb};
@@ -44,46 +37,8 @@ impl ThreadId {
     }
 }
 
-impl Bind for ThreadId {
-    fn bind(&self, statement: &Statement, start_index: i32) -> anyhow::Result<i32> {
-        self.0.bind(statement, start_index)
-    }
-}
-
-impl Column for ThreadId {
-    fn column(statement: &mut Statement, start_index: i32) -> anyhow::Result<(Self, i32)> {
-        let (uuid, next) = Column::column(statement, start_index)?;
-        Ok((ThreadId(uuid), next))
-    }
-}
-
 const THREAD_REMOTE_CONNECTION_MIGRATION_KEY: &str = "thread-metadata-remote-connection-backfill";
 const THREAD_ID_MIGRATION_KEY: &str = "thread-metadata-thread-id-backfill";
-
-/// List all sidebar thread metadata from an arbitrary SQLite connection.
-///
-/// This is used to read thread metadata from another release channel's
-/// database without opening a full `ThreadSafeConnection`.
-pub(crate) fn list_thread_metadata_from_connection(
-    connection: &db::sqlez::connection::Connection,
-) -> anyhow::Result<Vec<ThreadMetadata>> {
-    connection.select::<ThreadMetadata>(ThreadMetadataDb::LIST_QUERY)?()
-}
-
-/// Run the `ThreadMetadataDb` migrations on a raw connection.
-///
-/// This is used in tests to set up the sidebar_threads schema in a
-/// temporary database.
-#[cfg(test)]
-pub(crate) fn run_thread_metadata_migrations(connection: &db::sqlez::connection::Connection) {
-    connection
-        .migrate(
-            ThreadMetadataDb::NAME,
-            ThreadMetadataDb::MIGRATIONS,
-            &mut |_, _, _| false,
-        )
-        .expect("thread metadata migrations should succeed");
-}
 
 pub fn init(cx: &mut App) {
     ThreadMetadataStore::init_global(cx);
@@ -110,7 +65,7 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
         // `test_migration_awaits_thread_store_reload` pins this behavior.
         thread_store_ready.await;
 
-        let existing_list = db.list()?;
+        let existing_list = db.list().await?;
         let existing_session_ids: HashSet<Arc<str>> = existing_list
             .into_iter()
             .filter_map(|m| m.session_id.map(|s| s.0))
@@ -237,7 +192,7 @@ fn migrate_thread_remote_connections(cx: &mut App, migration_task: Task<anyhow::
         }
 
         let mut reloaded = false;
-        for metadata in db.list()? {
+        for metadata in db.list().await? {
             if metadata.remote_connection.is_some() {
                 continue;
             }
@@ -282,7 +237,7 @@ fn migrate_thread_ids(cx: &mut App) {
         }
 
         let mut reloaded = false;
-        for metadata in db.list()? {
+        for metadata in db.list().await? {
             db.save(metadata).await?;
             reloaded = true;
         }
@@ -563,9 +518,8 @@ impl ThreadMetadataStore {
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn init_global(cx: &mut App) {
-        let db_name = TestMetadataDbName::global(cx);
-        let db = gpui::block_on(db::open_test_db::<ThreadMetadataDb>(&db_name));
-        let thread_store = cx.new(|cx| Self::new(ThreadMetadataDb(db), cx));
+        let db = ThreadMetadataDb::global(cx);
+        let thread_store = cx.new(|cx| Self::new(db, cx));
         cx.set_global(GlobalThreadMetadataStore(thread_store));
     }
 
@@ -660,8 +614,9 @@ impl ThreadMetadataStore {
         let db = self.db.clone();
         self.reload_task.take();
 
-        let list_task = cx
-            .background_spawn(async move { db.list().context("Failed to fetch sidebar metadata") });
+        let list_task = cx.background_spawn(async move {
+            db.list().await.context("Failed to fetch sidebar metadata")
+        });
 
         let reload_task = cx
             .spawn(async move |this, cx| {
@@ -1126,7 +1081,7 @@ impl ThreadMetadataStore {
         cx: &App,
     ) -> Task<anyhow::Result<HashMap<ThreadId, HashMap<PathBuf, String>>>> {
         let db = self.db.clone();
-        cx.background_spawn(async move { db.get_all_archived_branch_names() })
+        cx.background_spawn(async move { db.get_all_archived_branch_names().await })
     }
 
     fn update_archived(&mut self, thread_id: ThreadId, archived: bool, cx: &mut Context<Self>) {
@@ -1273,7 +1228,7 @@ impl ThreadMetadataStore {
                 };
 
                 let fingerprint = cx
-                    .background_spawn(async move { database.change_fingerprint() })
+                    .background_spawn(async move { database.change_fingerprint().await })
                     .await;
 
                 if let Ok(Some(fingerprint)) = fingerprint {
@@ -1411,161 +1366,148 @@ pub enum ThreadMetadataStoreEvent {
 
 impl gpui::EventEmitter<ThreadMetadataStoreEvent> for ThreadMetadataStore {}
 
-struct ThreadMetadataDb(ThreadSafeConnection);
-
-impl Domain for ThreadMetadataDb {
-    const NAME: &str = stringify!(ThreadMetadataDb);
-
-    const MIGRATIONS: &[&str] = &[
-        sql!(
-            CREATE TABLE IF NOT EXISTS sidebar_threads(
-                session_id TEXT PRIMARY KEY,
-                agent_id TEXT,
-                title TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                created_at TEXT,
-                folder_paths TEXT,
-                folder_paths_order TEXT
-            ) STRICT;
-        ),
-        sql!(ALTER TABLE sidebar_threads ADD COLUMN archived INTEGER DEFAULT 0),
-        sql!(ALTER TABLE sidebar_threads ADD COLUMN main_worktree_paths TEXT),
-        sql!(ALTER TABLE sidebar_threads ADD COLUMN main_worktree_paths_order TEXT),
-        sql!(
-            CREATE TABLE IF NOT EXISTS archived_git_worktrees(
-                id INTEGER PRIMARY KEY,
-                worktree_path TEXT NOT NULL,
-                main_repo_path TEXT NOT NULL,
-                branch_name TEXT,
-                staged_commit_hash TEXT,
-                unstaged_commit_hash TEXT,
-                original_commit_hash TEXT
-            ) STRICT;
-
-            CREATE TABLE IF NOT EXISTS thread_archived_worktrees(
-                session_id TEXT NOT NULL,
-                archived_worktree_id INTEGER NOT NULL REFERENCES archived_git_worktrees(id),
-                PRIMARY KEY (session_id, archived_worktree_id)
-            ) STRICT;
-        ),
-        sql!(ALTER TABLE sidebar_threads ADD COLUMN remote_connection TEXT),
-        sql!(ALTER TABLE sidebar_threads ADD COLUMN thread_id BLOB),
-        sql!(
-            UPDATE sidebar_threads SET thread_id = randomblob(16) WHERE thread_id IS NULL;
-
-            CREATE TABLE thread_archived_worktrees_v2(
-                thread_id BLOB NOT NULL,
-                archived_worktree_id INTEGER NOT NULL REFERENCES archived_git_worktrees(id),
-                PRIMARY KEY (thread_id, archived_worktree_id)
-            ) STRICT;
-
-            INSERT INTO thread_archived_worktrees_v2(thread_id, archived_worktree_id)
-            SELECT s.thread_id, t.archived_worktree_id
-            FROM thread_archived_worktrees t
-            JOIN sidebar_threads s ON s.session_id = t.session_id;
-
-            DROP TABLE thread_archived_worktrees;
-            ALTER TABLE thread_archived_worktrees_v2 RENAME TO thread_archived_worktrees;
-
-            CREATE TABLE sidebar_threads_v2(
-                thread_id BLOB PRIMARY KEY,
-                session_id TEXT,
-                agent_id TEXT,
-                title TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                created_at TEXT,
-                folder_paths TEXT,
-                folder_paths_order TEXT,
-                archived INTEGER DEFAULT 0,
-                main_worktree_paths TEXT,
-                main_worktree_paths_order TEXT,
-                remote_connection TEXT
-            ) STRICT;
-
-            INSERT INTO sidebar_threads_v2(thread_id, session_id, agent_id, title, updated_at, created_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection)
-            SELECT thread_id, session_id, agent_id, title, updated_at, created_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection
-            FROM sidebar_threads;
-
-            DROP TABLE sidebar_threads;
-            ALTER TABLE sidebar_threads_v2 RENAME TO sidebar_threads;
-        ),
-        sql!(
-            DELETE FROM thread_archived_worktrees
-            WHERE thread_id IN (
-                SELECT thread_id FROM sidebar_threads WHERE session_id IS NULL
-            );
-
-            DELETE FROM sidebar_threads WHERE session_id IS NULL;
-
-            DELETE FROM archived_git_worktrees
-            WHERE id NOT IN (
-                SELECT archived_worktree_id FROM thread_archived_worktrees
-            );
-        ),
-        sql!(
-            ALTER TABLE sidebar_threads ADD COLUMN interacted_at TEXT;
-        ),
-        sql!(
-            ALTER TABLE sidebar_threads ADD COLUMN title_override TEXT;
-        ),
-        sql!(
-            DELETE FROM sidebar_threads
-            WHERE thread_id IN (
-                SELECT thread_id FROM (
-                    SELECT thread_id,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY session_id
-                               ORDER BY archived ASC, updated_at DESC
-                           ) AS rn
-                    FROM sidebar_threads
-                    WHERE session_id IS NOT NULL
-                )
-                WHERE rn > 1
-            );
-
-            DELETE FROM thread_archived_worktrees
-            WHERE thread_id NOT IN (SELECT thread_id FROM sidebar_threads);
-
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_sidebar_threads_session_id
-            ON sidebar_threads(session_id)
-            WHERE session_id IS NOT NULL;
-        ),
-    ];
+#[derive(Clone)]
+struct ThreadMetadataDb {
+    pool: PgPool,
+    tokio_handle: tokio::runtime::Handle,
 }
 
-db::static_connection!(ThreadMetadataDb, []);
+const THREAD_METADATA_SCHEMA: &[&str] = &[
+    indoc!(
+        "CREATE TABLE IF NOT EXISTS sidebar_threads (
+            thread_id UUID PRIMARY KEY,
+            session_id TEXT,
+            agent_id TEXT,
+            title TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            created_at TIMESTAMPTZ,
+            interacted_at TIMESTAMPTZ,
+            folder_paths TEXT,
+            folder_paths_order TEXT,
+            archived BOOLEAN NOT NULL DEFAULT FALSE,
+            main_worktree_paths TEXT,
+            main_worktree_paths_order TEXT,
+            remote_connection TEXT,
+            title_override TEXT
+        )"
+    ),
+    indoc!(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sidebar_threads_session_id
+         ON sidebar_threads(session_id) WHERE session_id IS NOT NULL"
+    ),
+    indoc!(
+        "CREATE TABLE IF NOT EXISTS archived_git_worktrees (
+            id BIGSERIAL PRIMARY KEY,
+            worktree_path TEXT NOT NULL,
+            main_repo_path TEXT NOT NULL,
+            branch_name TEXT,
+            staged_commit_hash TEXT,
+            unstaged_commit_hash TEXT,
+            original_commit_hash TEXT
+        )"
+    ),
+    indoc!(
+        "CREATE TABLE IF NOT EXISTS thread_archived_worktrees (
+            thread_id UUID NOT NULL REFERENCES sidebar_threads(thread_id) ON DELETE CASCADE,
+            archived_worktree_id BIGINT NOT NULL REFERENCES archived_git_worktrees(id) ON DELETE CASCADE,
+            PRIMARY KEY (thread_id, archived_worktree_id)
+        )"
+    ),
+];
 
 impl ThreadMetadataDb {
-    #[allow(dead_code)]
-    pub fn list_ids(&self) -> anyhow::Result<Vec<ThreadId>> {
-        self.select::<ThreadId>(
-            "SELECT thread_id FROM sidebar_threads \
-             ORDER BY updated_at DESC",
-        )?()
+    pub fn global(cx: &App) -> Self {
+        let tokio_handle = gpui_tokio::Tokio::handle(cx);
+        let pool = gpui::block_on(tokio_handle.spawn(Self::connect_pool()))
+            .context("thread metadata database task failed")
+            .and_then(|result| result)
+            .expect("failed to initialize thread metadata database");
+        Self { pool, tokio_handle }
     }
 
+    async fn connect_pool() -> anyhow::Result<PgPool> {
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&threads_database_url())
+            .await
+            .context("failed to connect to thread metadata database")?;
+        for statement in THREAD_METADATA_SCHEMA {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .context("failed to initialize thread metadata schema")?;
+        }
+        Ok(pool)
+    }
+
+    async fn run_db<F, T>(&self, future: F) -> anyhow::Result<T>
+    where
+        F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.tokio_handle
+            .spawn(future)
+            .await
+            .context("thread metadata database task failed")?
+    }
+}
+
+impl ThreadMetadataDb {
     const LIST_QUERY: &str = "SELECT thread_id, session_id, agent_id, title, updated_at, \
         created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, \
         main_worktree_paths_order, remote_connection, title_override \
         FROM sidebar_threads \
         ORDER BY updated_at DESC";
 
+    #[allow(dead_code)]
+    pub async fn list_ids(&self) -> anyhow::Result<Vec<ThreadId>> {
+        let pool = self.pool.clone();
+        self.run_db(async move {
+            let ids: Vec<uuid::Uuid> = sqlx::query_scalar::<_, uuid::Uuid>(
+                "SELECT thread_id FROM sidebar_threads ORDER BY updated_at DESC",
+            )
+            .fetch_all(&pool)
+            .await?;
+            Ok(ids.into_iter().map(ThreadId).collect())
+        })
+        .await
+    }
+
     /// List all sidebar thread metadata, ordered by updated_at descending.
     ///
     /// Only returns threads that have a `session_id`.
-    pub fn list(&self) -> anyhow::Result<Vec<ThreadMetadata>> {
-        self.select::<ThreadMetadata>(Self::LIST_QUERY)?()
+    pub async fn list(&self) -> anyhow::Result<Vec<ThreadMetadata>> {
+        let pool = self.pool.clone();
+        self.run_db(async move {
+            let rows = sqlx::query(Self::LIST_QUERY).fetch_all(&pool).await?;
+            rows.iter().map(ThreadMetadata::from_row).collect()
+        })
+        .await
     }
 
     /// Returns a cheap fingerprint of the sidebar metadata table — row count,
     /// newest `updated_at`, and the number of archived rows — used by the
     /// cross-instance change observer to detect external list changes.
     #[cfg(not(any(test, feature = "test-support")))]
-    pub fn change_fingerprint(&self) -> anyhow::Result<Option<String>> {
-        let mut select = self.select_row_bound::<(), String>(
-            "SELECT COUNT(*) || ':' || COALESCE(MAX(updated_at), '') || ':' || COALESCE(SUM(archived), 0) FROM sidebar_threads",
-        )?;
-        select(())
+    pub async fn change_fingerprint(&self) -> anyhow::Result<Option<String>> {
+        let pool = self.pool.clone();
+        self.run_db(async move {
+            let (count, max_updated_at, archived_sum): (i64, Option<DateTime<Utc>>, i64) =
+                sqlx::query_as(
+                    "SELECT COUNT(*), MAX(updated_at), COALESCE(SUM(archived::int), 0) FROM sidebar_threads",
+                )
+                .fetch_one(&pool)
+                .await?;
+            Ok(Some(format!(
+                "{}:{}:{}",
+                count,
+                max_updated_at
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_default(),
+                archived_sum
+            )))
+        })
+        .await
     }
 
     /// Upsert metadata for a thread.
@@ -1574,7 +1516,13 @@ impl ThreadMetadataDb {
     /// session_id on promotion (when the first message is sent) and
     /// then flow through this same upsert path.
     pub async fn save(&self, row: ThreadMetadata) -> anyhow::Result<()> {
-        let session_id = row.session_id.as_ref().map(|s| s.0.clone());
+        let pool = self.pool.clone();
+        self.run_db(async move { Self::save_sync(&pool, row).await })
+            .await
+    }
+
+    async fn save_sync(pool: &PgPool, row: ThreadMetadata) -> anyhow::Result<()> {
+        let session_id = row.session_id.as_ref().map(|s| s.0.to_string());
         let agent_id = if row.agent_id.as_ref() == ZED_AGENT_ID.as_ref() {
             None
         } else {
@@ -1585,9 +1533,9 @@ impl ThreadMetadataDb {
             .as_ref()
             .map(|t| t.to_string())
             .unwrap_or_default();
-        let updated_at = row.updated_at.to_rfc3339();
-        let created_at = row.created_at.map(|dt| dt.to_rfc3339());
-        let interacted_at = row.interacted_at.map(|dt| dt.to_rfc3339());
+        let updated_at = row.updated_at;
+        let created_at = row.created_at;
+        let interacted_at = row.interacted_at;
         let serialized = row.folder_paths().serialize();
         let (folder_paths, folder_paths_order) = if row.folder_paths().is_empty() {
             (None, None)
@@ -1611,64 +1559,65 @@ impl ThreadMetadataDb {
         let thread_id = row.thread_id;
         let archived = row.archived;
 
-        self.write(move |conn| {
-            // A session's `thread_id` can change (e.g. cross-window activation
-            // mints a new local id), but there must be at most one row per
-            // session. Remove any stale row still carrying the old thread_id
-            // before upserting so the metadata migrates instead of duplicating.
-            if let Some(session_id) = session_id.as_ref() {
-                let mut delete = Statement::prepare(
-                    conn,
-                    "DELETE FROM sidebar_threads WHERE session_id = ? AND thread_id != ?",
-                )?;
-                delete.bind(session_id, 1)?;
-                delete.bind(&thread_id, 2)?;
-                delete.exec()?;
-            }
+        // A session's `thread_id` can change (e.g. cross-window activation
+        // mints a new local id), but there must be at most one row per
+        // session. Remove any stale row still carrying the old thread_id
+        // before upserting so the metadata migrates instead of duplicating.
+        if let Some(session_id) = session_id.as_ref() {
+            sqlx::query("DELETE FROM sidebar_threads WHERE session_id = $1 AND thread_id != $2")
+                .bind(session_id)
+                .bind(thread_id.0)
+                .execute(pool)
+                .await?;
+        }
 
-            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
-                       ON CONFLICT(thread_id) DO UPDATE SET \
-                           session_id = excluded.session_id, \
-                           agent_id = excluded.agent_id, \
-                           title = excluded.title, \
-                           updated_at = excluded.updated_at, \
-                           created_at = excluded.created_at, \
-                           interacted_at = excluded.interacted_at, \
-                           folder_paths = excluded.folder_paths, \
-                           folder_paths_order = excluded.folder_paths_order, \
-                           archived = excluded.archived, \
-                           main_worktree_paths = excluded.main_worktree_paths, \
-                           main_worktree_paths_order = excluded.main_worktree_paths_order, \
-                           remote_connection = excluded.remote_connection, \
-                           title_override = excluded.title_override";
-            let mut stmt = Statement::prepare(conn, sql)?;
-            let mut i = stmt.bind(&thread_id, 1)?;
-            i = stmt.bind(&session_id, i)?;
-            i = stmt.bind(&agent_id, i)?;
-            i = stmt.bind(&title, i)?;
-            i = stmt.bind(&updated_at, i)?;
-            i = stmt.bind(&created_at, i)?;
-            i = stmt.bind(&interacted_at, i)?;
-            i = stmt.bind(&folder_paths, i)?;
-            i = stmt.bind(&folder_paths_order, i)?;
-            i = stmt.bind(&archived, i)?;
-            i = stmt.bind(&main_worktree_paths, i)?;
-            i = stmt.bind(&main_worktree_paths_order, i)?;
-            i = stmt.bind(&remote_connection, i)?;
-            stmt.bind(&title_override, i)?;
-            stmt.exec()
-        })
-        .await
+        sqlx::query(
+            "INSERT INTO sidebar_threads (thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+             ON CONFLICT (thread_id) DO UPDATE SET
+                 session_id = excluded.session_id,
+                 agent_id = excluded.agent_id,
+                 title = excluded.title,
+                 updated_at = excluded.updated_at,
+                 created_at = excluded.created_at,
+                 interacted_at = excluded.interacted_at,
+                 folder_paths = excluded.folder_paths,
+                 folder_paths_order = excluded.folder_paths_order,
+                 archived = excluded.archived,
+                 main_worktree_paths = excluded.main_worktree_paths,
+                 main_worktree_paths_order = excluded.main_worktree_paths_order,
+                 remote_connection = excluded.remote_connection,
+                 title_override = excluded.title_override",
+        )
+        .bind(thread_id.0)
+        .bind(session_id)
+        .bind(agent_id)
+        .bind(title)
+        .bind(updated_at)
+        .bind(created_at)
+        .bind(interacted_at)
+        .bind(folder_paths)
+        .bind(folder_paths_order)
+        .bind(archived)
+        .bind(main_worktree_paths)
+        .bind(main_worktree_paths_order)
+        .bind(remote_connection)
+        .bind(title_override)
+        .execute(pool)
+        .await?;
+
+        Ok(())
     }
 
     /// Delete metadata for a single thread.
     pub async fn delete(&self, thread_id: ThreadId) -> anyhow::Result<()> {
-        self.write(move |conn| {
-            let mut stmt =
-                Statement::prepare(conn, "DELETE FROM sidebar_threads WHERE thread_id = ?")?;
-            stmt.bind(&thread_id, 1)?;
-            stmt.exec()
+        let pool = self.pool.clone();
+        self.run_db(async move {
+            sqlx::query("DELETE FROM sidebar_threads WHERE thread_id = $1")
+                .bind(thread_id.0)
+                .execute(&pool)
+                .await?;
+            Ok(())
         })
         .await
     }
@@ -1682,20 +1631,22 @@ impl ThreadMetadataDb {
         unstaged_commit_hash: String,
         original_commit_hash: String,
     ) -> anyhow::Result<i64> {
-        self.write(move |conn| {
-            let mut stmt = Statement::prepare(
-                conn,
-                "INSERT INTO archived_git_worktrees(worktree_path, main_repo_path, branch_name, staged_commit_hash, unstaged_commit_hash, original_commit_hash) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+        let pool = self.pool.clone();
+        self.run_db(async move {
+            let id: i64 = sqlx::query_scalar::<_, i64>(
+                "INSERT INTO archived_git_worktrees (worktree_path, main_repo_path, branch_name, staged_commit_hash, unstaged_commit_hash, original_commit_hash)
+                 VALUES ($1, $2, $3, $4, $5, $6)
                  RETURNING id",
-            )?;
-            let mut i = stmt.bind(&worktree_path, 1)?;
-            i = stmt.bind(&main_repo_path, i)?;
-            i = stmt.bind(&branch_name, i)?;
-            i = stmt.bind(&staged_commit_hash, i)?;
-            i = stmt.bind(&unstaged_commit_hash, i)?;
-            stmt.bind(&original_commit_hash, i)?;
-            stmt.maybe_row::<i64>()?.context("expected RETURNING id")
+            )
+            .bind(worktree_path)
+            .bind(main_repo_path)
+            .bind(branch_name)
+            .bind(staged_commit_hash)
+            .bind(unstaged_commit_hash)
+            .bind(original_commit_hash)
+            .fetch_one(&pool)
+            .await?;
+            Ok(id)
         })
         .await
     }
@@ -1705,15 +1656,16 @@ impl ThreadMetadataDb {
         thread_id: ThreadId,
         archived_worktree_id: i64,
     ) -> anyhow::Result<()> {
-        self.write(move |conn| {
-            let mut stmt = Statement::prepare(
-                conn,
-                "INSERT INTO thread_archived_worktrees(thread_id, archived_worktree_id) \
-                 VALUES (?1, ?2)",
-            )?;
-            let i = stmt.bind(&thread_id, 1)?;
-            stmt.bind(&archived_worktree_id, i)?;
-            stmt.exec()
+        let pool = self.pool.clone();
+        self.run_db(async move {
+            sqlx::query(
+                "INSERT INTO thread_archived_worktrees (thread_id, archived_worktree_id) VALUES ($1, $2)",
+            )
+            .bind(thread_id.0)
+            .bind(archived_worktree_id)
+            .execute(&pool)
+            .await?;
+            Ok(())
         })
         .await
     }
@@ -1722,27 +1674,34 @@ impl ThreadMetadataDb {
         &self,
         thread_id: ThreadId,
     ) -> anyhow::Result<Vec<ArchivedGitWorktree>> {
-        self.select_bound::<ThreadId, ArchivedGitWorktree>(
-            "SELECT a.id, a.worktree_path, a.main_repo_path, a.branch_name, a.staged_commit_hash, a.unstaged_commit_hash, a.original_commit_hash \
-             FROM archived_git_worktrees a \
-             JOIN thread_archived_worktrees t ON a.id = t.archived_worktree_id \
-             WHERE t.thread_id = ?1",
-        )?(thread_id)
+        let pool = self.pool.clone();
+        self.run_db(async move {
+            let rows = sqlx::query(
+                "SELECT a.id, a.worktree_path, a.main_repo_path, a.branch_name, a.staged_commit_hash, a.unstaged_commit_hash, a.original_commit_hash
+                 FROM archived_git_worktrees a
+                 JOIN thread_archived_worktrees t ON a.id = t.archived_worktree_id
+                 WHERE t.thread_id = $1",
+            )
+            .bind(thread_id.0)
+            .fetch_all(&pool)
+            .await?;
+            rows.iter().map(ArchivedGitWorktree::from_row).collect()
+        })
+        .await
     }
 
     pub async fn delete_archived_worktree(&self, id: i64) -> anyhow::Result<()> {
-        self.write(move |conn| {
-            let mut stmt = Statement::prepare(
-                conn,
-                "DELETE FROM thread_archived_worktrees WHERE archived_worktree_id = ?",
-            )?;
-            stmt.bind(&id, 1)?;
-            stmt.exec()?;
-
-            let mut stmt =
-                Statement::prepare(conn, "DELETE FROM archived_git_worktrees WHERE id = ?")?;
-            stmt.bind(&id, 1)?;
-            stmt.exec()
+        let pool = self.pool.clone();
+        self.run_db(async move {
+            sqlx::query("DELETE FROM thread_archived_worktrees WHERE archived_worktree_id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await?;
+            sqlx::query("DELETE FROM archived_git_worktrees WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await?;
+            Ok(())
         })
         .await
     }
@@ -1751,13 +1710,13 @@ impl ThreadMetadataDb {
         &self,
         thread_id: ThreadId,
     ) -> anyhow::Result<()> {
-        self.write(move |conn| {
-            let mut stmt = Statement::prepare(
-                conn,
-                "DELETE FROM thread_archived_worktrees WHERE thread_id = ?",
-            )?;
-            stmt.bind(&thread_id, 1)?;
-            stmt.exec()
+        let pool = self.pool.clone();
+        self.run_db(async move {
+            sqlx::query("DELETE FROM thread_archived_worktrees WHERE thread_id = $1")
+                .bind(thread_id.0)
+                .execute(&pool)
+                .await?;
+            Ok(())
         })
         .await
     }
@@ -1766,71 +1725,70 @@ impl ThreadMetadataDb {
         &self,
         archived_worktree_id: i64,
     ) -> anyhow::Result<bool> {
-        self.select_row_bound::<i64, i64>(
-            "SELECT COUNT(*) FROM thread_archived_worktrees WHERE archived_worktree_id = ?1",
-        )?(archived_worktree_id)
-        .map(|count| count.unwrap_or(0) > 0)
+        let pool = self.pool.clone();
+        self.run_db(async move {
+            let count: i64 = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM thread_archived_worktrees WHERE archived_worktree_id = $1",
+            )
+            .bind(archived_worktree_id)
+            .fetch_one(&pool)
+            .await?;
+            Ok(count > 0)
+        })
+        .await
     }
 
-    pub fn get_all_archived_branch_names(
+    pub async fn get_all_archived_branch_names(
         &self,
     ) -> anyhow::Result<HashMap<ThreadId, HashMap<PathBuf, String>>> {
-        let rows = self.select::<(ThreadId, String, String)>(
-            "SELECT t.thread_id, a.worktree_path, a.branch_name \
-             FROM thread_archived_worktrees t \
-             JOIN archived_git_worktrees a ON a.id = t.archived_worktree_id \
-             WHERE a.branch_name IS NOT NULL \
-             ORDER BY a.id ASC",
-        )?()?;
+        let pool = self.pool.clone();
+        self.run_db(async move {
+            let rows = sqlx::query_as::<_, (uuid::Uuid, String, String)>(
+                "SELECT t.thread_id, a.worktree_path, a.branch_name
+                 FROM thread_archived_worktrees t
+                 JOIN archived_git_worktrees a ON a.id = t.archived_worktree_id
+                 WHERE a.branch_name IS NOT NULL
+                 ORDER BY a.id ASC",
+            )
+            .fetch_all(&pool)
+            .await?;
 
-        let mut result: HashMap<ThreadId, HashMap<PathBuf, String>> = HashMap::default();
-        for (thread_id, worktree_path, branch_name) in rows {
-            result
-                .entry(thread_id)
-                .or_default()
-                .insert(PathBuf::from(worktree_path), branch_name);
-        }
-        Ok(result)
+            let mut result: HashMap<ThreadId, HashMap<PathBuf, String>> = HashMap::default();
+            for (thread_id, worktree_path, branch_name) in rows {
+                result
+                    .entry(ThreadId(thread_id))
+                    .or_default()
+                    .insert(PathBuf::from(worktree_path), branch_name);
+            }
+            Ok(result)
+        })
+        .await
     }
 }
 
-impl Column for ThreadMetadata {
-    fn column(statement: &mut Statement, start_index: i32) -> anyhow::Result<(Self, i32)> {
-        let (thread_id_uuid, next): (uuid::Uuid, i32) = Column::column(statement, start_index)?;
-        let (id, next): (Option<Arc<str>>, i32) = Column::column(statement, next)?;
-        let (agent_id, next): (Option<String>, i32) = Column::column(statement, next)?;
-        let (title, next): (String, i32) = Column::column(statement, next)?;
-        let (updated_at_str, next): (String, i32) = Column::column(statement, next)?;
-        let (created_at_str, next): (Option<String>, i32) = Column::column(statement, next)?;
-        let (interacted_at_str, next): (Option<String>, i32) = Column::column(statement, next)?;
-        let (folder_paths_str, next): (Option<String>, i32) = Column::column(statement, next)?;
-        let (folder_paths_order_str, next): (Option<String>, i32) =
-            Column::column(statement, next)?;
-        let (archived, next): (bool, i32) = Column::column(statement, next)?;
-        let (main_worktree_paths_str, next): (Option<String>, i32) =
-            Column::column(statement, next)?;
-        let (main_worktree_paths_order_str, next): (Option<String>, i32) =
-            Column::column(statement, next)?;
-        let (remote_connection_json, next): (Option<String>, i32) =
-            Column::column(statement, next)?;
-        let (title_override, next): (Option<String>, i32) = Column::column(statement, next)?;
+impl ThreadMetadata {
+    fn from_row(row: &PgRow) -> anyhow::Result<Self> {
+        use sqlx::Row as _;
+
+        let thread_id: uuid::Uuid = row.try_get("thread_id")?;
+        let session_id: Option<String> = row.try_get("session_id")?;
+        let agent_id: Option<String> = row.try_get("agent_id")?;
+        let title: String = row.try_get("title")?;
+        let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
+        let created_at: Option<DateTime<Utc>> = row.try_get("created_at")?;
+        let interacted_at: Option<DateTime<Utc>> = row.try_get("interacted_at")?;
+        let folder_paths_str: Option<String> = row.try_get("folder_paths")?;
+        let folder_paths_order_str: Option<String> = row.try_get("folder_paths_order")?;
+        let archived: bool = row.try_get("archived")?;
+        let main_worktree_paths_str: Option<String> = row.try_get("main_worktree_paths")?;
+        let main_worktree_paths_order_str: Option<String> =
+            row.try_get("main_worktree_paths_order")?;
+        let remote_connection_json: Option<String> = row.try_get("remote_connection")?;
+        let title_override: Option<String> = row.try_get("title_override")?;
 
         let agent_id = agent_id
             .map(|id| AgentId::new(id))
-            .unwrap_or(ZED_AGENT_ID.clone());
-
-        let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)?.with_timezone(&Utc);
-        let created_at = created_at_str
-            .as_deref()
-            .map(DateTime::parse_from_rfc3339)
-            .transpose()?
-            .map(|dt| dt.with_timezone(&Utc));
-
-        let interacted_at = interacted_at_str
-            .as_deref()
-            .map(DateTime::parse_from_rfc3339)
-            .transpose()?
-            .map(|dt| dt.with_timezone(&Utc));
+            .unwrap_or_else(|| ZED_AGENT_ID.clone());
 
         let folder_paths = folder_paths_str
             .map(|paths| {
@@ -1859,55 +1817,41 @@ impl Column for ThreadMetadata {
         let worktree_paths = WorktreePaths::from_path_lists(main_worktree_paths, folder_paths)
             .unwrap_or_else(|_| WorktreePaths::default());
 
-        let thread_id = ThreadId(thread_id_uuid);
-
-        Ok((
-            ThreadMetadata {
-                thread_id,
-                session_id: id.map(acp::SessionId::new),
-                agent_id,
-                title: if title.is_empty() || title == DEFAULT_THREAD_TITLE {
-                    None
-                } else {
-                    Some(title.into())
-                },
-                title_override: title_override
-                    .filter(|t| !t.is_empty())
-                    .map(SharedString::from),
-                updated_at,
-                created_at,
-                interacted_at,
-                worktree_paths,
-                remote_connection,
-                archived,
+        Ok(ThreadMetadata {
+            thread_id: ThreadId(thread_id),
+            session_id: session_id.map(|id| acp::SessionId::new(Arc::<str>::from(id))),
+            agent_id,
+            title: if title.is_empty() || title == DEFAULT_THREAD_TITLE {
+                None
+            } else {
+                Some(title.into())
             },
-            next,
-        ))
+            title_override: title_override
+                .filter(|t| !t.is_empty())
+                .map(SharedString::from),
+            updated_at,
+            created_at,
+            interacted_at,
+            worktree_paths,
+            remote_connection,
+            archived,
+        })
     }
 }
 
-impl Column for ArchivedGitWorktree {
-    fn column(statement: &mut Statement, start_index: i32) -> anyhow::Result<(Self, i32)> {
-        let (id, next): (i64, i32) = Column::column(statement, start_index)?;
-        let (worktree_path_str, next): (String, i32) = Column::column(statement, next)?;
-        let (main_repo_path_str, next): (String, i32) = Column::column(statement, next)?;
-        let (branch_name, next): (Option<String>, i32) = Column::column(statement, next)?;
-        let (staged_commit_hash, next): (String, i32) = Column::column(statement, next)?;
-        let (unstaged_commit_hash, next): (String, i32) = Column::column(statement, next)?;
-        let (original_commit_hash, next): (String, i32) = Column::column(statement, next)?;
+impl ArchivedGitWorktree {
+    fn from_row(row: &PgRow) -> anyhow::Result<Self> {
+        use sqlx::Row as _;
 
-        Ok((
-            ArchivedGitWorktree {
-                id,
-                worktree_path: PathBuf::from(worktree_path_str),
-                main_repo_path: PathBuf::from(main_repo_path_str),
-                branch_name,
-                staged_commit_hash,
-                unstaged_commit_hash,
-                original_commit_hash,
-            },
-            next,
-        ))
+        Ok(ArchivedGitWorktree {
+            id: row.try_get("id")?,
+            worktree_path: PathBuf::from(row.try_get::<String, _>("worktree_path")?),
+            main_repo_path: PathBuf::from(row.try_get::<String, _>("main_repo_path")?),
+            branch_name: row.try_get("branch_name")?,
+            staged_commit_hash: row.try_get("staged_commit_hash")?,
+            unstaged_commit_hash: row.try_get("unstaged_commit_hash")?,
+            original_commit_hash: row.try_get("original_commit_hash")?,
+        })
     }
 }
 
