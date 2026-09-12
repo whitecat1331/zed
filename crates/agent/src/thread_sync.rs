@@ -72,6 +72,13 @@ pub enum ThreadSyncMessage {
         op_id: String,
         body: String,
     },
+    /// Signals that a thread's title changed.
+    TitleChanged {
+        session_id: String,
+        client_id: String,
+        op_id: String,
+        title: String,
+    },
 }
 
 impl ThreadSyncMessage {
@@ -80,7 +87,8 @@ impl ThreadSyncMessage {
             ThreadSyncMessage::Stream { client_id, .. }
             | ThreadSyncMessage::UserMessage { client_id, .. }
             | ThreadSyncMessage::TurnComplete { client_id, .. }
-            | ThreadSyncMessage::AgentMessage { client_id, .. } => client_id,
+            | ThreadSyncMessage::AgentMessage { client_id, .. }
+            | ThreadSyncMessage::TitleChanged { client_id, .. } => client_id,
         }
     }
 }
@@ -241,6 +249,18 @@ impl ThreadSyncBus {
             .ok();
     }
 
+    /// Publishes a title change for a thread.
+    pub fn broadcast_title_changed(&self, session_id: String, title: String) {
+        self.outbound_tx
+            .try_send(ThreadSyncMessage::TitleChanged {
+                session_id,
+                client_id: self.client_id.clone(),
+                op_id: uuid::Uuid::new_v4().to_string(),
+                title,
+            })
+            .ok();
+    }
+
     /// Publishes a stream event from an async context, if the bus has been
     /// initialized. No-op when the bus is absent (tests, or before init).
     pub fn broadcast_stream_global(
@@ -264,6 +284,17 @@ impl ThreadSyncBus {
         }
         cx.read_global::<GlobalThreadSyncBus, ()>(|bus, app| {
             bus.0.read(app).broadcast_turn_complete(session_id)
+        });
+    }
+
+    /// Publishes a title change from an async context, if the bus has been
+    /// initialized. No-op when the bus is absent (tests, or before init).
+    pub fn broadcast_title_changed_global(cx: &AsyncApp, session_id: String, title: String) {
+        if !cx.has_global::<GlobalThreadSyncBus>() {
+            return;
+        }
+        cx.read_global::<GlobalThreadSyncBus, ()>(|bus, app| {
+            bus.0.read(app).broadcast_title_changed(session_id, title)
         });
     }
 

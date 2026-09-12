@@ -3086,6 +3086,11 @@ impl AgentPanel {
             ThreadSyncMessage::AgentMessage { to_session, body, .. } => {
                 self.apply_remote_agent_message(to_session, body, cx);
             }
+            ThreadSyncMessage::TitleChanged { .. } => {
+                ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                    let _ = store.reload(cx);
+                });
+            }
         }
     }
 

@@ -1476,8 +1476,8 @@ impl NativeAgent {
         _: &TitleUpdated,
         cx: &mut Context<Self>,
     ) {
-        let session_id = thread.read(cx).id();
-        let Some(session) = self.sessions.get(session_id) else {
+        let session_id = thread.read(cx).id().clone();
+        let Some(session) = self.sessions.get(&session_id) else {
             return;
         };
 
@@ -1487,8 +1487,13 @@ impl NativeAgent {
             let title = thread.read_with(cx, |thread, _| thread.title())?;
             if let Some(title) = title {
                 let task =
-                    acp_thread.update(cx, |acp_thread, cx| acp_thread.set_title(title, cx))?;
+                    acp_thread.update(cx, |acp_thread, cx| acp_thread.set_title(title.clone(), cx))?;
                 task.await?;
+                ThreadSyncBus::broadcast_title_changed_global(
+                    cx,
+                    session_id.to_string(),
+                    title.to_string(),
+                );
             }
             anyhow::Ok(())
         })

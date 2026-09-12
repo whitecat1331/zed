@@ -656,7 +656,7 @@ impl ThreadMetadataStore {
             .filter(move |s| s.matches_remote_connection(remote_connection))
     }
 
-    fn reload(&mut self, cx: &mut Context<Self>) -> Shared<Task<()>> {
+    pub fn reload(&mut self, cx: &mut Context<Self>) -> Shared<Task<()>> {
         let db = self.db.clone();
         self.reload_task.take();
 
