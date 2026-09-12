@@ -2107,6 +2107,10 @@ pub struct AcpThread {
     shared_buffers: HashMap<Entity<Buffer>, BufferSnapshot>,
     turn_id: u32,
     running_turn: Option<RunningTurn>,
+    /// Set while another Zed instance is streaming a turn into this thread, so
+    /// `status()` reports `Generating` (stop button, queue) even though this
+    /// instance is not itself running the turn.
+    remote_turn_active: bool,
     connection: Rc<dyn AgentConnection>,
     token_usage: Option<TokenUsage>,
     cost: Option<SessionCost>,
@@ -2359,6 +2363,7 @@ impl AcpThread {
             provisional_title: None,
             project,
             running_turn: None,
+            remote_turn_active: false,
             turn_id: 0,
             connection,
             session_id,
@@ -2492,11 +2497,39 @@ impl AcpThread {
     }
 
     pub fn status(&self) -> ThreadStatus {
-        if self.running_turn.is_some() {
+        if self.running_turn.is_some() || self.remote_turn_active {
             ThreadStatus::Generating
         } else {
             ThreadStatus::Idle
         }
+    }
+
+    /// Whether this instance is itself running a turn (as opposed to merely
+    /// mirroring another instance's remote turn).
+    pub fn is_locally_generating(&self) -> bool {
+        self.running_turn.is_some()
+    }
+
+    /// Marks the thread as generating because another instance began streaming
+    /// a turn into it. Idempotent.
+    pub fn remote_turn_started(&mut self, cx: &mut Context<Self>) {
+        if self.remote_turn_active {
+            return;
+        }
+        self.remote_turn_active = true;
+        cx.emit(AcpThreadEvent::StatusChanged);
+    }
+
+    /// Marks the remote turn as complete. Emits `StatusChanged` and `Stopped`
+    /// so the UI clears the generating indicator and auto-dispatches any queued
+    /// follow-up messages, exactly as it would for a local turn finishing.
+    pub fn remote_turn_completed(&mut self, cx: &mut Context<Self>) {
+        if !self.remote_turn_active {
+            return;
+        }
+        self.remote_turn_active = false;
+        cx.emit(AcpThreadEvent::StatusChanged);
+        cx.emit(AcpThreadEvent::Stopped(acp::StopReason::EndTurn));
     }
 
     pub fn had_error(&self) -> bool {
@@ -2712,6 +2745,32 @@ impl AcpThread {
         cx: &mut Context<Self>,
     ) {
         self.push_user_content_block_with_indent(client_id, chunk, false, cx)
+    }
+
+    /// Pushes a complete user message as a new entry (never merging into an
+    /// adjacent user message). Used to mirror a user message that was sent in
+    /// another instance.
+    pub fn push_user_message(
+        &mut self,
+        client_id: Option<ClientUserMessageId>,
+        chunks: Vec<acp::ContentBlock>,
+        cx: &mut Context<Self>,
+    ) {
+        let language_registry = self.project.read(cx).languages().clone();
+        let path_style = self.project.read(cx).path_style(cx);
+        let content = ContentBlock::new_combined(chunks.clone(), language_registry, path_style, cx);
+        self.push_entry(
+            AgentThreadEntry::UserMessage(UserMessage {
+                protocol_id: None,
+                client_id,
+                is_optimistic: false,
+                content,
+                chunks,
+                checkpoint: None,
+                indented: false,
+            }),
+            cx,
+        );
     }
 
     pub fn push_user_content_block_with_indent(
