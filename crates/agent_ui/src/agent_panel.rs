@@ -4576,7 +4576,11 @@ impl AgentPanel {
             return;
         };
         // Never replace a thread that is actively generating in this instance.
-        if acp_thread.read(cx).status() == ThreadStatus::Generating {
+        // A thread that is merely mirroring another instance's remote turn
+        // (`remote_turn_active`) must still reload: if the final `TurnComplete`
+        // bus message was missed, this reload is what clears the stuck
+        // generating state instead of leaving the red stop button up forever.
+        if acp_thread.read(cx).is_locally_generating() {
             return;
         }
 
