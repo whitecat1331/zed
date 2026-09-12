@@ -13,7 +13,7 @@ use std::{
 use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, ThreadStatus, line_range_suffix};
 use agent::{
     ContextServerRegistry, SharedThread, ThreadStore, ThreadSyncBus, ThreadSyncBusEvent,
-    ThreadSyncMessage, ThreadSyncStreamEvent,
+    ThreadSyncMessage, ThreadSyncStreamEvent, UserMessage,
 };
 use agent_client_protocol::schema::v1 as acp;
 use agent_servers::AgentServer;
@@ -3070,6 +3070,13 @@ impl AgentPanel {
             } => {
                 self.apply_remote_stream_event(session_id, client_id, event, cx);
             }
+            ThreadSyncMessage::UserMessage {
+                session_id,
+                message,
+                ..
+            } => {
+                self.apply_remote_user_message(session_id, message, cx);
+            }
         }
     }
 
@@ -3102,6 +3109,43 @@ impl AgentPanel {
         }
 
         None
+    }
+
+    /// Applies a user message published by another instance to both the open
+    /// UI thread (as a new entry) and the native `agent::Thread` model's
+    /// committed prefix, so it mirrors immediately without waiting for a
+    /// Postgres NOTIFY reload.
+    fn apply_remote_user_message(
+        &mut self,
+        session_id: &str,
+        message: &UserMessage,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conversation_view) = self.conversation_view_by_session(session_id, cx) else {
+            return;
+        };
+        let Some(acp_thread) = conversation_view.read(cx).root_thread(cx) else {
+            return;
+        };
+
+        // Append to the model's committed prefix unconditionally so concurrent
+        // turns converge against the same history.
+        if let Some(native_thread) = conversation_view.read(cx).as_native_thread(cx) {
+            native_thread.update(cx, |thread, cx| {
+                thread.apply_remote_user_message(message.clone(), cx);
+            });
+        }
+
+        // Mirror into the UI as a new user-message entry (never merged into an
+        // adjacent message, matching how the local send path renders it).
+        let chunks: Vec<acp::ContentBlock> = message
+            .content
+            .iter()
+            .map(|content| content.clone().into())
+            .collect();
+        acp_thread.update(cx, |thread, cx| {
+            thread.push_user_message(Some(message.id.clone()), chunks, cx);
+        });
     }
 
     /// Mirrors streamed token deltas from another instance into both the native
