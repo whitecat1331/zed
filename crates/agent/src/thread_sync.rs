@@ -38,10 +38,9 @@ pub enum ThreadSyncStreamEvent {
     Stop(String),
 }
 
-/// A message carried across the local cross-instance sync bus. Ephemeral stream
-/// deltas are mirrored live, and committed user messages are pushed live for
-/// zero-latency mirroring. Postgres + `LISTEN/NOTIFY` remains the durable
-/// authority and the reconcile fallback for anything the bus drops.
+/// A streamed event carried across the local cross-instance sync bus. Persisted
+/// thread state (content, titles, metadata) is reconciled through Postgres +
+/// `LISTEN/NOTIFY`; the bus carries only live, ephemeral stream deltas.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ThreadSyncMessage {
     Stream {
@@ -52,22 +51,12 @@ pub enum ThreadSyncMessage {
         op_id: String,
         event: ThreadSyncStreamEvent,
     },
-    /// A user message appended to the committed prefix of a thread. Other
-    /// instances apply this to their `Thread.messages` so they generate (and
-    /// save) against the same history.
-    UserMessage {
-        session_id: String,
-        client_id: String,
-        op_id: String,
-        message: crate::thread::UserMessage,
-    },
 }
 
 impl ThreadSyncMessage {
     pub fn client_id(&self) -> &str {
         match self {
-            ThreadSyncMessage::Stream { client_id, .. }
-            | ThreadSyncMessage::UserMessage { client_id, .. } => client_id,
+            ThreadSyncMessage::Stream { client_id, .. } => client_id,
         }
     }
 }
@@ -190,20 +179,6 @@ impl ThreadSyncBus {
                 client_id: self.client_id.clone(),
                 op_id: uuid::Uuid::new_v4().to_string(),
                 event,
-            })
-            .ok();
-    }
-
-    /// Publishes a committed user message to the other instances so they mirror
-    /// it immediately, without waiting for the Postgres NOTIFY reload. The
-    /// persisted copy remains the authority; this is the zero-latency push.
-    pub fn broadcast_user_message(&self, session_id: String, message: crate::thread::UserMessage) {
-        self.outbound_tx
-            .try_send(ThreadSyncMessage::UserMessage {
-                session_id,
-                client_id: self.client_id.clone(),
-                op_id: uuid::Uuid::new_v4().to_string(),
-                message,
             })
             .ok();
     }

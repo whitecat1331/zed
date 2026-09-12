@@ -4,8 +4,8 @@ use crate::{
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
     GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
     ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
-    SystemPromptTemplate, Template, Templates, TerminalTool, ThreadSyncBus, ToolPermissionDecision,
-    WebSearchTool, WriteFileTool, decide_permission_from_settings,
+    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
+    WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
@@ -2600,14 +2600,9 @@ impl Thread {
         log::debug!("Thread::send content: {:?}", content);
 
         let message = UserMessage { id, content };
-        self.messages.push(Arc::new(Message::User(message.clone())));
+        self.messages.push(Arc::new(Message::User(message)));
         self.updated_at = Utc::now();
         cx.notify();
-
-        if let Some(bus) = ThreadSyncBus::try_global(cx) {
-            bus.read(cx)
-                .broadcast_user_message(self.id.to_string(), message);
-        }
 
         self.send_existing(cx)
     }
@@ -2733,29 +2728,8 @@ impl Thread {
             .map(|block| UserMessageContent::from_content_block(block, path_style))
             .collect::<Arc<_>>();
         let message = UserMessage { id, content };
-        self.messages.push(Arc::new(Message::User(message.clone())));
-        self.updated_at = Utc::now();
-        cx.notify();
-
-        if let Some(bus) = ThreadSyncBus::try_global(cx) {
-            bus.read(cx)
-                .broadcast_user_message(self.id.to_string(), message);
-        }
-    }
-
-    /// Applies a user message published by another instance to this thread's
-    /// committed prefix. Deduplicated by message id; does not advance
-    /// `updated_at` so the authoring instance's newer persisted copy is never
-    /// clobbered by this instance's reconcile save.
-    pub fn apply_remote_user_message(&mut self, message: UserMessage, cx: &mut Context<Self>) {
-        let already_present = self.messages.iter().any(|existing| {
-            matches!(&**existing, Message::User(UserMessage { id, .. }) if id == &message.id)
-        });
-        if already_present {
-            return;
-        }
-
         self.messages.push(Arc::new(Message::User(message)));
+        self.updated_at = Utc::now();
         cx.notify();
     }
 
