@@ -538,7 +538,7 @@ impl ThreadsDatabase {
                 folder_paths_order = excluded.folder_paths_order,
                 data_type = excluded.data_type,
                 data = excluded.data
-            WHERE excluded.updated_at >= threads.updated_at
+            WHERE excluded.updated_at > threads.updated_at
         "})
         .bind(id.0.to_string())
         .bind(workspace_id)

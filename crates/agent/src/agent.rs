@@ -2425,6 +2425,11 @@ impl NativeAgentConnection {
             let session_id = acp_thread
                 .update(cx, |thread, _cx| thread.session_id().to_string())
                 .ok();
+            // Replay (loading a thread from disk) forwards history into the
+            // local UI but must NOT re-broadcast it as live stream deltas: the
+            // other instance already has that content, and broadcasting it would
+            // drive a save -> NOTIFY -> reload loop.
+            let is_live_streaming = connection.is_some();
 
             // Handle response stream and forward to session.acp_thread
             while let Some(result) = events.next().await {
@@ -2445,7 +2450,9 @@ impl NativeAgentConnection {
                                 })?;
                             }
                             ThreadEvent::AgentText(text) => {
-                                if let Some(session_id) = session_id.as_ref() {
+                                if is_live_streaming
+                                    && let Some(session_id) = session_id.as_ref()
+                                {
                                     ThreadSyncBus::broadcast_stream_global(
                                         cx,
                                         session_id.clone(),
@@ -2457,7 +2464,9 @@ impl NativeAgentConnection {
                                 })?;
                             }
                             ThreadEvent::AgentThinking(text) => {
-                                if let Some(session_id) = session_id.as_ref() {
+                                if is_live_streaming
+                                    && let Some(session_id) = session_id.as_ref()
+                                {
                                     ThreadSyncBus::broadcast_stream_global(
                                         cx,
                                         session_id.clone(),
@@ -2555,7 +2564,9 @@ impl NativeAgentConnection {
                                 }
                             }
                             ThreadEvent::ToolCall(tool_call) => {
-                                if let Some(session_id) = session_id.as_ref() {
+                                if is_live_streaming
+                                    && let Some(session_id) = session_id.as_ref()
+                                {
                                     ThreadSyncBus::broadcast_stream_global(
                                         cx,
                                         session_id.clone(),
@@ -2569,7 +2580,9 @@ impl NativeAgentConnection {
                             ThreadEvent::ToolCallUpdate(update) => {
                                 if let acp_thread::ToolCallUpdate::UpdateFields(fields_update) = &update
                                 {
-                                    if let Some(session_id) = session_id.as_ref() {
+                                    if is_live_streaming
+                                        && let Some(session_id) = session_id.as_ref()
+                                    {
                                         ThreadSyncBus::broadcast_stream_global(
                                             cx,
                                             session_id.clone(),
@@ -2615,7 +2628,9 @@ impl NativeAgentConnection {
                                 })?;
                             }
                             ThreadEvent::Stop(stop_reason) => {
-                                if let Some(session_id) = session_id.as_ref() {
+                                if is_live_streaming
+                                    && let Some(session_id) = session_id.as_ref()
+                                {
                                     ThreadSyncBus::broadcast_stream_global(
                                         cx,
                                         session_id.clone(),
@@ -2628,7 +2643,9 @@ impl NativeAgentConnection {
                         }
                     }
                     Err(e) => {
-                        if let Some(session_id) = session_id.as_ref() {
+                        if is_live_streaming
+                            && let Some(session_id) = session_id.as_ref()
+                        {
                             // A stream error still ends the turn, so tell peers
                             // to finalize their mirrored remote turn.
                             ThreadSyncBus::broadcast_stream_global(
