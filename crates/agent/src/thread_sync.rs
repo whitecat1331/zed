@@ -3,12 +3,13 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
 
+use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender};
 use collections::HashMap;
@@ -32,6 +33,8 @@ pub enum ThreadSyncStreamEvent {
         text: String,
         signature: Option<String>,
     },
+    ToolCall(acp::ToolCall),
+    ToolCallUpdate(acp::ToolCallUpdate),
     Stop(String),
 }
 
@@ -178,7 +181,9 @@ impl ThreadSyncBus {
                     continue;
                 }
                 if this
-                    .update(cx, |_bus, cx| cx.emit(ThreadSyncBusEvent::Message(envelope)))
+                    .update(cx, |_bus, cx| {
+                        cx.emit(ThreadSyncBusEvent::Message(envelope))
+                    })
                     .is_err()
                 {
                     return;

@@ -5,8 +5,7 @@ use crate::{
     GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
     ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
     SystemPromptTemplate, Template, Templates, TerminalTool, ThreadSyncBus, ToolPermissionDecision,
-    WebSearchTool,
-    WriteFileTool, decide_permission_from_settings,
+    WebSearchTool, WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
@@ -834,11 +833,7 @@ pub trait ThreadEnvironment {
     }
 
     /// Restarts an existing debug session through the host UI, if the environment provides one.
-    fn restart_session(
-        &self,
-        session_id: u64,
-        cx: &mut AsyncApp,
-    ) -> Task<Result<()>> {
+    fn restart_session(&self, session_id: u64, cx: &mut AsyncApp) -> Task<Result<()>> {
         let _ = session_id;
         let _ = cx;
         Task::ready(Err(anyhow::anyhow!(
@@ -2607,7 +2602,8 @@ impl Thread {
         cx.notify();
 
         if let Some(bus) = ThreadSyncBus::try_global(cx) {
-            bus.read(cx).broadcast_user_message(self.id.to_string(), message);
+            bus.read(cx)
+                .broadcast_user_message(self.id.to_string(), message);
         }
 
         self.send_existing(cx)
@@ -2738,7 +2734,8 @@ impl Thread {
         cx.notify();
 
         if let Some(bus) = ThreadSyncBus::try_global(cx) {
-            bus.read(cx).broadcast_user_message(self.id.to_string(), message);
+            bus.read(cx)
+                .broadcast_user_message(self.id.to_string(), message);
         }
     }
 
@@ -2773,7 +2770,9 @@ impl Thread {
         if let Some(AgentMessageContent::Text(existing)) = message.content.last_mut() {
             existing.push_str(text);
         } else {
-            message.content.push(AgentMessageContent::Text(text.to_string()));
+            message
+                .content
+                .push(AgentMessageContent::Text(text.to_string()));
         }
         cx.notify();
     }
@@ -2814,11 +2813,8 @@ impl Thread {
     /// Publishes a directed message from this thread to another thread.
     pub fn send_agent_message(&self, to_session: &str, body: String, cx: &App) {
         if let Some(bus) = ThreadSyncBus::try_global(cx) {
-            bus.read(cx).broadcast_agent_message(
-                self.id.to_string(),
-                to_session.to_string(),
-                body,
-            );
+            bus.read(cx)
+                .broadcast_agent_message(self.id.to_string(), to_session.to_string(), body);
         }
     }
 

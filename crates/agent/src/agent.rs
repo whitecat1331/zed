@@ -1486,8 +1486,8 @@ impl NativeAgent {
         cx.spawn(async move |_, cx| {
             let title = thread.read_with(cx, |thread, _| thread.title())?;
             if let Some(title) = title {
-                let task =
-                    acp_thread.update(cx, |acp_thread, cx| acp_thread.set_title(title.clone(), cx))?;
+                let task = acp_thread
+                    .update(cx, |acp_thread, cx| acp_thread.set_title(title.clone(), cx))?;
                 task.await?;
                 ThreadSyncBus::broadcast_title_changed_global(
                     cx,
@@ -2580,11 +2580,30 @@ impl NativeAgentConnection {
                                 }
                             }
                             ThreadEvent::ToolCall(tool_call) => {
+                                if let Some(session_id) = session_id.as_ref() {
+                                    ThreadSyncBus::broadcast_stream_global(
+                                        cx,
+                                        session_id.clone(),
+                                        ThreadSyncStreamEvent::ToolCall(tool_call.clone()),
+                                    );
+                                }
                                 acp_thread.update(cx, |thread, cx| {
                                     thread.upsert_tool_call(tool_call, cx)
                                 })??;
                             }
                             ThreadEvent::ToolCallUpdate(update) => {
+                                if let acp_thread::ToolCallUpdate::UpdateFields(fields_update) = &update
+                                {
+                                    if let Some(session_id) = session_id.as_ref() {
+                                        ThreadSyncBus::broadcast_stream_global(
+                                            cx,
+                                            session_id.clone(),
+                                            ThreadSyncStreamEvent::ToolCallUpdate(
+                                                fields_update.clone(),
+                                            ),
+                                        );
+                                    }
+                                }
                                 acp_thread.update(cx, |thread, cx| {
                                     thread.update_tool_call(update, cx)
                                 })??;
@@ -2638,6 +2657,11 @@ impl NativeAgentConnection {
                         }
                     }
                     Err(e) => {
+                        if let Some(session_id) = session_id.as_ref() {
+                            // A stream error still ends the turn, so tell peers
+                            // to clear their remote generating state.
+                            ThreadSyncBus::broadcast_turn_complete_global(cx, session_id.clone());
+                        }
                         log::error!("Error in model response stream: {:?}", e);
                         return Err(e);
                     }

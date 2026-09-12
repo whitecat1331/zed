@@ -3092,6 +3092,37 @@ impl AgentPanel {
         }
     }
 
+    /// Finds the open conversation view for `session_id`, checking the active
+    /// view first and then retained threads, so remote events apply to a thread
+    /// even after it's been parked.
+    fn conversation_view_by_session(
+        &self,
+        session_id: &str,
+        cx: &App,
+    ) -> Option<Entity<ConversationView>> {
+        if let Some(view) = self.active_conversation_view() {
+            if view
+                .read(cx)
+                .root_thread(cx)
+                .is_some_and(|thread| thread.read(cx).session_id().to_string() == session_id)
+            {
+                return Some(view.clone());
+            }
+        }
+
+        for view in self.retained_threads.values() {
+            if view
+                .read(cx)
+                .root_thread(cx)
+                .is_some_and(|thread| thread.read(cx).session_id().to_string() == session_id)
+            {
+                return Some(view.clone());
+            }
+        }
+
+        None
+    }
+
     /// Mirrors streamed token deltas from another instance into both the native
     /// model's remote pending message (always) and the open UI thread (only
     /// when this instance isn't running its own turn).
@@ -3102,20 +3133,17 @@ impl AgentPanel {
         event: &ThreadSyncStreamEvent,
         cx: &mut Context<Self>,
     ) {
-        let Some(conversation_view) = self.active_conversation_view().cloned() else {
+        let Some(conversation_view) = self.conversation_view_by_session(session_id, cx) else {
             return;
         };
         let Some(acp_thread) = conversation_view.read(cx).root_thread(cx) else {
             return;
         };
-        if acp_thread.read(cx).session_id().to_string() != session_id {
-            return;
-        }
         let is_locally_generating = acp_thread.read(cx).is_locally_generating();
 
         match event {
             ThreadSyncStreamEvent::Text(text) => {
-                if let Some(native_thread) = self.active_native_agent_thread(cx) {
+                if let Some(native_thread) = conversation_view.read(cx).as_native_thread(cx) {
                     native_thread.update(cx, |thread, cx| {
                         thread.apply_remote_stream_text(client_id, text, cx);
                     });
@@ -3130,7 +3158,7 @@ impl AgentPanel {
                 });
             }
             ThreadSyncStreamEvent::Thinking { text, .. } => {
-                if let Some(native_thread) = self.active_native_agent_thread(cx) {
+                if let Some(native_thread) = conversation_view.read(cx).as_native_thread(cx) {
                     native_thread.update(cx, |thread, cx| {
                         thread.apply_remote_stream_thinking(client_id, text, cx);
                     });
@@ -3139,6 +3167,22 @@ impl AgentPanel {
                     thread.remote_turn_started(cx);
                     if !is_locally_generating {
                         thread.push_assistant_content_block(text.clone().into(), true, cx);
+                    }
+                });
+            }
+            ThreadSyncStreamEvent::ToolCall(tool_call) => {
+                acp_thread.update(cx, |thread, cx| {
+                    thread.remote_turn_started(cx);
+                    if !is_locally_generating {
+                        thread.upsert_tool_call(tool_call.clone(), cx).log_err();
+                    }
+                });
+            }
+            ThreadSyncStreamEvent::ToolCallUpdate(update) => {
+                acp_thread.update(cx, |thread, cx| {
+                    thread.remote_turn_started(cx);
+                    if !is_locally_generating {
+                        thread.update_tool_call(update.clone(), cx).log_err();
                     }
                 });
             }
@@ -3158,19 +3202,16 @@ impl AgentPanel {
         message: &UserMessage,
         cx: &mut Context<Self>,
     ) {
-        let Some(conversation_view) = self.active_conversation_view().cloned() else {
+        let Some(conversation_view) = self.conversation_view_by_session(session_id, cx) else {
             return;
         };
         let Some(acp_thread) = conversation_view.read(cx).root_thread(cx) else {
             return;
         };
-        if acp_thread.read(cx).session_id().to_string() != session_id {
-            return;
-        }
 
         // Append to the model's committed prefix unconditionally so concurrent
         // turns converge against the same history.
-        if let Some(native_thread) = self.active_native_agent_thread(cx) {
+        if let Some(native_thread) = conversation_view.read(cx).as_native_thread(cx) {
             native_thread.update(cx, |thread, cx| {
                 thread.apply_remote_user_message(message.clone(), cx);
             });
@@ -3197,19 +3238,16 @@ impl AgentPanel {
         client_id: &str,
         cx: &mut Context<Self>,
     ) {
-        let Some(conversation_view) = self.active_conversation_view().cloned() else {
+        let Some(conversation_view) = self.conversation_view_by_session(session_id, cx) else {
             return;
         };
         let Some(acp_thread) = conversation_view.read(cx).root_thread(cx) else {
             return;
         };
-        if acp_thread.read(cx).session_id().to_string() != session_id {
-            return;
-        }
 
         acp_thread.update(cx, |thread, cx| thread.remote_turn_completed(cx));
 
-        if let Some(native_thread) = self.active_native_agent_thread(cx) {
+        if let Some(native_thread) = conversation_view.read(cx).as_native_thread(cx) {
             native_thread.update(cx, |thread, cx| {
                 thread.apply_remote_turn_complete(client_id, cx);
             });
@@ -3219,16 +3257,10 @@ impl AgentPanel {
     /// Delivers a directed message from another thread to the target thread's
     /// model as a synthetic user message.
     fn apply_remote_agent_message(&mut self, to_session: &str, body: &str, cx: &mut Context<Self>) {
-        let Some(conversation_view) = self.active_conversation_view().cloned() else {
+        let Some(conversation_view) = self.conversation_view_by_session(to_session, cx) else {
             return;
         };
-        let Some(acp_thread) = conversation_view.read(cx).root_thread(cx) else {
-            return;
-        };
-        if acp_thread.read(cx).session_id().to_string() != to_session {
-            return;
-        }
-        if let Some(native_thread) = self.active_native_agent_thread(cx) {
+        if let Some(native_thread) = conversation_view.read(cx).as_native_thread(cx) {
             let body = body.to_string();
             native_thread.update(cx, |thread, cx| {
                 thread.apply_remote_agent_message(body, cx);
