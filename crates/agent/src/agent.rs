@@ -10,6 +10,7 @@ mod tests;
 mod thread;
 mod thread_store;
 mod thread_sync;
+mod thread_workspace;
 mod tool_permissions;
 mod tools;
 
@@ -28,6 +29,7 @@ pub use templates::*;
 pub use thread::*;
 pub use thread_store::*;
 pub use thread_sync::*;
+pub use thread_workspace::*;
 pub use tool_permissions::*;
 pub use tools::*;
 

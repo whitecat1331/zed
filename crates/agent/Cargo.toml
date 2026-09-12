@@ -65,6 +65,7 @@ shell_command_parser.workspace = true
 sqlez.workspace = true
 smallvec.workspace = true
 smol.workspace = true
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid"] }
 streaming_diff.workspace = true
 strsim.workspace = true
 task.workspace = true
