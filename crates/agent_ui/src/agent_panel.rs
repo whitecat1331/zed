@@ -3058,9 +3058,12 @@ impl AgentPanel {
         let ThreadSyncBusEvent::Message(envelope) = event;
         match &envelope.message {
             ThreadSyncMessage::Stream {
-                session_id, event, ..
+                session_id,
+                client_id,
+                event,
+                ..
             } => {
-                self.apply_remote_stream_event(session_id, event, cx);
+                self.apply_remote_stream_event(session_id, client_id, event, cx);
             }
         }
     }
@@ -3096,12 +3099,14 @@ impl AgentPanel {
         None
     }
 
-    /// Mirrors streamed token deltas from another instance into the open UI
-    /// thread (only when this instance isn't running its own turn). Finalization
-    /// happens via the Postgres NOTIFY reload, not a bus message.
+    /// Mirrors streamed token deltas from another instance into both the native
+    /// model's remote pending message (always) and the open UI thread (only when
+    /// this instance isn't running its own turn). The `Stop` event finalizes the
+    /// mirrored turn: flush the pending content and clear the generating state.
     fn apply_remote_stream_event(
         &mut self,
         session_id: &str,
+        client_id: &str,
         event: &ThreadSyncStreamEvent,
         cx: &mut Context<Self>,
     ) {
@@ -3115,6 +3120,11 @@ impl AgentPanel {
 
         match event {
             ThreadSyncStreamEvent::Text(text) => {
+                if let Some(native_thread) = conversation_view.read(cx).as_native_thread(cx) {
+                    native_thread.update(cx, |thread, cx| {
+                        thread.apply_remote_stream_text(client_id, text, cx);
+                    });
+                }
                 acp_thread.update(cx, |thread, cx| {
                     // Mark the thread generating so the stop button shows and
                     // local submissions queue, exactly like a local turn.
@@ -3125,6 +3135,11 @@ impl AgentPanel {
                 });
             }
             ThreadSyncStreamEvent::Thinking { text, .. } => {
+                if let Some(native_thread) = conversation_view.read(cx).as_native_thread(cx) {
+                    native_thread.update(cx, |thread, cx| {
+                        thread.apply_remote_stream_thinking(client_id, text, cx);
+                    });
+                }
                 acp_thread.update(cx, |thread, cx| {
                     thread.remote_turn_started(cx);
                     if !is_locally_generating {
@@ -3149,9 +3164,17 @@ impl AgentPanel {
                 });
             }
             ThreadSyncStreamEvent::Stop(_) => {
-                // Finalization is driven by the Postgres NOTIFY reload, not by
-                // a bus message: the writer's final save triggers the reload
-                // that finalizes the completed turn.
+                // Finalize the mirrored turn in-process: clear the generating
+                // state (which auto-dispatches any queued follow-up message)
+                // and flush the accumulated stream into the native model so a
+                // follow-up turn generates against the correct history. The
+                // Postgres NOTIFY reload remains the reconcile fallback.
+                acp_thread.update(cx, |thread, cx| thread.remote_turn_completed(cx));
+                if let Some(native_thread) = conversation_view.read(cx).as_native_thread(cx) {
+                    native_thread.update(cx, |thread, cx| {
+                        thread.apply_remote_turn_complete(client_id, cx);
+                    });
+                }
             }
         }
     }

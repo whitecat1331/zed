@@ -2620,6 +2620,15 @@ impl NativeAgentConnection {
                         }
                     }
                     Err(e) => {
+                        if let Some(session_id) = session_id.as_ref() {
+                            // A stream error still ends the turn, so tell peers
+                            // to finalize their mirrored remote turn.
+                            ThreadSyncBus::broadcast_stream_global(
+                                cx,
+                                session_id.clone(),
+                                ThreadSyncStreamEvent::Stop("error".to_string()),
+                            );
+                        }
                         log::error!("Error in model response stream: {:?}", e);
                         return Err(e);
                     }
