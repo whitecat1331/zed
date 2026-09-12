@@ -10,6 +10,7 @@ use futures::{FutureExt, future::Shared};
 use gpui::{BackgroundExecutor, Global, Task};
 use indoc::indoc;
 use language_model::Speed;
+#[cfg(test)]
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -408,7 +409,8 @@ impl ThreadsDatabase {
                 let executor = executor.clone();
                 let tokio_handle = tokio_handle.clone();
                 async move {
-                    let database = tokio_handle
+                    let spawn_handle = tokio_handle.clone();
+                    let database = spawn_handle
                         .spawn(async move { ThreadsDatabase::new(executor, tokio_handle).await })
                         .await
                         .map_err(|err| anyhow::anyhow!("thread database task failed: {err}"))??;
