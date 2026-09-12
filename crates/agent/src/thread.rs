@@ -1557,6 +1557,22 @@ impl Thread {
         self.updated_at
     }
 
+    /// Replaces this thread's persisted content with a fresh snapshot from the
+    /// shared database, without tearing down its model, tools, or turn state.
+    /// Used by the cross-instance reload path to converge an idle thread to the
+    /// authoritative on-disk copy.
+    pub fn reload_content(&mut self, db_thread: DbThread, cx: &mut Context<Self>) {
+        self.messages = db_thread.messages;
+        self.updated_at = db_thread.updated_at;
+        self.summary = db_thread.detailed_summary;
+        self.title = if db_thread.title.is_empty() {
+            None
+        } else {
+            Some(db_thread.title)
+        };
+        cx.notify();
+    }
+
     // Only used by Seatbelt-style sandboxes (macOS); Linux relies on bwrap's
     // tmpfs `/tmp` and Windows on the WSL bwrap tmpfs, so neither needs a
     // per-thread temp directory.

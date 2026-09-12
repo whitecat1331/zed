@@ -4570,8 +4570,8 @@ impl AgentPanel {
 
     /// If the active native thread's on-disk copy is newer than the
     /// in-memory copy (e.g. another Zed instance wrote to the shared threads
-    /// database), discard the stale in-memory session and reload it from
-    /// disk. Driven by the cross-instance change observer.
+    /// database), converge it in place to the on-disk copy without tearing the
+    /// view down. Driven by the cross-instance change observer.
     pub fn reload_active_thread_if_stale(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         log::info!("[THREAD_SYNC] reload_active_thread_if_stale called");
         let Some(conversation_view) = self.active_conversation_view().cloned() else {
@@ -4620,37 +4620,23 @@ impl AgentPanel {
             return;
         };
 
-        let agent = Agent::from(metadata.agent_id.clone());
-        let disk_future = connection.thread_updated_at(session_id.clone(), cx);
+        let disk_future = connection.load_db_thread(session_id.clone(), cx);
 
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(Some(disk_updated_at)) = disk_future.await else {
+            let Ok(Some(db_thread)) = disk_future.await else {
                 return;
             };
-            if disk_updated_at <= memory_updated_at {
+            if db_thread.updated_at <= memory_updated_at {
                 return;
             }
-            log::info!("[THREAD_SYNC] reloading stale thread (disk newer than memory)");
+            log::info!("[THREAD_SYNC] surgically reloading stale thread (disk newer than memory)");
 
-            this.update_in(cx, |this, window, cx| {
-                // Discard the stale in-memory session before rebuilding so
-                // `load_agent_thread` reads the newer on-disk copy rather than
-                // reusing the cached session. Skipping the save is important:
-                // saving here would clobber the newer on-disk content.
-                connection.discard_session(&session_id, cx);
-                this.base_view = BaseView::Uninitialized;
-                this.retained_threads.remove(&thread_id);
-                this.refresh_base_view_subscriptions(window, cx);
-                this.load_agent_thread(
-                    agent,
-                    thread_id,
-                    Some(metadata.folder_paths().clone()),
-                    metadata.title.clone(),
-                    false,
-                    AgentThreadSource::AgentPanel,
-                    window,
-                    cx,
-                );
+            this.update_in(cx, |_this, _window, cx| {
+                // Update the native model in place and replay the converged
+                // content into the existing UI thread (no teardown/rebuild).
+                if let Err(error) = connection.reload_thread_content(session_id, db_thread, cx) {
+                    log::error!("[THREAD_SYNC] surgical reload failed: {error:#}");
+                }
             })
             .ok();
         })

@@ -2336,6 +2336,44 @@ impl NativeAgentConnection {
         })
     }
 
+    /// Loads the raw persisted `DbThread` for a session without constructing an
+    /// in-memory `Thread`. Used by the surgical reload path.
+    pub fn load_db_thread(
+        &self,
+        id: acp::SessionId,
+        cx: &mut App,
+    ) -> Task<Result<Option<DbThread>>> {
+        let database_future = ThreadsDatabase::connect(cx);
+        cx.background_spawn(async move {
+            let database = database_future.await.map_err(|err| anyhow!(err))?;
+            database.load_thread(id).await
+        })
+    }
+
+    /// Converges an idle in-memory thread to the authoritative on-disk copy:
+    /// updates the native model in place, resets the UI thread, and replays the
+    /// converged messages. No teardown/rebuild, so there is no "loading" flash.
+    pub fn reload_thread_content(
+        &self,
+        session_id: acp::SessionId,
+        db_thread: DbThread,
+        cx: &mut App,
+    ) -> Result<()> {
+        self.0.update(cx, |agent, cx| {
+            let Some(session) = agent.sessions.get(&session_id) else {
+                return Err(anyhow!("session {session_id} not found"));
+            };
+            session.thread.update(cx, |thread, cx| {
+                thread.reload_content(db_thread, cx);
+            });
+            let events = session.thread.update(cx, |thread, cx| thread.replay(cx));
+            let acp_thread = session.acp_thread.clone();
+            acp_thread.update(cx, |thread, cx| thread.reset(cx)).ok();
+            Self::handle_thread_events(events, acp_thread, None, cx).detach_and_log_err(cx);
+            Ok(())
+        })
+    }
+
     /// Discards a session from memory without saving it. This must only be
     /// used when the caller is about to reload the session from disk because
     /// the on-disk copy is newer than the in-memory copy.

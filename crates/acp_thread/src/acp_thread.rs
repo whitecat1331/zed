@@ -2450,6 +2450,14 @@ impl AcpThread {
         &self.entries
     }
 
+    /// Clears the rendered entries so a converged thread snapshot can be
+    /// replayed back into this view. Used by the cross-instance reload path.
+    pub fn reset(&mut self, cx: &mut Context<Self>) {
+        Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
+        self.entries.clear();
+        cx.notify();
+    }
+
     pub fn is_compacting(&self) -> bool {
         self.entries.last().is_some_and(|entry| {
             matches!(
