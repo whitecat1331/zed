@@ -533,3 +533,68 @@ async fn read_frame<D: DeserializeOwned>(stream: &mut TcpStream) -> Result<D> {
     stream.read_exact(&mut buf).await?;
     Ok(serde_json::from_slice(&buf)?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream_message(client_id: &str) -> ThreadSyncMessage {
+        ThreadSyncMessage::Stream {
+            session_id: "session-1".into(),
+            client_id: client_id.into(),
+            op_id: "op-1".into(),
+            event: ThreadSyncStreamEvent::Text("hello".into()),
+        }
+    }
+
+    #[test]
+    fn client_id_is_extracted_for_every_variant() {
+        assert_eq!(stream_message("a").client_id(), "a");
+        assert_eq!(
+            ThreadSyncMessage::TurnComplete {
+                session_id: "s".into(),
+                client_id: "b".into(),
+                op_id: "o".into(),
+            }
+            .client_id(),
+            "b"
+        );
+        assert_eq!(
+            ThreadSyncMessage::AgentMessage {
+                from_session: "from".into(),
+                to_session: "to".into(),
+                client_id: "c".into(),
+                op_id: "o".into(),
+                body: "hi".into(),
+            }
+            .client_id(),
+            "c"
+        );
+        assert_eq!(
+            ThreadSyncMessage::TitleChanged {
+                session_id: "s".into(),
+                client_id: "d".into(),
+                op_id: "o".into(),
+                title: "T".into(),
+            }
+            .client_id(),
+            "d"
+        );
+    }
+
+    #[test]
+    fn stream_message_round_trips_through_json() {
+        let message = stream_message("client-9");
+        let json = serde_json::to_string(&message).unwrap();
+        let decoded: ThreadSyncMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            ThreadSyncMessage::Stream {
+                client_id,
+                event,
+                ..
+            } if client_id == "client-9"
+                && matches!(&event, ThreadSyncStreamEvent::Text(t) if t == "hello")
+        ));
+    }
+}
