@@ -8,7 +8,10 @@ use agent_client_protocol::schema::v1 as acp;
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet};
-use db::kvp::KeyValueStore;
+use db::{
+    kvp::KeyValueStore,
+    sqlez::{bindable::Column, statement::Statement},
+};
 use fs::Fs;
 use futures::{FutureExt, future::Shared};
 use gpui::{AppContext as _, Entity, Global, Subscription, Task, TaskExt};
@@ -39,6 +42,108 @@ impl ThreadId {
 
 const THREAD_REMOTE_CONNECTION_MIGRATION_KEY: &str = "thread-metadata-remote-connection-backfill";
 const THREAD_ID_MIGRATION_KEY: &str = "thread-metadata-thread-id-backfill";
+
+/// List all sidebar thread metadata from an arbitrary SQLite connection.
+///
+/// This is used to read thread metadata from another release channel's
+/// database without opening a full `ThreadSafeConnection`.
+pub(crate) fn list_thread_metadata_from_connection(
+    connection: &db::sqlez::connection::Connection,
+) -> anyhow::Result<Vec<ThreadMetadata>> {
+    connection.select::<ThreadMetadata>(ThreadMetadataDb::LIST_QUERY)?()
+}
+
+impl Column for ThreadMetadata {
+    fn column(statement: &mut Statement, start_index: i32) -> anyhow::Result<(Self, i32)> {
+        let (thread_id_uuid, next): (uuid::Uuid, i32) = Column::column(statement, start_index)?;
+        let (id, next): (Option<Arc<str>>, i32) = Column::column(statement, next)?;
+        let (agent_id, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (title, next): (String, i32) = Column::column(statement, next)?;
+        let (updated_at_str, next): (String, i32) = Column::column(statement, next)?;
+        let (created_at_str, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (interacted_at_str, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (folder_paths_str, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (folder_paths_order_str, next): (Option<String>, i32) =
+            Column::column(statement, next)?;
+        let (archived, next): (bool, i32) = Column::column(statement, next)?;
+        let (main_worktree_paths_str, next): (Option<String>, i32) =
+            Column::column(statement, next)?;
+        let (main_worktree_paths_order_str, next): (Option<String>, i32) =
+            Column::column(statement, next)?;
+        let (remote_connection_json, next): (Option<String>, i32) =
+            Column::column(statement, next)?;
+        let (title_override, next): (Option<String>, i32) = Column::column(statement, next)?;
+
+        let agent_id = agent_id
+            .map(|id| AgentId::new(id))
+            .unwrap_or(ZED_AGENT_ID.clone());
+
+        let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)?.with_timezone(&Utc);
+        let created_at = created_at_str
+            .as_deref()
+            .map(DateTime::parse_from_rfc3339)
+            .transpose()?
+            .map(|dt| dt.with_timezone(&Utc));
+
+        let interacted_at = interacted_at_str
+            .as_deref()
+            .map(DateTime::parse_from_rfc3339)
+            .transpose()?
+            .map(|dt| dt.with_timezone(&Utc));
+
+        let folder_paths = folder_paths_str
+            .map(|paths| {
+                PathList::deserialize(&util::path_list::SerializedPathList {
+                    paths,
+                    order: folder_paths_order_str.unwrap_or_default(),
+                })
+            })
+            .unwrap_or_default();
+
+        let main_worktree_paths = main_worktree_paths_str
+            .map(|paths| {
+                PathList::deserialize(&util::path_list::SerializedPathList {
+                    paths,
+                    order: main_worktree_paths_order_str.unwrap_or_default(),
+                })
+            })
+            .unwrap_or_default();
+
+        let remote_connection = remote_connection_json
+            .as_deref()
+            .map(serde_json::from_str::<RemoteConnectionOptions>)
+            .transpose()
+            .context("deserialize thread metadata remote connection")?;
+
+        let worktree_paths = WorktreePaths::from_path_lists(main_worktree_paths, folder_paths)
+            .unwrap_or_else(|_| WorktreePaths::default());
+
+        let thread_id = ThreadId(thread_id_uuid);
+
+        Ok((
+            ThreadMetadata {
+                thread_id,
+                session_id: id.map(acp::SessionId::new),
+                agent_id,
+                title: if title.is_empty() || title == DEFAULT_THREAD_TITLE {
+                    None
+                } else {
+                    Some(title.into())
+                },
+                title_override: title_override
+                    .filter(|t| !t.is_empty())
+                    .map(SharedString::from),
+                updated_at,
+                created_at,
+                interacted_at,
+                worktree_paths,
+                remote_connection,
+                archived,
+            },
+            next,
+        ))
+    }
+}
 
 pub fn init(cx: &mut App) {
     ThreadMetadataStore::init_global(cx);
