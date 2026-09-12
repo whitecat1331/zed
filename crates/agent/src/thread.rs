@@ -4,8 +4,8 @@ use crate::{
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
     GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
     ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
-    SystemPromptTemplate, Template, Templates, TerminalTool, ThreadSyncBus, ToolPermissionDecision,
-    WebSearchTool, WriteFileTool, decide_permission_from_settings,
+    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
+    WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
@@ -1327,10 +1327,6 @@ pub struct Thread {
     /// message mid-task; by default queued messages wait for the turn to finish.
     end_turn_at_next_boundary: bool,
     pending_message: Option<AgentMessage>,
-    /// In-flight assistant content streamed by other instances, keyed by the
-    /// authoring process's `client_id`. Flushed into `messages` on the
-    /// matching `TurnComplete` operation.
-    remote_pending_messages: HashMap<String, AgentMessage>,
     pub(crate) tools: BTreeMap<SharedString, Arc<dyn AnyAgentTool>>,
     request_token_usage: HashMap<ClientUserMessageId, language_model::TokenUsage>,
     cumulative_token_usage: TokenUsage,
@@ -1475,7 +1471,6 @@ impl Thread {
             running_turn: None,
             end_turn_at_next_boundary: false,
             pending_message: None,
-            remote_pending_messages: HashMap::default(),
             tools: BTreeMap::default(),
             request_token_usage: HashMap::default(),
             cumulative_token_usage: TokenUsage::default(),
@@ -1863,7 +1858,6 @@ impl Thread {
             running_turn: None,
             end_turn_at_next_boundary: false,
             pending_message: None,
-            remote_pending_messages: HashMap::default(),
             tools: BTreeMap::default(),
             request_token_usage: db_thread.request_token_usage.clone(),
             cumulative_token_usage: db_thread.cumulative_token_usage,
@@ -2598,13 +2592,8 @@ impl Thread {
         log::debug!("Thread::send content: {:?}", content);
 
         let message = UserMessage { id, content };
-        self.messages.push(Arc::new(Message::User(message.clone())));
+        self.messages.push(Arc::new(Message::User(message)));
         cx.notify();
-
-        if let Some(bus) = ThreadSyncBus::try_global(cx) {
-            bus.read(cx)
-                .broadcast_user_message(self.id.to_string(), message);
-        }
 
         self.send_existing(cx)
     }
@@ -2730,101 +2719,6 @@ impl Thread {
             .map(|block| UserMessageContent::from_content_block(block, path_style))
             .collect::<Arc<_>>();
         let message = UserMessage { id, content };
-        self.messages.push(Arc::new(Message::User(message.clone())));
-        cx.notify();
-
-        if let Some(bus) = ThreadSyncBus::try_global(cx) {
-            bus.read(cx)
-                .broadcast_user_message(self.id.to_string(), message);
-        }
-    }
-
-    /// Applies a user message published by another instance to this thread's
-    /// committed prefix. Deduplicated by message id; does not advance
-    /// `updated_at` or trigger a save (the authoring instance already persists
-    /// it).
-    pub fn apply_remote_user_message(&mut self, message: UserMessage, cx: &mut Context<Self>) {
-        let already_present = self.messages.iter().any(|existing| {
-            matches!(&**existing, Message::User(UserMessage { id, .. }) if id == &message.id)
-        });
-        if already_present {
-            return;
-        }
-
-        self.messages.push(Arc::new(Message::User(message)));
-        cx.notify();
-    }
-
-    /// Appends a streamed text delta from another instance to the remote
-    /// pending message owned by `client_id`.
-    pub fn apply_remote_stream_text(
-        &mut self,
-        client_id: &str,
-        text: &str,
-        cx: &mut Context<Self>,
-    ) {
-        let message = self
-            .remote_pending_messages
-            .entry(client_id.to_string())
-            .or_default();
-        if let Some(AgentMessageContent::Text(existing)) = message.content.last_mut() {
-            existing.push_str(text);
-        } else {
-            message
-                .content
-                .push(AgentMessageContent::Text(text.to_string()));
-        }
-        cx.notify();
-    }
-
-    /// Appends a streamed thinking delta from another instance to the remote
-    /// pending message owned by `client_id`.
-    pub fn apply_remote_stream_thinking(
-        &mut self,
-        client_id: &str,
-        text: &str,
-        cx: &mut Context<Self>,
-    ) {
-        let message = self
-            .remote_pending_messages
-            .entry(client_id.to_string())
-            .or_default();
-        message.content.push(AgentMessageContent::Thinking {
-            text: text.to_string(),
-            signature: None,
-        });
-        cx.notify();
-    }
-
-    /// Flushes the remote pending message owned by `client_id` into the
-    /// committed `messages` list, finalizing that instance's turn.
-    pub fn apply_remote_turn_complete(&mut self, client_id: &str, cx: &mut Context<Self>) {
-        let Some(message) = self.remote_pending_messages.remove(client_id) else {
-            return;
-        };
-        if message.content.is_empty() {
-            return;
-        }
-
-        self.messages.push(Arc::new(Message::Agent(message)));
-        cx.notify();
-    }
-
-    /// Publishes a directed message from this thread to another thread.
-    pub fn send_agent_message(&self, to_session: &str, body: String, cx: &App) {
-        if let Some(bus) = ThreadSyncBus::try_global(cx) {
-            bus.read(cx)
-                .broadcast_agent_message(self.id.to_string(), to_session.to_string(), body);
-        }
-    }
-
-    /// Delivers a directed message from another thread as a synthetic user
-    /// message appended to this thread's committed prefix.
-    pub fn apply_remote_agent_message(&mut self, body: String, cx: &mut Context<Self>) {
-        let message = UserMessage {
-            id: ClientUserMessageId::new(),
-            content: vec![UserMessageContent::Text(body)].into(),
-        };
         self.messages.push(Arc::new(Message::User(message)));
         cx.notify();
     }

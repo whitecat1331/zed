@@ -13,7 +13,7 @@ use std::{
 use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, ThreadStatus, line_range_suffix};
 use agent::{
     ContextServerRegistry, SharedThread, ThreadStore, ThreadSyncBus, ThreadSyncBusEvent,
-    ThreadSyncMessage, ThreadSyncStreamEvent, UserMessage,
+    ThreadSyncMessage, ThreadSyncStreamEvent,
 };
 use agent_client_protocol::schema::v1 as acp;
 use agent_servers::AgentServer;
@@ -3058,36 +3058,9 @@ impl AgentPanel {
         let ThreadSyncBusEvent::Message(envelope) = event;
         match &envelope.message {
             ThreadSyncMessage::Stream {
-                session_id,
-                client_id,
-                event,
-                ..
+                session_id, event, ..
             } => {
-                self.apply_remote_stream_event(session_id, client_id, event, cx);
-            }
-            ThreadSyncMessage::UserMessage {
-                session_id,
-                message,
-                ..
-            } => {
-                self.apply_remote_user_message(session_id, message, cx);
-            }
-            ThreadSyncMessage::TurnComplete {
-                session_id,
-                client_id,
-                ..
-            } => {
-                self.apply_remote_turn_complete(session_id, client_id, cx);
-            }
-            ThreadSyncMessage::AgentMessage {
-                to_session, body, ..
-            } => {
-                self.apply_remote_agent_message(to_session, body, cx);
-            }
-            ThreadSyncMessage::TitleChanged { .. } => {
-                ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-                    let _ = store.reload(cx);
-                });
+                self.apply_remote_stream_event(session_id, event, cx);
             }
         }
     }
@@ -3123,13 +3096,12 @@ impl AgentPanel {
         None
     }
 
-    /// Mirrors streamed token deltas from another instance into both the native
-    /// model's remote pending message (always) and the open UI thread (only
-    /// when this instance isn't running its own turn).
+    /// Mirrors streamed token deltas from another instance into the open UI
+    /// thread (only when this instance isn't running its own turn). Finalization
+    /// happens via the Postgres NOTIFY reload, not a bus message.
     fn apply_remote_stream_event(
         &mut self,
         session_id: &str,
-        client_id: &str,
         event: &ThreadSyncStreamEvent,
         cx: &mut Context<Self>,
     ) {
@@ -3143,11 +3115,6 @@ impl AgentPanel {
 
         match event {
             ThreadSyncStreamEvent::Text(text) => {
-                if let Some(native_thread) = conversation_view.read(cx).as_native_thread(cx) {
-                    native_thread.update(cx, |thread, cx| {
-                        thread.apply_remote_stream_text(client_id, text, cx);
-                    });
-                }
                 acp_thread.update(cx, |thread, cx| {
                     // Mark the thread generating so the stop button shows and
                     // local submissions queue, exactly like a local turn.
@@ -3158,11 +3125,6 @@ impl AgentPanel {
                 });
             }
             ThreadSyncStreamEvent::Thinking { text, .. } => {
-                if let Some(native_thread) = conversation_view.read(cx).as_native_thread(cx) {
-                    native_thread.update(cx, |thread, cx| {
-                        thread.apply_remote_stream_thinking(client_id, text, cx);
-                    });
-                }
                 acp_thread.update(cx, |thread, cx| {
                     thread.remote_turn_started(cx);
                     if !is_locally_generating {
@@ -3187,84 +3149,10 @@ impl AgentPanel {
                 });
             }
             ThreadSyncStreamEvent::Stop(_) => {
-                // Finalization is driven by the `TurnComplete` op, which is
-                // published alongside this `Stop` stream event.
+                // Finalization is driven by the Postgres NOTIFY reload, not by
+                // a bus message: the writer's final save triggers the reload
+                // that finalizes the completed turn.
             }
-        }
-    }
-
-    /// Applies a user message published by another instance to both the open
-    /// UI thread (as a new entry) and the native `agent::Thread` model's
-    /// committed prefix.
-    fn apply_remote_user_message(
-        &mut self,
-        session_id: &str,
-        message: &UserMessage,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(conversation_view) = self.conversation_view_by_session(session_id, cx) else {
-            return;
-        };
-        let Some(acp_thread) = conversation_view.read(cx).root_thread(cx) else {
-            return;
-        };
-
-        // Append to the model's committed prefix unconditionally so concurrent
-        // turns converge against the same history.
-        if let Some(native_thread) = conversation_view.read(cx).as_native_thread(cx) {
-            native_thread.update(cx, |thread, cx| {
-                thread.apply_remote_user_message(message.clone(), cx);
-            });
-        }
-
-        // Mirror into the UI as a new user-message entry (never merged into an
-        // adjacent message, matching how the local send path renders it).
-        let chunks: Vec<acp::ContentBlock> = message
-            .content
-            .iter()
-            .map(|content| content.clone().into())
-            .collect();
-        acp_thread.update(cx, |thread, cx| {
-            thread.push_user_message(Some(message.id.clone()), chunks, cx);
-        });
-    }
-
-    /// Finalizes a turn streamed by another instance by clearing the remote
-    /// generating state (so the UI stops and auto-dispatches queued messages)
-    /// and flushing its pending content into the native model.
-    fn apply_remote_turn_complete(
-        &mut self,
-        session_id: &str,
-        client_id: &str,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(conversation_view) = self.conversation_view_by_session(session_id, cx) else {
-            return;
-        };
-        let Some(acp_thread) = conversation_view.read(cx).root_thread(cx) else {
-            return;
-        };
-
-        acp_thread.update(cx, |thread, cx| thread.remote_turn_completed(cx));
-
-        if let Some(native_thread) = conversation_view.read(cx).as_native_thread(cx) {
-            native_thread.update(cx, |thread, cx| {
-                thread.apply_remote_turn_complete(client_id, cx);
-            });
-        }
-    }
-
-    /// Delivers a directed message from another thread to the target thread's
-    /// model as a synthetic user message.
-    fn apply_remote_agent_message(&mut self, to_session: &str, body: &str, cx: &mut Context<Self>) {
-        let Some(conversation_view) = self.conversation_view_by_session(to_session, cx) else {
-            return;
-        };
-        if let Some(native_thread) = conversation_view.read(cx).as_native_thread(cx) {
-            let body = body.to_string();
-            native_thread.update(cx, |thread, cx| {
-                thread.apply_remote_agent_message(body, cx);
-            });
         }
     }
 

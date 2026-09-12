@@ -1461,11 +1461,6 @@ impl NativeAgent {
                 let task = acp_thread
                     .update(cx, |acp_thread, cx| acp_thread.set_title(title.clone(), cx))?;
                 task.await?;
-                ThreadSyncBus::broadcast_title_changed_global(
-                    cx,
-                    session_id.to_string(),
-                    title.to_string(),
-                );
             }
             anyhow::Ok(())
         })
@@ -2618,10 +2613,6 @@ impl NativeAgentConnection {
                                         session_id.clone(),
                                         ThreadSyncStreamEvent::Stop(format!("{stop_reason:?}")),
                                     );
-                                    ThreadSyncBus::broadcast_turn_complete_global(
-                                        cx,
-                                        session_id.clone(),
-                                    );
                                 }
                                 log::debug!("Assistant message complete: {:?}", stop_reason);
                                 return Ok(acp::PromptResponse::new(stop_reason));
@@ -2629,11 +2620,6 @@ impl NativeAgentConnection {
                         }
                     }
                     Err(e) => {
-                        if let Some(session_id) = session_id.as_ref() {
-                            // A stream error still ends the turn, so tell peers
-                            // to clear their remote generating state.
-                            ThreadSyncBus::broadcast_turn_complete_global(cx, session_id.clone());
-                        }
                         log::error!("Error in model response stream: {:?}", e);
                         return Err(e);
                     }

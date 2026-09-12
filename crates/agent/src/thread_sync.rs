@@ -38,60 +38,25 @@ pub enum ThreadSyncStreamEvent {
     Stop(String),
 }
 
-/// An operation on the local cross-instance thread sync log. The hub assigns a
-/// sequence number to every operation and broadcasts it to all peers, so every
-/// instance applies the same operations in the same total order.
+/// A streamed event carried across the local cross-instance sync bus. Persisted
+/// thread state (content, titles, metadata) is reconciled through Postgres +
+/// `LISTEN/NOTIFY`; the bus carries only live, ephemeral stream deltas.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ThreadSyncMessage {
     Stream {
         session_id: String,
-        /// Stable identity of the process that authored this operation.
+        /// Stable identity of the process that authored this event.
         client_id: String,
-        /// Per-operation unique id, used to de-duplicate self-echoes.
+        /// Per-event unique id, used to de-duplicate self-echoes.
         op_id: String,
         event: ThreadSyncStreamEvent,
-    },
-    /// A user message appended to the committed prefix of a thread. Other
-    /// instances apply this to their `Thread.messages` so they generate (and
-    /// save) against the same history.
-    UserMessage {
-        session_id: String,
-        client_id: String,
-        op_id: String,
-        message: crate::thread::UserMessage,
-    },
-    /// Signals that a turn has been flushed into the thread's persisted model.
-    TurnComplete {
-        session_id: String,
-        client_id: String,
-        op_id: String,
-    },
-    /// A directed message from one thread to another (cross-instance agent
-    /// coordination).
-    AgentMessage {
-        from_session: String,
-        to_session: String,
-        client_id: String,
-        op_id: String,
-        body: String,
-    },
-    /// Signals that a thread's title changed.
-    TitleChanged {
-        session_id: String,
-        client_id: String,
-        op_id: String,
-        title: String,
     },
 }
 
 impl ThreadSyncMessage {
     pub fn client_id(&self) -> &str {
         match self {
-            ThreadSyncMessage::Stream { client_id, .. }
-            | ThreadSyncMessage::UserMessage { client_id, .. }
-            | ThreadSyncMessage::TurnComplete { client_id, .. }
-            | ThreadSyncMessage::AgentMessage { client_id, .. }
-            | ThreadSyncMessage::TitleChanged { client_id, .. } => client_id,
+            ThreadSyncMessage::Stream { client_id, .. } => client_id,
         }
     }
 }
@@ -218,54 +183,6 @@ impl ThreadSyncBus {
             .ok();
     }
 
-    /// Publishes a committed user message to the other instances.
-    pub fn broadcast_user_message(&self, session_id: String, message: crate::thread::UserMessage) {
-        self.outbound_tx
-            .try_send(ThreadSyncMessage::UserMessage {
-                session_id,
-                client_id: self.client_id.clone(),
-                op_id: uuid::Uuid::new_v4().to_string(),
-                message,
-            })
-            .ok();
-    }
-
-    /// Publishes a turn-completion signal to the other instances.
-    pub fn broadcast_turn_complete(&self, session_id: String) {
-        self.outbound_tx
-            .try_send(ThreadSyncMessage::TurnComplete {
-                session_id,
-                client_id: self.client_id.clone(),
-                op_id: uuid::Uuid::new_v4().to_string(),
-            })
-            .ok();
-    }
-
-    /// Publishes a directed message from one thread to another.
-    pub fn broadcast_agent_message(&self, from_session: String, to_session: String, body: String) {
-        self.outbound_tx
-            .try_send(ThreadSyncMessage::AgentMessage {
-                from_session,
-                to_session,
-                client_id: self.client_id.clone(),
-                op_id: uuid::Uuid::new_v4().to_string(),
-                body,
-            })
-            .ok();
-    }
-
-    /// Publishes a title change for a thread.
-    pub fn broadcast_title_changed(&self, session_id: String, title: String) {
-        self.outbound_tx
-            .try_send(ThreadSyncMessage::TitleChanged {
-                session_id,
-                client_id: self.client_id.clone(),
-                op_id: uuid::Uuid::new_v4().to_string(),
-                title,
-            })
-            .ok();
-    }
-
     /// Publishes a stream event from an async context, if the bus has been
     /// initialized. No-op when the bus is absent (tests, or before init).
     pub fn broadcast_stream_global(
@@ -278,28 +195,6 @@ impl ThreadSyncBus {
         }
         cx.read_global::<GlobalThreadSyncBus, ()>(|bus, app| {
             bus.0.read(app).broadcast_stream(session_id, event)
-        });
-    }
-
-    /// Publishes a turn-completion signal from an async context, if the bus has
-    /// been initialized. No-op when the bus is absent (tests, or before init).
-    pub fn broadcast_turn_complete_global(cx: &AsyncApp, session_id: String) {
-        if !cx.has_global::<GlobalThreadSyncBus>() {
-            return;
-        }
-        cx.read_global::<GlobalThreadSyncBus, ()>(|bus, app| {
-            bus.0.read(app).broadcast_turn_complete(session_id)
-        });
-    }
-
-    /// Publishes a title change from an async context, if the bus has been
-    /// initialized. No-op when the bus is absent (tests, or before init).
-    pub fn broadcast_title_changed_global(cx: &AsyncApp, session_id: String, title: String) {
-        if !cx.has_global::<GlobalThreadSyncBus>() {
-            return;
-        }
-        cx.read_global::<GlobalThreadSyncBus, ()>(|bus, app| {
-            bus.0.read(app).broadcast_title_changed(session_id, title)
         });
     }
 
@@ -553,38 +448,8 @@ mod tests {
     }
 
     #[test]
-    fn client_id_is_extracted_for_every_variant() {
+    fn stream_client_id_is_extracted() {
         assert_eq!(stream_message("a").client_id(), "a");
-        assert_eq!(
-            ThreadSyncMessage::TurnComplete {
-                session_id: "s".into(),
-                client_id: "b".into(),
-                op_id: "o".into(),
-            }
-            .client_id(),
-            "b"
-        );
-        assert_eq!(
-            ThreadSyncMessage::AgentMessage {
-                from_session: "from".into(),
-                to_session: "to".into(),
-                client_id: "c".into(),
-                op_id: "o".into(),
-                body: "hi".into(),
-            }
-            .client_id(),
-            "c"
-        );
-        assert_eq!(
-            ThreadSyncMessage::TitleChanged {
-                session_id: "s".into(),
-                client_id: "d".into(),
-                op_id: "o".into(),
-                title: "T".into(),
-            }
-            .client_id(),
-            "d"
-        );
     }
 
     #[test]
