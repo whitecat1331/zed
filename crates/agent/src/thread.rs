@@ -1,11 +1,11 @@
 use crate::{
     ApplyCodeActionTool, AskUserTool, CodeActionStore, ContextServerRegistry, CopyPathTool,
-    CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DebuggerTool, DeletePathTool,
-    DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
-    GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
-    ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
-    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
-    WriteFileTool, decide_permission_from_settings,
+    CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbQueuedMessage, DbThread,
+    DebuggerTool, DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool,
+    FindReferencesTool, GetCodeActionsTool, GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool,
+    ListDirectoryTool, MovePathTool, ProjectSnapshot, ReadFileTool, RenameTool,
+    SandboxedTerminalTool, SpawnAgentTool, SystemPromptTemplate, Template, Templates, TerminalTool,
+    ToolPermissionDecision, WebSearchTool, WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
@@ -1361,6 +1361,9 @@ pub struct Thread {
     subagent_context: Option<SubagentContext>,
     /// The user's unsent prompt text, persisted so it can be restored when reloading the thread.
     draft_prompt: Option<Vec<acp::ContentBlock>>,
+    /// User messages queued while a turn is generating, persisted so the queue
+    /// syncs across instances.
+    queued_messages: Vec<DbQueuedMessage>,
     ui_scroll_position: Option<gpui::ListOffset>,
     /// Weak references to running subagent threads for cancellation propagation
     running_subagents: Vec<WeakEntity<Thread>>,
@@ -1503,6 +1506,7 @@ impl Thread {
             action_log,
             subagent_context: None,
             draft_prompt: None,
+            queued_messages: Vec::new(),
             ui_scroll_position: None,
             running_subagents: Vec::new(),
             inherits_parent_model_settings: true,
@@ -1570,6 +1574,8 @@ impl Thread {
         } else {
             Some(db_thread.title)
         };
+        self.draft_prompt = db_thread.draft_prompt;
+        self.queued_messages = db_thread.queued_messages;
         cx.notify();
     }
 
@@ -1903,6 +1909,7 @@ impl Thread {
             prompt_capabilities_rx,
             subagent_context: db_thread.subagent_context,
             draft_prompt: db_thread.draft_prompt,
+            queued_messages: db_thread.queued_messages,
             ui_scroll_position: db_thread.ui_scroll_position.map(|sp| gpui::ListOffset {
                 item_ix: sp.item_ix,
                 offset_in_item: gpui::px(sp.offset_in_item),
@@ -2002,6 +2009,7 @@ impl Thread {
             thinking_enabled: self.thinking_enabled,
             thinking_effort: self.thinking_effort.clone(),
             draft_prompt: self.draft_prompt.clone(),
+            queued_messages: self.queued_messages.clone(),
             ui_scroll_position: self.ui_scroll_position.map(|lo| {
                 crate::db::SerializedScrollPosition {
                     item_ix: lo.item_ix,
@@ -2057,6 +2065,22 @@ impl Thread {
 
     pub fn set_draft_prompt(&mut self, prompt: Option<Vec<acp::ContentBlock>>) {
         self.draft_prompt = prompt;
+    }
+
+    pub fn queued_messages(&self) -> &[DbQueuedMessage] {
+        &self.queued_messages
+    }
+
+    pub fn set_queued_messages(
+        &mut self,
+        queued_messages: Vec<DbQueuedMessage>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.queued_messages != queued_messages {
+            self.queued_messages = queued_messages;
+            self.updated_at = Utc::now();
+            cx.notify();
+        }
     }
 
     pub fn ui_scroll_position(&self) -> Option<gpui::ListOffset> {

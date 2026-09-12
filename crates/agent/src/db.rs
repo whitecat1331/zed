@@ -75,6 +75,8 @@ pub struct DbThread {
     #[serde(default)]
     pub draft_prompt: Option<Vec<acp::ContentBlock>>,
     #[serde(default)]
+    pub queued_messages: Vec<DbQueuedMessage>,
+    #[serde(default)]
     pub ui_scroll_position: Option<SerializedScrollPosition>,
     #[serde(default)]
     pub sandboxed_terminal_temp_dir: Option<PathBuf>,
@@ -83,6 +85,16 @@ pub struct DbThread {
     /// [`crate::sandboxing::ThreadSandboxGrants`].
     #[serde(default)]
     pub sandbox_grants: DbSandboxGrants,
+}
+
+/// A user message held in the send queue while a turn is generating. Persisted
+/// so the queue syncs across instances; `content` is the message and `steer`
+/// marks a front message that interrupts at the next turn boundary.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DbQueuedMessage {
+    pub content: Vec<acp::ContentBlock>,
+    #[serde(default)]
+    pub steer: bool,
 }
 
 /// Serialized form of the sandbox permissions the user granted "for the rest of
@@ -163,6 +175,7 @@ impl SharedThread {
             thinking_enabled: false,
             thinking_effort: None,
             draft_prompt: None,
+            queued_messages: Vec::new(),
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
@@ -349,6 +362,7 @@ impl DbThread {
             thinking_enabled: false,
             thinking_effort: None,
             draft_prompt: None,
+            queued_messages: Vec::new(),
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
@@ -876,6 +890,7 @@ mod tests {
             thinking_enabled: false,
             thinking_effort: None,
             draft_prompt: None,
+            queued_messages: Vec::new(),
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
