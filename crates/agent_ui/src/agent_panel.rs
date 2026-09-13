@@ -3044,8 +3044,8 @@ impl AgentPanel {
                         cx.subscribe_in::<ThreadSyncBus, ThreadSyncBusEvent>(
                             &bus,
                             window,
-                            |this, _bus, event, _window, cx| {
-                                this.handle_thread_sync_event(event, cx);
+                            |this, _bus, event, window, cx| {
+                                this.handle_thread_sync_event(event, window, cx);
                             },
                         ),
                     );
@@ -3059,7 +3059,12 @@ impl AgentPanel {
 
     /// Handles a message from another instance by applying it to the native
     /// model (always) and the open UI thread (only when not mid-turn here).
-    fn handle_thread_sync_event(&mut self, event: &ThreadSyncBusEvent, cx: &mut Context<Self>) {
+    fn handle_thread_sync_event(
+        &mut self,
+        event: &ThreadSyncBusEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let ThreadSyncBusEvent::Message(envelope) = event;
         match &envelope.message {
             ThreadSyncMessage::Stream {
@@ -3070,7 +3075,33 @@ impl AgentPanel {
             } => {
                 self.apply_remote_stream_event(session_id, client_id, event, cx);
             }
+            ThreadSyncMessage::DraftUpdate {
+                session_id, draft, ..
+            } => {
+                self.apply_remote_draft(session_id, draft.clone(), window, cx);
+            }
         }
+    }
+
+    /// Mirrors an unsent draft typed in another instance into the matching open
+    /// thread's input editor. Best-effort and live (no DB round-trip); the
+    /// Postgres reload remains the durable reconcile fallback.
+    fn apply_remote_draft(
+        &mut self,
+        session_id: &str,
+        draft: Option<Vec<acp::ContentBlock>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conversation_view) = self.conversation_view_by_session(session_id, cx) else {
+            return;
+        };
+        let Some(thread_view) = conversation_view.read(cx).root_thread_view() else {
+            return;
+        };
+        thread_view.update(cx, |view, cx| {
+            view.apply_remote_draft(draft, window, cx);
+        });
     }
 
     /// Finds the open conversation view for `session_id`, checking the active

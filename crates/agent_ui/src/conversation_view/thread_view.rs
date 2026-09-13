@@ -7,6 +7,7 @@ use crate::{
 };
 use agent_client_protocol::schema::v1 as acp;
 use std::cell::RefCell;
+use std::time::Duration;
 
 use acp_thread::{
     Elicitation, ElicitationEntryId, ElicitationStatus, PlanEntry, SandboxAuthorizationDetails,
@@ -14,7 +15,8 @@ use acp_thread::{
 };
 use agent::{
     DbQueuedMessage, SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue,
-    SkillLoadingIssueKind, SkillLoadingIssuesUpdated, ThreadSandbox, VerifiedSandboxStatus,
+    SkillLoadingIssueKind, SkillLoadingIssuesUpdated, ThreadSandbox, ThreadSyncBus,
+    VerifiedSandboxStatus,
 };
 use agent_settings::UserAgentsMd;
 use agent_skills::MAX_SKILL_DESCRIPTION_LEN;
@@ -54,6 +56,12 @@ use super::elicitation::{
 use super::*;
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
+
+/// How long to wait after the last keystroke before persisting the draft prompt
+/// to the shared thread database. Live cross-instance mirroring is handled by
+/// the sync bus, so this is purely a durability debounce to avoid a Postgres
+/// write (and its reload NOTIFY) on every keystroke.
+const DRAFT_SAVE_DEBOUNCE: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 struct ThreadFeedbackState {
@@ -615,6 +623,7 @@ pub struct ThreadView {
     elicitation_form_states: HashMap<ElicitationEntryId, ElicitationFormState>,
     pub _cancel_task: Option<Task<()>>,
     _save_task: Option<Task<()>>,
+    _draft_save_task: Option<Task<()>>,
     _draft_resolve_task: Option<Task<()>>,
     _sandbox_status_refresh_task: Option<Task<()>>,
     pub hovered_edited_file_buttons: Option<usize>,
@@ -970,10 +979,20 @@ impl ThreadView {
                     None
                 };
                 this.update(cx, |this, cx| {
+                    // A remote draft application sets the UI thread first, then
+                    // the editor; when the observer fires for that editor change
+                    // the draft already matches, so we don't re-broadcast our own
+                    // echo (which would clobber the author's newer keystrokes).
+                    let already_synced =
+                        this.thread.read(cx).draft_prompt().map(|p| p.to_vec()) == draft;
+                    if already_synced {
+                        return;
+                    }
                     this.thread.update(cx, |thread, cx| {
-                        thread.set_draft_prompt(draft, cx);
+                        thread.set_draft_prompt(draft.clone(), cx);
                     });
-                    this.schedule_save(cx);
+                    this.broadcast_draft(cx);
+                    this.schedule_draft_save(cx);
                 })
                 .ok();
             }));
@@ -1029,6 +1048,7 @@ impl ThreadView {
             elicitation_form_states: HashMap::default(),
             _cancel_task: None,
             _save_task: None,
+            _draft_save_task: None,
             _draft_resolve_task: None,
             _sandbox_status_refresh_task: None,
             hovered_edited_file_buttons: None,
@@ -1098,6 +1118,33 @@ impl ThreadView {
             })
             .ok();
         }));
+    }
+
+    /// Persists the draft prompt after a longer debounce. Live mirroring rides
+    /// the sync bus, so this only backs the draft up for reopen/durability.
+    fn schedule_draft_save(&mut self, cx: &mut Context<Self>) {
+        self._draft_save_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(DRAFT_SAVE_DEBOUNCE)
+                .await;
+            this.update(cx, |this, cx| {
+                if let Some(thread) = this.as_native_thread(cx) {
+                    thread.update(cx, |_thread, cx| cx.notify());
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Publishes the current draft prompt over the local sync bus so other open
+    /// instances mirror it live, without waiting for a Postgres round-trip.
+    fn broadcast_draft(&self, cx: &App) {
+        let Some(bus) = ThreadSyncBus::try_global(cx) else {
+            return;
+        };
+        let session_id = self.thread.read(cx).session_id().to_string();
+        let draft = self.thread.read(cx).draft_prompt().map(|blocks| blocks.to_vec());
+        bus.read(cx).broadcast_draft(session_id, draft);
     }
 
     pub fn handle_message_editor_event(
@@ -2291,6 +2338,35 @@ impl ThreadView {
         self.sync_queue_flag_to_native_thread(cx);
     }
 
+    /// Updates the input editor and UI thread draft from a converged value.
+    /// The UI thread is updated first so the editor observer (which fires for
+    /// this editor change) sees an already-matching draft and does not echo it.
+    fn set_draft_prompt_ui(
+        &mut self,
+        draft: Option<Vec<acp::ContentBlock>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.thread.read(cx).draft_prompt().map(|p| p.to_vec()) == draft {
+            return;
+        }
+        self.thread.update(cx, |thread, cx| {
+            thread.set_draft_prompt(draft.clone(), cx);
+        });
+        match draft {
+            Some(blocks) => {
+                self.message_editor.update(cx, |editor, cx| {
+                    editor.set_message(blocks, window, cx);
+                });
+            }
+            None => {
+                self.message_editor.update(cx, |editor, cx| {
+                    editor.clear(window, cx);
+                });
+            }
+        }
+    }
+
     /// Converges the input editor (and the UI thread's draft prompt) to the
     /// authoritative unsent draft persisted by another instance. Called from the
     /// cross-instance reload path so a draft typed elsewhere shows up here and is
@@ -2307,31 +2383,19 @@ impl ThreadView {
             .read(cx)
             .draft_prompt()
             .map(|blocks| blocks.to_vec());
+        self.set_draft_prompt_ui(draft, window, cx);
+    }
 
-        // Skip when the local draft already matches, so a remote content-only
-        // change never resets the input editor's focus or cursor mid-typing.
-        if self.thread.read(cx).draft_prompt().map(|p| p.to_vec()) == draft {
-            return;
-        }
-
-        // Update the UI thread first so any save triggered by the editor observer
-        // below reads back the converged value, not a stale local draft.
-        self.thread.update(cx, |thread, cx| {
-            thread.set_draft_prompt(draft.clone(), cx);
-        });
-
-        match draft {
-            Some(blocks) => {
-                self.message_editor.update(cx, |editor, cx| {
-                    editor.set_message(blocks, window, cx);
-                });
-            }
-            None => {
-                self.message_editor.update(cx, |editor, cx| {
-                    editor.clear(window, cx);
-                });
-            }
-        }
+    /// Applies a live draft mirrored over the sync bus from another instance.
+    /// Unlike the Postgres reload path this carries the draft directly, so no
+    /// database round-trip is needed.
+    pub fn apply_remote_draft(
+        &mut self,
+        draft: Option<Vec<acp::ContentBlock>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_draft_prompt_ui(draft, window, cx);
     }
 
     pub fn send_queued_message_now(

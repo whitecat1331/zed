@@ -40,7 +40,8 @@ pub enum ThreadSyncStreamEvent {
 
 /// A streamed event carried across the local cross-instance sync bus. Persisted
 /// thread state (content, titles, metadata) is reconciled through Postgres +
-/// `LISTEN/NOTIFY`; the bus carries only live, ephemeral stream deltas.
+/// `LISTEN/NOTIFY`; the bus carries only live, ephemeral stream deltas and the
+/// unsent draft prompt (too high-frequency for a DB round-trip).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ThreadSyncMessage {
     Stream {
@@ -51,12 +52,20 @@ pub enum ThreadSyncMessage {
         op_id: String,
         event: ThreadSyncStreamEvent,
     },
+    DraftUpdate {
+        session_id: String,
+        client_id: String,
+        op_id: String,
+        /// The authoring instance's unsent prompt text, or `None` when cleared.
+        draft: Option<Vec<acp::ContentBlock>>,
+    },
 }
 
 impl ThreadSyncMessage {
     pub fn client_id(&self) -> &str {
         match self {
-            ThreadSyncMessage::Stream { client_id, .. } => client_id,
+            ThreadSyncMessage::Stream { client_id, .. }
+            | ThreadSyncMessage::DraftUpdate { client_id, .. } => client_id,
         }
     }
 }
@@ -179,6 +188,20 @@ impl ThreadSyncBus {
                 client_id: self.client_id.clone(),
                 op_id: uuid::Uuid::new_v4().to_string(),
                 event,
+            })
+            .ok();
+    }
+
+    /// Publishes the authoring instance's unsent draft prompt to the other
+    /// instances. Live mirroring only — the durable copy is still reconciled
+    /// through Postgres, so a missed frame is recovered on the next reload.
+    pub fn broadcast_draft(&self, session_id: String, draft: Option<Vec<acp::ContentBlock>>) {
+        self.outbound_tx
+            .try_send(ThreadSyncMessage::DraftUpdate {
+                session_id,
+                client_id: self.client_id.clone(),
+                op_id: uuid::Uuid::new_v4().to_string(),
+                draft,
             })
             .ok();
     }

@@ -2363,13 +2363,20 @@ impl NativeAgentConnection {
             let Some(session) = agent.sessions.get(&session_id) else {
                 return Err(anyhow!("session {session_id} not found"));
             };
+            // Only replay (and visually reset) the UI when the committed
+            // messages actually changed. A draft-only or queue-only change is
+            // still converged below, but without the reset+replay that causes a
+            // loading/thinking flicker on every keystroke.
+            let messages_changed = session.thread.read(cx).messages_differ(&db_thread);
             session.thread.update(cx, |thread, cx| {
                 thread.reload_content(db_thread, cx);
             });
-            let events = session.thread.update(cx, |thread, cx| thread.replay(cx));
-            let acp_thread = session.acp_thread.clone();
-            acp_thread.update(cx, |thread, cx| thread.reset(cx)).ok();
-            Self::handle_thread_events(events, acp_thread, None, cx).detach_and_log_err(cx);
+            if messages_changed {
+                let events = session.thread.update(cx, |thread, cx| thread.replay(cx));
+                let acp_thread = session.acp_thread.clone();
+                acp_thread.update(cx, |thread, cx| thread.reset(cx)).ok();
+                Self::handle_thread_events(events, acp_thread, None, cx).detach_and_log_err(cx);
+            }
             Ok(())
         })
     }

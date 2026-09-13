@@ -1579,6 +1579,13 @@ impl Thread {
         cx.notify();
     }
 
+    /// Whether replacing this thread's state with `db_thread` would change its
+    /// committed messages. Lets the cross-instance reload path skip the
+    /// expensive reset+replay when only the draft or queue changed.
+    pub fn messages_differ(&self, db_thread: &DbThread) -> bool {
+        self.messages != db_thread.messages
+    }
+
     // Only used by Seatbelt-style sandboxes (macOS); Linux relies on bwrap's
     // tmpfs `/tmp` and Windows on the WSL bwrap tmpfs, so neither needs a
     // per-thread temp directory.
