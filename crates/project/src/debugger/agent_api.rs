@@ -1,5 +1,6 @@
 use super::{
     breakpoint_store::{BreakpointState, BreakpointStore, SourceBreakpoint},
+    dap_command::DataBreakpointContext,
     dap_store::DapStore,
     session::{OutputToken, Session, SessionEvent, SessionStateEvent, ThreadId, ThreadStatus},
 };
@@ -74,6 +75,40 @@ pub struct AgentBreakpointEditResult {
     pub path: PathBuf,
     pub line: u32,
     pub changed: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentExceptionBreakpoint {
+    pub id: String,
+    pub label: String,
+    pub description: Option<String>,
+    pub default: bool,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentExceptionBreakpointInput {
+    pub id: String,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentDataBreakpoint {
+    pub data_id: String,
+    pub context: String,
+    pub enabled: bool,
+    pub access_type: Option<String>,
+    pub condition: Option<String>,
+    pub hit_condition: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentDataBreakpointInput {
+    pub variables_reference: u64,
+    pub name: String,
+    pub access_type: Option<String>,
+    pub condition: Option<String>,
+    pub hit_condition: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -307,6 +342,202 @@ impl AgentDebuggerApi {
                 line,
                 changed,
             })
+        })
+    }
+
+    pub fn list_exception_breakpoints(
+        &self,
+        session_id: SessionId,
+        cx: &App,
+    ) -> Result<Vec<AgentExceptionBreakpoint>> {
+        let session = self
+            .dap_store
+            .read(cx)
+            .session_by_id(session_id)
+            .with_context(|| format!("Could not find debugger session {:?}", session_id))?;
+        Ok(session.read_with(cx, |session, _| {
+            session
+                .exception_breakpoints()
+                .map(|(filter, enabled)| AgentExceptionBreakpoint {
+                    id: filter.filter.clone(),
+                    label: filter.label.clone(),
+                    description: filter.description.clone(),
+                    default: filter.default.unwrap_or(false),
+                    enabled: *enabled,
+                })
+                .collect()
+        }))
+    }
+
+    pub fn set_exception_breakpoints(
+        &self,
+        session_id: SessionId,
+        breakpoints: Vec<AgentExceptionBreakpointInput>,
+        cx: &mut App,
+    ) -> Task<Result<Vec<AgentExceptionBreakpoint>>> {
+        let dap_store = self.dap_store.clone();
+        cx.spawn(async move |cx| {
+            let session = session_by_id(&dap_store, session_id, cx)?;
+            for breakpoint in &breakpoints {
+                session
+                    .update(cx, |session, cx| {
+                        session.agent_set_exception_breakpoint(
+                            &breakpoint.id,
+                            breakpoint.enabled,
+                            cx,
+                        )
+                    })
+                    .await?;
+            }
+            Ok(session.read_with(cx, |session, _| {
+                session
+                    .exception_breakpoints()
+                    .map(|(filter, enabled)| AgentExceptionBreakpoint {
+                        id: filter.filter.clone(),
+                        label: filter.label.clone(),
+                        description: filter.description.clone(),
+                        default: filter.default.unwrap_or(false),
+                        enabled: *enabled,
+                    })
+                    .collect()
+            }))
+        })
+    }
+
+    pub fn list_data_breakpoints(
+        &self,
+        session_id: SessionId,
+        cx: &App,
+    ) -> Result<Vec<AgentDataBreakpoint>> {
+        let session = self
+            .dap_store
+            .read(cx)
+            .session_by_id(session_id)
+            .with_context(|| format!("Could not find debugger session {:?}", session_id))?;
+        Ok(session.read_with(cx, |session, _| {
+            session
+                .data_breakpoints()
+                .map(|state| AgentDataBreakpoint {
+                    data_id: state.dap.data_id.clone(),
+                    context: state.context.human_readable_label(),
+                    enabled: state.is_enabled,
+                    access_type: state
+                        .dap
+                        .access_type
+                        .as_ref()
+                        .map(data_breakpoint_access_type_to_string)
+                        .map(str::to_string),
+                    condition: state.dap.condition.clone(),
+                    hit_condition: state.dap.hit_condition.clone(),
+                })
+                .collect()
+        }))
+    }
+
+    pub fn set_data_breakpoints(
+        &self,
+        session_id: SessionId,
+        breakpoints: Vec<AgentDataBreakpointInput>,
+        cx: &mut App,
+    ) -> Task<Result<Vec<AgentDataBreakpoint>>> {
+        let dap_store = self.dap_store.clone();
+        cx.spawn(async move |cx| {
+            let session = session_by_id(&dap_store, session_id, cx)?;
+            let supports_data_breakpoints = session.read_with(cx, |session, _| {
+                session
+                    .capabilities()
+                    .supports_data_breakpoints
+                    .unwrap_or(false)
+            });
+            if !supports_data_breakpoints {
+                return Err(anyhow!("debug adapter does not support data breakpoints"));
+            }
+
+            let mut results = Vec::with_capacity(breakpoints.len());
+            for breakpoint in breakpoints {
+                let name = breakpoint.name;
+                let variables_reference = breakpoint.variables_reference;
+                let access_type = breakpoint.access_type;
+                let condition = breakpoint.condition;
+                let hit_condition = breakpoint.hit_condition;
+
+                let context = Arc::new(DataBreakpointContext::Variable {
+                    variables_reference,
+                    name: name.clone(),
+                    bytes: None,
+                });
+                let info = session
+                    .update(cx, |session, cx| {
+                        session.data_breakpoint_info(context.clone(), None, cx)
+                    })
+                    .await;
+                let Some(info) = info else {
+                    return Err(anyhow!(
+                        "debug adapter returned no data breakpoint info for {name:?}"
+                    ));
+                };
+                let Some(data_id) = info.data_id else {
+                    return Err(anyhow!("debug adapter returned no data id for {name:?}"));
+                };
+                let access_type = access_type
+                    .as_deref()
+                    .map(parse_data_breakpoint_access_type)
+                    .transpose()?;
+                let dap_breakpoint = dap::DataBreakpoint {
+                    data_id: data_id.clone(),
+                    access_type,
+                    condition: condition.clone(),
+                    hit_condition: hit_condition.clone(),
+                };
+                session.update(cx, |session, cx| {
+                    session.create_data_breakpoint(
+                        context.clone(),
+                        data_id.clone(),
+                        dap_breakpoint,
+                        cx,
+                    );
+                });
+                results.push(AgentDataBreakpoint {
+                    data_id,
+                    context: context.human_readable_label(),
+                    enabled: true,
+                    access_type: access_type
+                        .as_ref()
+                        .map(data_breakpoint_access_type_to_string)
+                        .map(str::to_string),
+                    condition,
+                    hit_condition,
+                });
+            }
+
+            Ok(results)
+        })
+    }
+
+    pub fn set_ignore_breakpoints(
+        &self,
+        session_id: SessionId,
+        ignore: bool,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let dap_store = self.dap_store.clone();
+        cx.spawn(async move |cx| {
+            let session = session_by_id(&dap_store, session_id, cx)?;
+            session
+                .update(cx, |session, cx| {
+                    session.agent_set_ignore_breakpoints(ignore, cx)
+                })
+                .await
+        })
+    }
+
+    pub fn clear_breakpoints(&self, cx: &mut App) -> Task<Result<()>> {
+        let breakpoint_store = self.breakpoint_store.clone();
+        cx.spawn(async move |cx| {
+            breakpoint_store.update(cx, |breakpoint_store, cx| {
+                breakpoint_store.clear_breakpoints(cx)
+            });
+            Ok(())
         })
     }
 
@@ -766,6 +997,27 @@ impl AgentDebuggerThreadStatus {
 fn line_to_row(line: u32) -> Result<u32> {
     line.checked_sub(1)
         .with_context(|| "Debugger source breakpoint lines are 1-based")
+}
+
+fn data_breakpoint_access_type_to_string(
+    access_type: &dap::DataBreakpointAccessType,
+) -> &'static str {
+    match access_type {
+        dap::DataBreakpointAccessType::Read => "read",
+        dap::DataBreakpointAccessType::Write => "write",
+        dap::DataBreakpointAccessType::ReadWrite => "readWrite",
+    }
+}
+
+fn parse_data_breakpoint_access_type(value: &str) -> Result<dap::DataBreakpointAccessType> {
+    match value {
+        "read" => Ok(dap::DataBreakpointAccessType::Read),
+        "write" => Ok(dap::DataBreakpointAccessType::Write),
+        "readWrite" => Ok(dap::DataBreakpointAccessType::ReadWrite),
+        _ => Err(anyhow!(
+            "unknown data breakpoint access type {value:?} (expected read, write, or readWrite)"
+        )),
+    }
 }
 
 fn session_by_id(

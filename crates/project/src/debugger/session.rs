@@ -2628,6 +2628,64 @@ impl Session {
         })
     }
 
+    pub(crate) fn agent_set_exception_breakpoint(
+        &mut self,
+        id: &str,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let supports_exception_breakpoints = self
+            .capabilities
+            .exception_breakpoint_filters
+            .as_ref()
+            .is_some_and(|filters| !filters.is_empty());
+        if !supports_exception_breakpoints {
+            return Task::ready(Err(anyhow!(
+                "debug adapter does not support exception breakpoints"
+            )));
+        }
+
+        let Some((_, is_enabled)) = self.exception_breakpoints.get_mut(id) else {
+            return Task::ready(Err(anyhow!(
+                "unknown exception breakpoint filter {id:?}"
+            )));
+        };
+
+        if *is_enabled != enabled {
+            *is_enabled = enabled;
+            self.send_exception_breakpoints(cx);
+        }
+
+        Task::ready(Ok(()))
+    }
+
+    pub(crate) fn agent_set_ignore_breakpoints(
+        &mut self,
+        ignore: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        if self.as_running().is_none() {
+            return Task::ready(Err(anyhow!(
+                "cannot change ignore breakpoints while the debug session is not running locally"
+            )));
+        }
+
+        let send = self.set_ignore_breakpoints(ignore, cx);
+        cx.spawn(async move |_, _| {
+            let errors = send.await;
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                let message = errors
+                    .into_values()
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                Err(anyhow!("failed to update source breakpoints: {message}"))
+            }
+        })
+    }
+
     pub fn pause_thread(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
         self.request(
             PauseCommand {
