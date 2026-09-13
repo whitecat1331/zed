@@ -69,7 +69,7 @@ impl ThreadStore {
         let database_future = ThreadsDatabase::connect(cx);
         cx.spawn(async move |this, cx| {
             let database = database_future.await.map_err(|err| anyhow!(err))?;
-            database.save_thread(id, thread, folder_paths).await?;
+            database.save_thread(id, thread, folder_paths, None).await?;
             this.update(cx, |this, cx| this.reload(cx))
         })
     }

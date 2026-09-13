@@ -220,6 +220,7 @@ struct ProjectState {
 /// racing the foreground mutation of the live thread.
 struct PendingThreadSave {
     folder_paths: PathList,
+    workspace_id: Option<String>,
     db_thread: Task<DbThread>,
 }
 
@@ -1865,7 +1866,7 @@ impl NativeAgent {
         let Some(session) = self.sessions.get(id) else {
             return;
         };
-        let Some((id, folder_paths, db_thread)) =
+        let Some((id, folder_paths, workspace_id, db_thread)) =
             self.thread_save_payload(session, draft_prompt, cx)
         else {
             return;
@@ -1876,6 +1877,7 @@ impl NativeAgent {
         };
         *session.pending_save.lock() = Some(PendingThreadSave {
             folder_paths,
+            workspace_id,
             db_thread,
         });
         session.save_wake.send(()).log_err();
@@ -1894,6 +1896,7 @@ impl NativeAgent {
             let payload = pending_save.lock().take();
             if let Some(PendingThreadSave {
                 folder_paths,
+                workspace_id,
                 db_thread,
             }) = payload
                 && let Some(database) = database_future
@@ -1904,7 +1907,7 @@ impl NativeAgent {
             {
                 let db_thread = db_thread.await;
                 match database
-                    .save_thread(id.clone(), db_thread, folder_paths)
+                    .save_thread(id.clone(), db_thread, folder_paths, workspace_id)
                     .await
                 {
                     Ok(()) => {
@@ -1934,7 +1937,7 @@ impl NativeAgent {
         session: &Session,
         draft_prompt: Option<Vec<acp::ContentBlock>>,
         cx: &mut App,
-    ) -> Option<(acp::SessionId, PathList, Task<DbThread>)> {
+    ) -> Option<(acp::SessionId, PathList, Option<String>, Task<DbThread>)> {
         if session.thread.read(cx).is_empty() {
             return None;
         }
@@ -1952,7 +1955,7 @@ impl NativeAgent {
             thread.set_draft_prompt(draft_prompt);
             thread.to_db(cx)
         });
-        Some((id, folder_paths, db_thread))
+        Some((id, folder_paths, None, db_thread))
     }
 
     /// Commits every non-empty thread's content on shutdown so the async
@@ -1975,12 +1978,12 @@ impl NativeAgent {
             };
             // All quit observers share `gpui::SHUTDOWN_TIMEOUT`, so run the
             // saves concurrently instead of one at a time.
-            future::join_all(saves.into_iter().map(|(id, folder_paths, db_thread)| {
+            future::join_all(saves.into_iter().map(|(id, folder_paths, workspace_id, db_thread)| {
                 let database = database.clone();
                 async move {
                     let db_thread = db_thread.await;
                     database
-                        .save_thread(id, db_thread, folder_paths)
+                        .save_thread(id, db_thread, folder_paths, workspace_id)
                         .await
                         .log_err();
                 }

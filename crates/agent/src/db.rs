@@ -33,8 +33,11 @@ pub struct DbThreadMetadata {
     pub updated_at: DateTime<Utc>,
     pub created_at: Option<DateTime<Utc>>,
     /// The workspace folder paths this thread was created against, sorted
-    /// lexicographically. Used for grouping threads by project in the sidebar.
+    /// lexicographically. Used for grouping threads by workspace in the sidebar.
     pub folder_paths: PathList,
+    /// The stable managed-workspace id this thread belongs to, if one has been
+    /// minted. Stored as the hyphenated string form of the manager id.
+    pub workspace_id: Option<String>,
 }
 
 impl From<&DbThreadMetadata> for acp_thread::AgentSessionInfo {
@@ -477,6 +480,13 @@ impl ThreadsDatabase {
         }
 
         if let Ok(mut s) = connection.exec(indoc! {"
+            ALTER TABLE threads ADD COLUMN workspace_id TEXT
+        "})
+        {
+            s().ok();
+        }
+
+        if let Ok(mut s) = connection.exec(indoc! {"
             ALTER TABLE threads ADD COLUMN created_at TEXT;
         "})
         {
@@ -502,6 +512,7 @@ impl ThreadsDatabase {
         id: acp::SessionId,
         thread: DbThread,
         folder_paths: &PathList,
+        workspace_id: Option<String>,
     ) -> Result<()> {
         const COMPRESSION_LEVEL: i32 = 3;
 
@@ -544,13 +555,14 @@ impl ThreadsDatabase {
         // created, not when it was saved to the database.
         let created_at = updated_at.clone();
 
-        let mut insert = connection.exec_bound::<(Arc<str>, Option<Arc<str>>, Option<String>, Option<String>, String, String, DataType, Vec<u8>, String)>(indoc! {"
-            INSERT INTO threads (id, parent_id, folder_paths, folder_paths_order, summary, updated_at, data_type, data, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        let mut insert = connection.exec_bound::<(Arc<str>, Option<Arc<str>>, Option<String>, Option<String>, Option<String>, String, String, DataType, Vec<u8>, String)>(indoc! {"
+            INSERT INTO threads (id, parent_id, folder_paths, folder_paths_order, workspace_id, summary, updated_at, data_type, data, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             ON CONFLICT(id) DO UPDATE SET
                 parent_id = excluded.parent_id,
                 folder_paths = excluded.folder_paths,
                 folder_paths_order = excluded.folder_paths_order,
+                workspace_id = COALESCE(excluded.workspace_id, threads.workspace_id),
                 summary = excluded.summary,
                 updated_at = excluded.updated_at,
                 data_type = excluded.data_type,
@@ -562,6 +574,7 @@ impl ThreadsDatabase {
             parent_id,
             folder_paths_str,
             folder_paths_order_str,
+            workspace_id,
             title,
             updated_at,
             data_type,
@@ -579,14 +592,14 @@ impl ThreadsDatabase {
             let connection = connection.lock();
 
             let mut select = connection
-                .select_bound::<(), (Arc<str>, Option<Arc<str>>, Option<String>, Option<String>, String, String, Option<String>)>(indoc! {"
-                SELECT id, parent_id, folder_paths, folder_paths_order, summary, updated_at, created_at FROM threads ORDER BY updated_at DESC, created_at DESC
+                .select_bound::<(), (Arc<str>, Option<Arc<str>>, Option<String>, Option<String>, Option<String>, String, String, Option<String>)>(indoc! {"
+                SELECT id, parent_id, folder_paths, folder_paths_order, workspace_id, summary, updated_at, created_at FROM threads ORDER BY updated_at DESC, created_at DESC
             "})?;
 
             let rows = select(())?;
             let mut threads = Vec::new();
 
-            for (id, parent_id, folder_paths, folder_paths_order, summary, updated_at, created_at) in rows {
+            for (id, parent_id, folder_paths, folder_paths_order, workspace_id, summary, updated_at, created_at) in rows {
                 let folder_paths = folder_paths
                     .map(|paths| {
                         PathList::deserialize(&util::path_list::SerializedPathList {
@@ -608,6 +621,7 @@ impl ThreadsDatabase {
                     updated_at: DateTime::parse_from_rfc3339(&updated_at)?.with_timezone(&Utc),
                     created_at,
                     folder_paths,
+                    workspace_id,
                 });
             }
 
@@ -659,6 +673,7 @@ impl ThreadsDatabase {
         id: acp::SessionId,
         thread: DbThread,
         folder_paths: PathList,
+        workspace_id: Option<String>,
     ) -> Task<Result<()>> {
         let connection = self.connection.clone();
         #[cfg(test)]
@@ -669,7 +684,7 @@ impl ThreadsDatabase {
             if let Some(write_gate) = write_gate {
                 write_gate.await.ok();
             }
-            Self::save_thread_sync(&connection, id, thread, &folder_paths)
+            Self::save_thread_sync(&connection, id, thread, &folder_paths, workspace_id)
         })
     }
 
@@ -870,11 +885,11 @@ mod tests {
         );
 
         database
-            .save_thread(older_id.clone(), older_thread, PathList::default())
+            .save_thread(older_id.clone(), older_thread, PathList::default(), None)
             .await
             .unwrap();
         database
-            .save_thread(newer_id.clone(), newer_thread, PathList::default())
+            .save_thread(newer_id.clone(), newer_thread, PathList::default(), None)
             .await
             .unwrap();
 
@@ -899,11 +914,16 @@ mod tests {
         );
 
         database
-            .save_thread(thread_id.clone(), original_thread, PathList::default())
+            .save_thread(
+                thread_id.clone(),
+                original_thread,
+                PathList::default(),
+                None,
+            )
             .await
             .unwrap();
         database
-            .save_thread(thread_id.clone(), updated_thread, PathList::default())
+            .save_thread(thread_id.clone(), updated_thread, PathList::default(), None)
             .await
             .unwrap();
 
@@ -1014,7 +1034,7 @@ mod tests {
         thread.sandbox_grants = grants.clone();
 
         database
-            .save_thread(thread_id.clone(), thread, PathList::default())
+            .save_thread(thread_id.clone(), thread, PathList::default(), None)
             .await
             .unwrap();
 
@@ -1044,7 +1064,7 @@ mod tests {
         thread.sandboxed_terminal_temp_dir = Some(temp_dir.clone());
 
         database
-            .save_thread(thread_id.clone(), thread, PathList::default())
+            .save_thread(thread_id.clone(), thread, PathList::default(), None)
             .await
             .unwrap();
 
@@ -1074,7 +1094,7 @@ mod tests {
         thread.sandboxed_terminal_temp_dir = Some(temp_dir.clone());
 
         database
-            .save_thread(thread_id.clone(), thread, PathList::default())
+            .save_thread(thread_id.clone(), thread, PathList::default(), None)
             .await
             .unwrap();
         database.delete_thread(thread_id).await.unwrap();
@@ -1126,7 +1146,7 @@ mod tests {
             (unrelated_id.clone(), unrelated_thread),
         ] {
             database
-                .save_thread(id, thread, PathList::default())
+                .save_thread(id, thread, PathList::default(), None)
                 .await
                 .unwrap();
         }
@@ -1155,7 +1175,7 @@ mod tests {
         });
 
         database
-            .save_thread(child_id.clone(), child_thread, PathList::default())
+            .save_thread(child_id.clone(), child_thread, PathList::default(), None)
             .await
             .unwrap();
 
@@ -1183,7 +1203,7 @@ mod tests {
         );
 
         database
-            .save_thread(thread_id.clone(), thread, PathList::default())
+            .save_thread(thread_id.clone(), thread, PathList::default(), None)
             .await
             .unwrap();
 
@@ -1215,7 +1235,7 @@ mod tests {
         ]);
 
         database
-            .save_thread(thread_id.clone(), thread, folder_paths.clone())
+            .save_thread(thread_id.clone(), thread, folder_paths.clone(), None)
             .await
             .unwrap();
 
@@ -1234,7 +1254,7 @@ mod tests {
         );
 
         database
-            .save_thread(thread_id.clone(), thread, PathList::default())
+            .save_thread(thread_id.clone(), thread, PathList::default(), None)
             .await
             .unwrap();
 
@@ -1274,7 +1294,7 @@ mod tests {
         });
 
         database
-            .save_thread(thread_id.clone(), thread, PathList::default())
+            .save_thread(thread_id.clone(), thread, PathList::default(), None)
             .await
             .unwrap();
 
