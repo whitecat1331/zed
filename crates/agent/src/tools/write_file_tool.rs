@@ -1110,6 +1110,84 @@ mod tests {
         assert_eq!(new_text, "new_content");
     }
 
+    // Measurement (not a correctness assertion): reproduces the "Keep All stays
+    // blocked after streaming stops" symptom. It streams a large write_file and
+    // times how long the tool stays busy (InProgress) *after* the final full
+    // input is delivered — i.e. the post-stream `ensure_buffer_saved` +
+    // `compute_new_text_and_diff` work inside `run_session`.
+    //
+    // Run with:
+    //   cargo test -p agent measure_streaming_write_post_completion_lag -- --nocapture
+    //
+    // Tunable via CHUNK_COUNT / LINES_PER_CHUNK env vars.
+    #[gpui::test]
+    async fn measure_streaming_write_post_completion_lag(cx: &mut TestAppContext) {
+        let (write_tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"dir": {}})).await;
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let chunk_count = std::env::var("CHUNK_COUNT")
+            .map(|v| v.parse().expect("invalid `CHUNK_COUNT`"))
+            .unwrap_or(50);
+        let lines_per_chunk = std::env::var("LINES_PER_CHUNK")
+            .map(|v| v.parse().expect("invalid `LINES_PER_CHUNK`"))
+            .unwrap_or(100);
+
+        // The write tool streams the *cumulative* content (each partial repeats
+        // everything so far), so build that up front.
+        let mut full = String::new();
+        let mut cumulatives = Vec::with_capacity(chunk_count);
+        for i in 0..chunk_count {
+            let start = i * lines_per_chunk;
+            for j in 0..lines_per_chunk {
+                full.push_str(&format!("line {:08} {:04}\n", start + j, j));
+            }
+            cumulatives.push(full.clone());
+        }
+
+        let (mut sender, input) = ToolInput::<WriteFileToolInput>::test();
+        let (event_stream, _receiver) = ToolCallEventStream::test();
+        let task = cx.update(|cx| write_tool.clone().run(input, event_stream, cx));
+
+        // Establish the path so the edit session is created on the next partial.
+        sender.send_partial(json!({ "path": "root/dir/new_file.txt" }));
+        cx.run_until_parked();
+
+        // Stream the cumulative content chunk by chunk.
+        for (i, content) in cumulatives.iter().enumerate() {
+            let payload = if i == 0 {
+                json!({ "path": "root/dir/new_file.txt", "content": content })
+            } else {
+                json!({ "content": content })
+            };
+            sender.send_partial(payload);
+            cx.run_until_parked();
+        }
+
+        // Final full input; time how long the tool stays busy after this point.
+        let start = std::time::Instant::now();
+        sender.send_full(json!({
+            "path": "root/dir/new_file.txt",
+            "content": full,
+        }));
+        let result = task.await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok(), "write should succeed: {:?}", result.err());
+
+        eprintln!(
+            "[write-tool] chunks={} lines/chunk={} total_lines={} post-stream completion={:?}",
+            chunk_count,
+            lines_per_chunk,
+            chunk_count * lines_per_chunk,
+            elapsed,
+        );
+    }
+
     #[gpui::test]
     async fn test_streaming_reject_created_file_deletes_it(cx: &mut TestAppContext) {
         let (write_tool, _project, action_log, fs, _thread) =

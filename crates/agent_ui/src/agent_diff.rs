@@ -28,7 +28,7 @@ use std::{
     ops::Range,
     sync::Arc,
 };
-use ui::{CommonAnimationExt, Divider, IconButtonShape, KeyBinding, Tooltip, prelude::*};
+use ui::{Divider, IconButtonShape, KeyBinding, Tooltip, prelude::*};
 use util::{ResultExt, truncate_and_trailoff};
 use workspace::{
     Item, ItemHandle, ItemNavHistory, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
@@ -1067,18 +1067,6 @@ impl ToolbarItemView for AgentDiffToolbar {
 
 impl Render for AgentDiffToolbar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let spinner_icon = div()
-            .px_0p5()
-            .id("generating")
-            .tooltip(Tooltip::text("Generating Changes…"))
-            .child(
-                Icon::new(IconName::LoadCircle)
-                    .size(IconSize::Small)
-                    .color(Color::Accent)
-                    .with_rotate_animation(3),
-            )
-            .into_any();
-
         let Some(active_item) = self.active_item.as_ref() else {
             return Empty.into_any();
         };
@@ -1206,20 +1194,16 @@ impl Render for AgentDiffToolbar {
                     return Empty.into_any();
                 };
 
+                let is_empty = agent_diff.read(cx).multibuffer.read(cx).is_empty();
+                if is_empty {
+                    return Empty.into_any();
+                }
+
                 let has_pending_edit_tool_use = agent_diff
                     .read(cx)
                     .thread
                     .read(cx)
                     .has_pending_edit_tool_calls();
-
-                if has_pending_edit_tool_use {
-                    return div().px_2().child(spinner_icon).into_any();
-                }
-
-                let is_empty = agent_diff.read(cx).multibuffer.read(cx).is_empty();
-                if is_empty {
-                    return Empty.into_any();
-                }
 
                 let focus_handle = agent_diff.focus_handle(cx);
 
@@ -1232,6 +1216,12 @@ impl Render for AgentDiffToolbar {
                         h_group_sm()
                             .child(
                                 Button::new("reject-all", "Reject All")
+                                    .disabled(has_pending_edit_tool_use)
+                                    .when(has_pending_edit_tool_use, |this| {
+                                        this.tooltip(Tooltip::text(
+                                            "Wait until file edits are complete.",
+                                        ))
+                                    })
                                     .key_binding({
                                         KeyBinding::for_action_in(&RejectAll, &focus_handle, cx)
                                             .map(|kb| kb.size(rems_from_px(12_f32)))
@@ -1242,6 +1232,12 @@ impl Render for AgentDiffToolbar {
                             )
                             .child(
                                 Button::new("keep-all", "Keep All")
+                                    .disabled(has_pending_edit_tool_use)
+                                    .when(has_pending_edit_tool_use, |this| {
+                                        this.tooltip(Tooltip::text(
+                                            "Wait until file edits are complete.",
+                                        ))
+                                    })
                                     .key_binding({
                                         KeyBinding::for_action_in(&KeepAll, &focus_handle, cx)
                                             .map(|kb| kb.size(rems_from_px(12_f32)))
