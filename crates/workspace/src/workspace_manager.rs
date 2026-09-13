@@ -204,6 +204,33 @@ impl WorkspaceManager {
 
         Ok(None)
     }
+
+    /// Resolve a workspace by its hyphenated id or its user-giveable name.
+    pub fn resolve(&self, id_or_name: &str) -> Result<Option<ManagedWorkspaceId>> {
+        if let Ok(id) = ManagedWorkspaceId::from_key_string(id_or_name)
+            && self.get(id)?.is_some()
+        {
+            return Ok(Some(id));
+        }
+
+        let rows = self.select_bound::<&str, String>(sql! {
+            SELECT workspace_id FROM managed_workspaces WHERE name = ?
+        })?(id_or_name)?;
+
+        rows.into_iter()
+            .next()
+            .map(|id| ManagedWorkspaceId::from_key_string(&id))
+            .transpose()
+    }
+
+    /// The project paths (membership) of a workspace, in position order.
+    pub fn project_paths(&self, workspace_id: ManagedWorkspaceId) -> Result<Vec<PathBuf>> {
+        Ok(self
+            .projects(workspace_id)?
+            .into_iter()
+            .map(|project| project.path)
+            .collect())
+    }
 }
 
 fn parse_timestamp(text: &str) -> DateTime<Utc> {
