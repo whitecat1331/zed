@@ -3,6 +3,13 @@
 - Describe the objective or issue this PR addresses.
 - If you're fixing a specific issue, use "Fixes #X" for each issue as [described in the GitHub docs](https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue#linking-a-pull-request-to-an-issue-using-a-keyword).
 
+## AI Disclosure
+
+> Required for every PR (see [AI_POLICY.md](./AI_POLICY.md)). Do not delete.
+
+- Primary author of the majority of this PR and its code (human, or agent + model):
+- Model(s) used (or "None — no AI was used"):
+
 ## Solution
 
 - Describe the solution used to achieve the objective above.
@@ -13,6 +20,23 @@
 - Are there any parts that need more testing?
 - How can other people (reviewers) test your changes? Is there anything specific they need to know?
 - If relevant, what platforms did you test these changes on, and are there any important ones you can't test?
+
+## Root cause → fix → verification
+
+> Soft-required for AI-assisted PRs (see [AI_POLICY.md](./AI_POLICY.md)). PRs that
+> fill this out are reviewed first.
+
+- **Root cause** (bug fix) or **motivation** (feature/refactor):
+- **Fix** / **approach** (what changed and why):
+- **Verification** (how you know it's correct — tests, harness evidence, or both):
+
+## Debugger harness evidence
+
+> Required if AI was used (see [AI_POLICY.md](./AI_POLICY.md)). If no AI was used, write "N/A — no AI used".
+
+- Acceptance report (dated `TEST_REPORT-*.md`):
+- Loop state confirmed clean (`ISSUES.json` / `LOOP_STATE.json`):
+- Build profile (`quick` / `release`) and the commit SHA the evidence was produced against:
 
 ## Self-Review Checklist:
 
