@@ -878,11 +878,42 @@ fn main() {
         })
         .detach_and_log_err(cx);
 
-        let urls: Vec<_> = args
-            .paths_or_urls
-            .iter()
-            .map(|arg| parse_url_arg(arg, cx))
-            .collect();
+        let urls: Vec<_> = if let Some(workspace_paths) =
+            args.workspace.as_deref().and_then(|id_or_name| {
+                let manager = workspace::WorkspaceManager::global(cx);
+                match manager.resolve(id_or_name).log_err().flatten() {
+                    Some(workspace_id) => manager.project_paths(workspace_id).log_err().ok(),
+                    None => {
+                        // Create-if-absent: adopt the positional roots under this
+                        // name so a scripted throw can open by identity before
+                        // any managed workspace exists.
+                        let paths = args
+                            .paths_or_urls
+                            .iter()
+                            .map(PathBuf::from)
+                            .collect::<Vec<_>>();
+                        if paths.is_empty() {
+                            None
+                        } else {
+                            let workspace_id = manager
+                                .create(id_or_name.to_string(), paths)
+                                .log_err()
+                                .ok()?;
+                            manager.project_paths(workspace_id).log_err().ok()
+                        }
+                    }
+                }
+            }) {
+            workspace_paths
+                .iter()
+                .map(|path| parse_url_arg(&path.to_string_lossy(), cx))
+                .collect()
+        } else {
+            args.paths_or_urls
+                .iter()
+                .map(|arg| parse_url_arg(arg, cx))
+                .collect()
+        };
 
         // Check if any diff paths are directories to determine diff_all mode
         let diff_all_mode = args
@@ -971,6 +1002,10 @@ fn main() {
             let restore_finished = restore_finished.clone();
             cx.spawn(async move |cx| {
                 restore_finished.await;
+                // Wait for the first workspace window to actually exist before
+                // submitting, so the prompt lands in a real (non-empty)
+                // workspace instead of racing the window creation.
+                first_window_rx.await.ok();
                 let multi_workspace =
                     workspace::get_any_active_multi_workspace(app_state, cx.clone()).await?;
                 let panels_task = multi_workspace.update(cx, |multi_workspace, _, cx| {
@@ -1835,6 +1870,11 @@ struct Args {
     /// startup. Trusted local input only — not reachable via `zed://` URLs.
     #[arg(long, hide = true)]
     agent_prompt: Option<PathBuf>,
+
+    /// Open a managed workspace by id (hyphenated uuid) or name. Resolved via
+    /// the workspace manager and treated as the set of roots to open.
+    #[arg(long, hide = true)]
+    workspace: Option<String>,
 }
 
 #[derive(Clone, Debug)]
