@@ -1062,6 +1062,22 @@ impl Domain for WorkspaceDb {
                 ON UPDATE CASCADE
             ) STRICT;
         ),
+        sql!(
+            CREATE TABLE managed_workspaces (
+                workspace_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            ) STRICT;
+
+            CREATE TABLE managed_workspace_projects (
+                workspace_id TEXT NOT NULL REFERENCES managed_workspaces(workspace_id) ON DELETE CASCADE,
+                path TEXT NOT NULL,
+                position INTEGER NOT NULL DEFAULT 0,
+                remote_connection_id INTEGER,
+                PRIMARY KEY (workspace_id, path)
+            ) STRICT;
+        ),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly

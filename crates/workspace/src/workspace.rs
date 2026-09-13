@@ -27,6 +27,7 @@ mod toast_layer;
 mod toolbar;
 pub mod welcome;
 pub mod workspace_error;
+pub mod workspace_manager;
 mod workspace_settings;
 
 pub use dock::Panel;
@@ -42,6 +43,9 @@ pub use remote::{
     RemoteConnectionIdentity, remote_connection_identity, same_remote_connection_identity,
 };
 pub use toast_layer::{ToastAction, ToastLayer, ToastView};
+pub use workspace_manager::{
+    ManagedWorkspace, ManagedWorkspaceId, ManagedWorkspaceProject, WorkspaceManager,
+};
 
 use anyhow::{Context as _, Result, anyhow};
 use client::{
