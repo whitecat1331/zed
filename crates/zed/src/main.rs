@@ -990,6 +990,7 @@ fn main() {
                 tx.send(()).ok();
             }
         });
+        let first_window_placed = first_window_rx.shared();
 
         let restore_finished = cx.background_spawn(restore_task).shared();
 
@@ -998,12 +999,13 @@ fn main() {
         if let Some(prompt) = agent_prompt {
             let app_state = app_state.clone();
             let restore_finished = restore_finished.clone();
+            let first_window_placed = first_window_placed.clone();
             cx.spawn(async move |cx| {
                 restore_finished.await;
                 // Wait for the first workspace window to actually exist before
                 // submitting, so the prompt lands in a real (non-empty)
                 // workspace instead of racing the window creation.
-                first_window_rx.await.ok();
+                first_window_placed.await.ok();
                 let multi_workspace =
                     workspace::get_any_active_multi_workspace(app_state, cx.clone()).await?;
                 let panels_task = multi_workspace.update(cx, |multi_workspace, _, cx| {
@@ -1057,7 +1059,6 @@ fn main() {
 
         cx.spawn(async move |cx| {
             let _first_window_subscription = _first_window_subscription;
-            let first_window_placed = first_window_rx.shared();
             while let Some(urls) = open_rx.next().await {
                 // On a macOS cold launch, `zed <path>` arrives here after startup already
                 // began restoring the session, so wait for a restored window to exist before
