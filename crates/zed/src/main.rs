@@ -882,7 +882,7 @@ fn main() {
             args.workspace.as_deref().and_then(|id_or_name| {
                 let manager = workspace::WorkspaceManager::global(cx);
                 match manager.resolve(id_or_name).log_err().flatten() {
-                    Some(workspace_id) => manager.project_paths(workspace_id).log_err().ok(),
+                    Some(workspace_id) => manager.project_paths(workspace_id).log_err(),
                     None => {
                         // Create-if-absent: adopt the positional roots under this
                         // name so a scripted throw can open by identity before
@@ -895,11 +895,9 @@ fn main() {
                         if paths.is_empty() {
                             None
                         } else {
-                            let workspace_id = manager
-                                .create(id_or_name.to_string(), paths)
-                                .log_err()
-                                .ok()?;
-                            manager.project_paths(workspace_id).log_err().ok()
+                            let workspace_id =
+                                manager.create(id_or_name.to_string(), paths).log_err()?;
+                            manager.project_paths(workspace_id).log_err()
                         }
                     }
                 }
