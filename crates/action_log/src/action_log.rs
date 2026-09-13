@@ -306,21 +306,50 @@ impl ActionLog {
             None
         };
 
+        let mut pending: Option<(ChangeAuthor, text::BufferSnapshot)> = None;
+
         loop {
-            futures::select_biased! {
-                buffer_update = buffer_updates.next() => {
-                    if let Some((author, buffer_snapshot)) = buffer_update {
-                        Self::track_edits(&this, &buffer, author, buffer_snapshot, cx).await?;
-                    } else {
-                        break;
+            // Coalesce consecutive same-author updates so a streaming write (one
+            // update per chunk) doesn't recompute the full diff once per chunk.
+            // We stop at author boundaries so a mixed burst of user and agent
+            // edits is still processed in order, preserving which edits are
+            // folded into the diff base vs. left unreviewed.
+            let Some((author, mut buffer_snapshot)) =
+                pending.take().or_else(|| buffer_updates.try_recv().ok())
+            else {
+                let channel_closed = futures::select_biased! {
+                    buffer_update = buffer_updates.next() => {
+                        if let Some((author, buffer_snapshot)) = buffer_update {
+                            pending = Some((author, buffer_snapshot));
+                            false
+                        } else {
+                            true
+                        }
                     }
+                    _ = git_diff_updates_rx.changed().fuse() => {
+                        if let Some(git_diff) = git_diff.as_ref() {
+                            Self::keep_committed_edits(&this, &buffer, git_diff, cx).await?;
+                        }
+                        false
+                    }
+                };
+
+                if channel_closed {
+                    break;
                 }
-                _ = git_diff_updates_rx.changed().fuse() => {
-                    if let Some(git_diff) = git_diff.as_ref() {
-                        Self::keep_committed_edits(&this, &buffer, git_diff, cx).await?;
-                    }
+                continue;
+            };
+
+            while let Ok((next_author, next_snapshot)) = buffer_updates.try_recv() {
+                if next_author == author {
+                    buffer_snapshot = next_snapshot;
+                } else {
+                    pending = Some((next_author, next_snapshot));
+                    break;
                 }
             }
+
+            Self::track_edits(&this, &buffer, author, buffer_snapshot, cx).await?;
         }
 
         Ok(())
@@ -1253,7 +1282,7 @@ fn point_to_row_edit(edit: Edit<Point>, old_text: &Rope, new_text: &Rope) -> Edi
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 enum ChangeAuthor {
     User,
     Agent,
@@ -3548,5 +3577,112 @@ mod tests {
                 })
                 .collect()
         })
+    }
+
+    // --- Measurement harness for the streaming review-diff lag -----------------
+    //
+    // Not a correctness assertion: this reproduces the "diff panel lags behind
+    // the actual file" symptom during a streaming write_file. The same content
+    // is written two ways — once as a single edit, once as many small streaming
+    // chunks — and we time how long `run_until_parked` takes to drain the
+    // action-log diff queue *after* the buffer is already fully written.
+    //
+    // Run with:
+    //   cargo test -p action_log measure_streaming_diff_lag -- --nocapture
+    //
+    // Tunable via CHUNK_COUNT / LINES_PER_CHUNK env vars.
+
+    async fn new_tracked_created_buffer(
+        cx: &mut TestAppContext,
+    ) -> (Entity<ActionLog>, Entity<Buffer>) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({})).await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+        cx.update(|cx| {
+            action_log.update(cx, |log, cx| log.buffer_created(buffer.clone(), cx));
+        });
+        (action_log, buffer)
+    }
+
+    #[gpui::test]
+    async fn measure_streaming_diff_lag(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let chunk_count = env::var("CHUNK_COUNT")
+            .map(|v| v.parse().expect("invalid `CHUNK_COUNT`"))
+            .unwrap_or(50);
+        let lines_per_chunk = env::var("LINES_PER_CHUNK")
+            .map(|v| v.parse().expect("invalid `LINES_PER_CHUNK`"))
+            .unwrap_or(100);
+
+        let total_lines = chunk_count * lines_per_chunk;
+        let chunk = |i: usize| -> String {
+            let start = i * lines_per_chunk;
+            (0..lines_per_chunk)
+                .map(|j| format!("line {:08} {:04}\n", start + j, j))
+                .collect()
+        };
+
+        // Single-shot: one edit, one diff recompute over the whole buffer.
+        let single_shot = {
+            let (action_log, buffer) = new_tracked_created_buffer(cx).await;
+            let full = (0..chunk_count).map(chunk).collect::<String>();
+            cx.update(|cx| {
+                buffer.update(cx, |buffer, cx| {
+                    buffer.edit([(0..0, full.as_str())], None, cx).unwrap();
+                });
+                action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
+            });
+            let start = std::time::Instant::now();
+            cx.run_until_parked();
+            let elapsed = start.elapsed();
+            let stats = cx.read(|cx| action_log.read(cx).diff_stats(cx));
+            (elapsed, stats.lines_added)
+        };
+
+        // Streaming: the same content split into many chunk edits, one full diff
+        // recompute scheduled per chunk (mirrors apply_char_operations).
+        let streaming = {
+            let (action_log, buffer) = new_tracked_created_buffer(cx).await;
+            for i in 0..chunk_count {
+                let content = chunk(i);
+                cx.update(|cx| {
+                    buffer.update(cx, |buffer, cx| {
+                        let end = buffer.len();
+                        buffer
+                            .edit([(end..end, content.as_str())], None, cx)
+                            .unwrap();
+                    });
+                    action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
+                });
+            }
+            let start = std::time::Instant::now();
+            cx.run_until_parked();
+            let elapsed = start.elapsed();
+            let stats = cx.read(|cx| action_log.read(cx).diff_stats(cx));
+            (elapsed, stats.lines_added)
+        };
+
+        eprintln!(
+            "[diff-lag] chunks={} lines/chunk={} total_lines={}",
+            chunk_count, lines_per_chunk, total_lines
+        );
+        eprintln!("[diff-lag] single-shot (1 edit): {:?}", single_shot.0);
+        eprintln!(
+            "[diff-lag] streaming    ({} chunks): {:?}",
+            chunk_count, streaming.0
+        );
+
+        // Both must converge on the same final diff (all lines added).
+        assert_eq!(single_shot.1 as usize, total_lines);
+        assert_eq!(streaming.1 as usize, total_lines);
     }
 }
