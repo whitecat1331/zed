@@ -13,8 +13,8 @@ use acp_thread::{
     SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason, decode_path_escapes,
 };
 use agent::{
-    SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue, SkillLoadingIssueKind,
-    SkillLoadingIssuesUpdated, ThreadSandbox, VerifiedSandboxStatus,
+    DbQueuedMessage, SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue,
+    SkillLoadingIssueKind, SkillLoadingIssuesUpdated, ThreadSandbox, VerifiedSandboxStatus,
 };
 use agent_settings::UserAgentsMd;
 use agent_skills::MAX_SKILL_DESCRIPTION_LEN;
@@ -2094,6 +2094,7 @@ impl ThreadView {
 
             this.update_in(cx, |this, window, cx| {
                 this.add_to_queue(content, tracked_buffers, window, cx);
+                this.sync_queued_messages_to_native_thread(cx);
                 message_editor.update(cx, |message_editor, cx| {
                     message_editor.clear(window, cx);
                 });
@@ -2201,6 +2202,7 @@ impl ThreadView {
                     entry.content = content;
                     entry.tracked_buffers = tracked_buffers;
                 }
+                this.sync_queued_messages_to_native_thread(cx);
                 cx.notify();
             })?;
 
@@ -2217,6 +2219,7 @@ impl ThreadView {
         let removed = self.message_queue.remove(id);
         if removed.is_some() {
             self.sync_queue_flag_to_native_thread(cx);
+            self.sync_queued_messages_to_native_thread(cx);
         }
         removed
     }
@@ -2224,6 +2227,7 @@ impl ThreadView {
     fn toggle_queue_entry_steer(&mut self, id: QueueEntryId, cx: &mut Context<Self>) {
         self.message_queue.toggle_steer(id);
         self.sync_queue_flag_to_native_thread(cx);
+        self.sync_queued_messages_to_native_thread(cx);
         cx.notify();
     }
 
@@ -2236,6 +2240,55 @@ impl ThreadView {
                 thread.set_end_turn_at_next_boundary(end_at_boundary);
             });
         }
+    }
+
+    fn sync_queued_messages_to_native_thread(&self, cx: &mut Context<Self>) {
+        if let Some(native_thread) = self.as_native_thread(cx) {
+            let queued = self
+                .message_queue
+                .iter()
+                .map(|entry| DbQueuedMessage {
+                    content: entry.content.clone(),
+                    steer: entry.steer,
+                })
+                .collect();
+            native_thread.update(cx, |thread, cx| {
+                thread.set_queued_messages(queued, cx);
+            });
+        }
+    }
+
+    pub fn reload_queue_from_native_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(native_thread) = self.as_native_thread(cx) else {
+            return;
+        };
+        let queued = native_thread.read(cx).queued_messages().to_vec();
+
+        // Only rebuild when the authoritative copy actually differs. A remote
+        // content-only change (e.g. a new message) must not clobber the local
+        // queue's editor focus or in-progress edit.
+        let current: Vec<DbQueuedMessage> = self
+            .message_queue
+            .iter()
+            .map(|entry| DbQueuedMessage {
+                content: entry.content.clone(),
+                steer: entry.steer,
+            })
+            .collect();
+        if current == queued {
+            return;
+        }
+
+        self.message_queue.clear();
+        for message in queued {
+            self.add_to_queue(message.content, Vec::new(), window, cx);
+            if message.steer {
+                if let Some(id) = self.message_queue.last_id() {
+                    self.message_queue.toggle_steer(id);
+                }
+            }
+        }
+        self.sync_queue_flag_to_native_thread(cx);
     }
 
     pub fn send_queued_message_now(
@@ -2260,6 +2313,7 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) {
         self.sync_queue_flag_to_native_thread(cx);
+        self.sync_queued_messages_to_native_thread(cx);
 
         cx.emit(AcpThreadViewEvent::Interacted);
 

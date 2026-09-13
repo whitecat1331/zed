@@ -2738,6 +2738,7 @@ fn run_multi_workspace_sidebar_visual_tests(
                             thinking_effort: None,
                             ui_scroll_position: None,
                             draft_prompt: None,
+                            queued_messages: Vec::new(),
                             sandboxed_terminal_temp_dir: None,
                             sandbox_grants: Default::default(),
                         },

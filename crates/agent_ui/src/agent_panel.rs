@@ -4631,11 +4631,22 @@ impl AgentPanel {
             }
             log::info!("[THREAD_SYNC] surgically reloading stale thread (disk newer than memory)");
 
-            this.update_in(cx, |_this, _window, cx| {
+            this.update_in(cx, |this, window, cx| {
                 // Update the native model in place and replay the converged
                 // content into the existing UI thread (no teardown/rebuild).
-                if let Err(error) = connection.reload_thread_content(session_id, db_thread, cx) {
+                if let Err(error) =
+                    connection.reload_thread_content(session_id.clone(), db_thread, cx)
+                {
                     log::error!("[THREAD_SYNC] surgical reload failed: {error:#}");
+                }
+                // Re-render the send queue from the converged native state.
+                if let Some(thread_view) = this
+                    .active_conversation_view()
+                    .and_then(|view| view.read(cx).thread_view(&session_id))
+                {
+                    thread_view.update(cx, |view, cx| {
+                        view.reload_queue_from_native_thread(window, cx);
+                    });
                 }
             })
             .ok();
@@ -11691,6 +11702,7 @@ mod tests {
             thinking_enabled: false,
             thinking_effort: None,
             draft_prompt: None,
+            queued_messages: Vec::new(),
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Default::default(),
