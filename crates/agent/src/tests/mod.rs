@@ -1484,11 +1484,21 @@ async fn test_debugger_tool_permission_rules_match_resolved_paths(cx: &mut TestA
 
     let tool = debugger_tool_for_thread(&thread, cx);
 
+    // Rules match the resolved absolute path; build it platform-specifically so
+    // the assertion holds on both Unix and Windows.
+    let main_js_rule_path = path!("/test/src/main.js")
+        .replace('\\', "\\\\")
+        .replace('.', "\\.");
+    let confirm_line_3 = format!("path:{main_js_rule_path} line:3");
+    let deny_line_1 = format!("path:{main_js_rule_path} line:1");
+    let deny_run_to_line_5 =
+        format!("action:run_to_line session_id:12 thread_id:34 path:{main_js_rule_path} line:5");
+
     set_debugger_permission_rules(
         cx,
         settings::ToolPermissionMode::Allow,
         &[],
-        &[r"path:/test/src/main\.js line:3"],
+        &[confirm_line_3.as_str()],
     );
     let (event_stream, mut receiver) = ToolCallEventStream::test();
     let task = cx.update(|cx| {
@@ -1525,7 +1535,7 @@ async fn test_debugger_tool_permission_rules_match_resolved_paths(cx: &mut TestA
     set_debugger_permission_rules(
         cx,
         settings::ToolPermissionMode::Allow,
-        &[r"path:/test/src/main\.js line:1"],
+        &[deny_line_1.as_str()],
         &[],
     );
     let (event_stream, _receiver) = ToolCallEventStream::test();
@@ -1554,7 +1564,7 @@ async fn test_debugger_tool_permission_rules_match_resolved_paths(cx: &mut TestA
     set_debugger_permission_rules(
         cx,
         settings::ToolPermissionMode::Allow,
-        &[r"action:run_to_line session_id:12 thread_id:34 path:/test/src/main\.js line:5"],
+        &[deny_run_to_line_5.as_str()],
         &[],
     );
     let (event_stream, _receiver) = ToolCallEventStream::test();
