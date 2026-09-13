@@ -338,14 +338,18 @@ impl ThreadSandboxGrants {
         persistent: &SandboxPermissions,
     ) -> bool {
         if request.unsandboxed {
-            // The persistent `allow_unsandboxed` setting is intentionally not
-            // consulted here: when it's set, sandboxing is removed from the
-            // model-facing surface (the plain `terminal` tool is exposed
-            // instead of the sandboxed one), so the model can't issue an
-            // `unsandboxed: true` request at all. Only a "for this thread"
-            // grant suppresses the re-prompt while the sandboxed tool is
-            // active — see `sandboxing_enabled_for_project`.
-            return self.unsandboxed;
+            // The persistent `allow_unsandboxed` setting covers an
+            // `unsandboxed: true` request too, not just a "for this thread"
+            // grant. For the terminal tool the model-facing surface means this
+            // usually can't happen (setting `allow_unsandboxed` swaps the
+            // sandboxed `terminal` tool for the plain one, so the model has no
+            // `unsandboxed` field to set — see
+            // `sandboxing_enabled_for_project`), but tools like the debugger
+            // issue an `unsandboxed: true` request directly regardless of that
+            // surface. Without consulting the persistent setting here, "Allow
+            // always" on those prompts would be persisted and then ignored,
+            // re-prompting on every run.
+            return self.unsandboxed || persistent.allow_unsandboxed;
         }
         if !self.network_covered(&request.network, persistent) {
             return false;
@@ -1148,16 +1152,17 @@ mod tests {
     }
 
     #[test]
-    fn persistent_allow_unsandboxed_does_not_cover_here() {
-        // The persistent setting is handled by removing the sandboxed tool (see
-        // `sandboxing_enabled_for_project`), not by covering requests, so on
-        // its own it never makes an `unsandboxed: true` request "covered".
+    fn persistent_allow_unsandboxed_covers_unsandboxed_requests() {
+        // Tools that issue an `unsandboxed: true` request directly (the
+        // debugger tool) must be covered by the persistent setting, otherwise
+        // "Allow always" would be persisted and then ignored, re-prompting on
+        // every run.
         let grants = ThreadSandboxGrants::default();
         let persistent = SandboxPermissions {
             allow_unsandboxed: true,
             ..Default::default()
         };
-        assert!(!grants.covers_with_persistent(&unsandboxed_request(), &persistent));
+        assert!(grants.covers_with_persistent(&unsandboxed_request(), &persistent));
     }
 
     #[test]
