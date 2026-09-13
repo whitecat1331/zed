@@ -842,6 +842,16 @@ impl AgentDebuggerApi {
         let dap_store = self.dap_store.clone();
         cx.spawn(async move |cx| {
             let session = session_by_id(&dap_store, session_id, cx)?;
+            let supports_restart = session.read_with(cx, |session, _| {
+                session
+                    .capabilities()
+                    .supports_restart_request
+                    .unwrap_or(false)
+            });
+            if !supports_restart {
+                return Err(anyhow!("debug adapter does not support restart"));
+            }
+
             let mut restart_task = session
                 .update(cx, |session, cx| session.agent_restart(cx))
                 .fuse();
