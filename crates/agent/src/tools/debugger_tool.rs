@@ -90,6 +90,18 @@ pub enum DebuggerOperation {
     Evaluate,
     /// Set the value of a variable in a debug session.
     SetVariable,
+    /// List exception breakpoint filters for a debug session.
+    ListExceptionBreakpoints,
+    /// Enable or disable exception breakpoint filters for a debug session.
+    SetExceptionBreakpoints,
+    /// List data breakpoints for a debug session.
+    ListDataBreakpoints,
+    /// Set data breakpoints on variables in a debug session.
+    SetDataBreakpoints,
+    /// Toggle ignoring all breakpoints for a debug session.
+    SetIgnoreBreakpoints,
+    /// Clear all source breakpoints in the project.
+    ClearBreakpoints,
 }
 
 /// A single debugger operation and the fields it needs.
@@ -152,6 +164,15 @@ pub struct DebuggerToolInput {
     /// New variable value, used by set_variable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+    /// Exception breakpoint filters, used by set_exception_breakpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exception_breakpoints: Option<Vec<ExceptionBreakpointInput>>,
+    /// Data breakpoints, used by set_data_breakpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_breakpoints: Option<Vec<DataBreakpointInput>>,
+    /// Whether to ignore all breakpoints, used by set_ignore_breakpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -216,6 +237,33 @@ pub struct BreakpointLocationInput {
     pub path: PathBuf,
     /// 1-based line number.
     pub line: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct ExceptionBreakpointInput {
+    /// The adapter's exception filter id (from a snapshot or list).
+    pub id: String,
+    /// Whether the filter should be enabled.
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct DataBreakpointInput {
+    /// The variable container reference (a scope or variable's `variables_reference` from a snapshot).
+    pub variables_reference: u64,
+    /// The variable name to set the data breakpoint on.
+    pub name: String,
+    /// Optional access type: "read", "write", or "readWrite".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_type: Option<String>,
+    /// Optional condition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+    /// Optional hit condition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hit_condition: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -701,6 +749,126 @@ impl DebuggerTool {
                     set_variable_result_to_json(result),
                 ))
             }
+            DebuggerOperation::ListExceptionBreakpoints => {
+                let api = cx.update(|cx| self.api(cx));
+                let session_id =
+                    cx.update(|cx| resolve_session_id(&self.project, &api, input.session_id, cx))?;
+                let data = cx.update(|cx| api.list_exception_breakpoints(session_id, cx))?;
+                Ok(success(
+                    operation,
+                    "listed exception breakpoints",
+                    exception_breakpoints_to_json(data),
+                ))
+            }
+            DebuggerOperation::SetExceptionBreakpoints => {
+                self.ensure_write_mode(&operation, cx)?;
+                let breakpoints = input.exception_breakpoints.context(
+                    "exception_breakpoints is required for debugger set_exception_breakpoints",
+                )?;
+                let api = cx.update(|cx| self.api(cx));
+                let session_id =
+                    cx.update(|cx| resolve_session_id(&self.project, &api, input.session_id, cx))?;
+                authorize_debugger_operation(
+                    &event_stream,
+                    "Set debugger exception breakpoint(s)",
+                    exception_breakpoint_permission_inputs(&operation, &breakpoints, session_id),
+                    cx,
+                )
+                .await?;
+                let task = cx.update(|cx| {
+                    api.set_exception_breakpoints(
+                        session_id,
+                        breakpoints.into_iter().map(Into::into).collect(),
+                        cx,
+                    )
+                });
+                let result = task.await?;
+                Ok(success(
+                    operation,
+                    "set exception breakpoint(s)",
+                    exception_breakpoints_to_json(result),
+                ))
+            }
+            DebuggerOperation::ListDataBreakpoints => {
+                let api = cx.update(|cx| self.api(cx));
+                let session_id =
+                    cx.update(|cx| resolve_session_id(&self.project, &api, input.session_id, cx))?;
+                let data = cx.update(|cx| api.list_data_breakpoints(session_id, cx))?;
+                Ok(success(
+                    operation,
+                    "listed data breakpoints",
+                    data_breakpoints_to_json(data),
+                ))
+            }
+            DebuggerOperation::SetDataBreakpoints => {
+                self.ensure_write_mode(&operation, cx)?;
+                let breakpoints = input
+                    .data_breakpoints
+                    .context("data_breakpoints is required for debugger set_data_breakpoints")?;
+                let api = cx.update(|cx| self.api(cx));
+                let session_id =
+                    cx.update(|cx| resolve_session_id(&self.project, &api, input.session_id, cx))?;
+                authorize_debugger_operation(
+                    &event_stream,
+                    "Set debugger data breakpoint(s)",
+                    data_breakpoint_permission_inputs(&operation, &breakpoints, session_id),
+                    cx,
+                )
+                .await?;
+                let task = cx.update(|cx| {
+                    api.set_data_breakpoints(
+                        session_id,
+                        breakpoints.into_iter().map(Into::into).collect(),
+                        cx,
+                    )
+                });
+                let result = task.await?;
+                Ok(success(
+                    operation,
+                    "set data breakpoint(s)",
+                    data_breakpoints_to_json(result),
+                ))
+            }
+            DebuggerOperation::SetIgnoreBreakpoints => {
+                self.ensure_write_mode(&operation, cx)?;
+                let ignore = input
+                    .ignore
+                    .context("ignore is required for debugger set_ignore_breakpoints")?;
+                let api = cx.update(|cx| self.api(cx));
+                let session_id =
+                    cx.update(|cx| resolve_session_id(&self.project, &api, input.session_id, cx))?;
+                authorize_debugger_operation(
+                    &event_stream,
+                    "Set debugger ignore breakpoints",
+                    permission_inputs(
+                        &operation,
+                        [format!("session_id:{} ignore:{}", session_id.0, ignore)],
+                    ),
+                    cx,
+                )
+                .await?;
+                let task = cx.update(|cx| api.set_ignore_breakpoints(session_id, ignore, cx));
+                task.await?;
+                Ok(success(
+                    operation,
+                    "set ignore breakpoints",
+                    json!({ "session_id": session_id.0, "ignore": ignore }),
+                ))
+            }
+            DebuggerOperation::ClearBreakpoints => {
+                self.ensure_write_mode(&operation, cx)?;
+                authorize_debugger_operation(
+                    &event_stream,
+                    "Clear all debugger breakpoints",
+                    permission_inputs(&operation, std::iter::empty()),
+                    cx,
+                )
+                .await?;
+                let api = cx.update(|cx| self.api(cx));
+                let task = cx.update(|cx| api.clear_breakpoints(cx));
+                task.await?;
+                Ok(success(operation, "cleared all breakpoints", json!({})))
+            }
         }
     }
 
@@ -890,6 +1058,27 @@ impl BreakpointInput {
     }
 }
 
+impl From<ExceptionBreakpointInput> for AgentExceptionBreakpointInput {
+    fn from(input: ExceptionBreakpointInput) -> Self {
+        Self {
+            id: input.id,
+            enabled: input.enabled,
+        }
+    }
+}
+
+impl From<DataBreakpointInput> for AgentDataBreakpointInput {
+    fn from(input: DataBreakpointInput) -> Self {
+        Self {
+            variables_reference: input.variables_reference,
+            name: input.name,
+            access_type: input.access_type,
+            condition: input.condition,
+            hit_condition: input.hit_condition,
+        }
+    }
+}
+
 struct ResolvedControlInput {
     session_id: SessionId,
     thread_id: Option<project::debugger::session::ThreadId>,
@@ -1024,6 +1213,43 @@ fn breakpoint_location_permission_inputs<'a>(
                 "path:{} line:{}",
                 breakpoint.path.display(),
                 breakpoint.line
+            )
+        }),
+    )
+}
+
+fn exception_breakpoint_permission_inputs(
+    operation: &str,
+    breakpoints: &[ExceptionBreakpointInput],
+    session_id: SessionId,
+) -> Vec<String> {
+    permission_inputs(
+        operation,
+        breakpoints.iter().map(|breakpoint| {
+            format!(
+                "session_id:{} id:{} enabled:{}",
+                session_id.0, breakpoint.id, breakpoint.enabled
+            )
+        }),
+    )
+}
+
+fn data_breakpoint_permission_inputs(
+    operation: &str,
+    breakpoints: &[DataBreakpointInput],
+    session_id: SessionId,
+) -> Vec<String> {
+    permission_inputs(
+        operation,
+        breakpoints.iter().map(|breakpoint| {
+            format!(
+                "session_id:{} variables_reference:{} name:{} access_type:{} condition:{} hit_condition:{}",
+                session_id.0,
+                breakpoint.variables_reference,
+                breakpoint.name,
+                breakpoint.access_type.as_deref().unwrap_or("none"),
+                breakpoint.condition.as_deref().unwrap_or("none"),
+                breakpoint.hit_condition.as_deref().unwrap_or("none"),
             )
         }),
     )
@@ -1297,6 +1523,12 @@ fn operation_name(input: &DebuggerToolInput) -> &'static str {
         DebuggerOperation::StopSession => "stop_session",
         DebuggerOperation::Evaluate => "evaluate",
         DebuggerOperation::SetVariable => "set_variable",
+        DebuggerOperation::ListExceptionBreakpoints => "list_exception_breakpoints",
+        DebuggerOperation::SetExceptionBreakpoints => "set_exception_breakpoints",
+        DebuggerOperation::ListDataBreakpoints => "list_data_breakpoints",
+        DebuggerOperation::SetDataBreakpoints => "set_data_breakpoints",
+        DebuggerOperation::SetIgnoreBreakpoints => "set_ignore_breakpoints",
+        DebuggerOperation::ClearBreakpoints => "clear_breakpoints",
     }
 }
 
@@ -1381,6 +1613,25 @@ fn initial_title_for_input(input: &DebuggerToolInput) -> SharedString {
             .as_ref()
             .map(|name| format!("Set debugger variable {}", MarkdownInlineCode(name)).into())
             .unwrap_or_else(|| "Set debugger variable".into()),
+        DebuggerOperation::ListExceptionBreakpoints => "List debugger exception breakpoints".into(),
+        DebuggerOperation::SetExceptionBreakpoints => {
+            let count = input
+                .exception_breakpoints
+                .as_deref()
+                .map_or(0, |b| b.len());
+            format!("Set debugger exception breakpoint filters ({count})").into()
+        }
+        DebuggerOperation::ListDataBreakpoints => "List debugger data breakpoints".into(),
+        DebuggerOperation::SetDataBreakpoints => {
+            let count = input.data_breakpoints.as_deref().map_or(0, |b| b.len());
+            format!("Set debugger data breakpoints ({count})").into()
+        }
+        DebuggerOperation::SetIgnoreBreakpoints => match input.ignore {
+            Some(true) => "Ignore all debugger breakpoints".into(),
+            Some(false) => "Stop ignoring debugger breakpoints".into(),
+            None => "Set debugger ignore breakpoints".into(),
+        },
+        DebuggerOperation::ClearBreakpoints => "Clear all debugger breakpoints".into(),
     }
 }
 
@@ -1662,6 +1913,41 @@ fn breakpoint_edit_result_to_json(result: AgentBreakpointEditResult) -> Value {
     })
 }
 
+fn exception_breakpoints_to_json(breakpoints: Vec<AgentExceptionBreakpoint>) -> Value {
+    Value::Array(
+        breakpoints
+            .into_iter()
+            .map(|breakpoint| {
+                json!({
+                    "id": breakpoint.id,
+                    "label": breakpoint.label,
+                    "description": breakpoint.description,
+                    "default": breakpoint.default,
+                    "enabled": breakpoint.enabled,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn data_breakpoints_to_json(breakpoints: Vec<AgentDataBreakpoint>) -> Value {
+    Value::Array(
+        breakpoints
+            .into_iter()
+            .map(|breakpoint| {
+                json!({
+                    "data_id": breakpoint.data_id,
+                    "context": breakpoint.context,
+                    "enabled": breakpoint.enabled,
+                    "access_type": breakpoint.access_type,
+                    "condition": breakpoint.condition,
+                    "hit_condition": breakpoint.hit_condition,
+                })
+            })
+            .collect(),
+    )
+}
+
 fn control_result_to_json(result: AgentDebuggerControlResult) -> Value {
     json!({
         "status": format!("{:?}", result.status).to_lowercase(),
@@ -1919,5 +2205,75 @@ mod tests {
             control_permission_input(&detach),
             "action:detach session_id:7 thread_id:none"
         );
+    }
+
+    #[test]
+    fn exception_breakpoint_permission_inputs_include_id_and_enabled() {
+        let inputs = exception_breakpoint_permission_inputs(
+            "set_exception_breakpoints",
+            &[ExceptionBreakpointInput {
+                id: "uncaught".into(),
+                enabled: true,
+            }],
+            SessionId::from_proto(7),
+        );
+        assert_eq!(
+            inputs,
+            vec!["set_exception_breakpoints session_id:7 id:uncaught enabled:true".to_string()]
+        );
+    }
+
+    #[test]
+    fn data_breakpoint_permission_inputs_include_name_and_access_type() {
+        let inputs = data_breakpoint_permission_inputs(
+            "set_data_breakpoints",
+            &[DataBreakpointInput {
+                variables_reference: 100,
+                name: "a".into(),
+                access_type: Some("write".into()),
+                condition: None,
+                hit_condition: None,
+            }],
+            SessionId::from_proto(7),
+        );
+        assert_eq!(
+            inputs,
+            vec![
+                "set_data_breakpoints session_id:7 variables_reference:100 name:a access_type:write condition:none hit_condition:none"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn debugger_operation_serializes_new_breakpoint_operations() {
+        for (operation, expected) in [
+            (
+                DebuggerOperation::ListExceptionBreakpoints,
+                "list_exception_breakpoints",
+            ),
+            (
+                DebuggerOperation::SetExceptionBreakpoints,
+                "set_exception_breakpoints",
+            ),
+            (
+                DebuggerOperation::ListDataBreakpoints,
+                "list_data_breakpoints",
+            ),
+            (
+                DebuggerOperation::SetDataBreakpoints,
+                "set_data_breakpoints",
+            ),
+            (
+                DebuggerOperation::SetIgnoreBreakpoints,
+                "set_ignore_breakpoints",
+            ),
+            (DebuggerOperation::ClearBreakpoints, "clear_breakpoints"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(operation).unwrap(),
+                Value::String(expected.to_string())
+            );
+        }
     }
 }
