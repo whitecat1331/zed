@@ -886,7 +886,9 @@ fn main() {
                     None => {
                         // Create-if-absent: adopt the positional roots under this
                         // name so a scripted throw can open by identity before
-                        // any managed workspace exists.
+                        // any managed workspace exists. Writes go through the
+                        // async write queue, so adopt in the background and open
+                        // the positional roots now.
                         let paths = args
                             .paths_or_urls
                             .iter()
@@ -895,9 +897,14 @@ fn main() {
                         if paths.is_empty() {
                             None
                         } else {
-                            let workspace_id =
-                                manager.create(id_or_name.to_string(), paths).log_err()?;
-                            manager.project_paths(workspace_id).log_err()
+                            let name = id_or_name.to_string();
+                            let manager = workspace::WorkspaceManager::global(cx);
+                            let paths_for_open = paths.clone();
+                            cx.spawn(async move |_cx| {
+                                manager.create(name, paths).await.log_err();
+                            })
+                            .detach();
+                            Some(paths_for_open)
                         }
                     }
                 }

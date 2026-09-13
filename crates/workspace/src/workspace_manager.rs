@@ -77,6 +77,7 @@ pub struct ManagedWorkspaceProject {
 /// [`WorkspaceDb`] that owns the `managed_workspaces` /
 /// `managed_workspace_projects` tables (distinct from the legacy path-keyed
 /// `workspaces` layout table).
+#[derive(Clone)]
 pub struct WorkspaceManager(WorkspaceDb);
 
 impl std::ops::Deref for WorkspaceManager {
@@ -106,23 +107,31 @@ impl WorkspaceManager {
     }
 
     /// Mint a new managed workspace id and record its membership.
-    pub fn create(&self, name: String, project_paths: Vec<PathBuf>) -> Result<ManagedWorkspaceId> {
+    pub async fn create(
+        &self,
+        name: String,
+        project_paths: Vec<PathBuf>,
+    ) -> Result<ManagedWorkspaceId> {
         let workspace_id = ManagedWorkspaceId::new();
         let now = Utc::now().to_rfc3339();
         let key = workspace_id.to_key_string();
 
-        self.exec_bound::<(&str, &str, &str, &str)>(sql! {
-            INSERT INTO managed_workspaces (workspace_id, name, created_at, updated_at)
-            VALUES (?, ?, ?, ?)
-        })?((key.as_str(), name.as_str(), now.as_str(), now.as_str()))?;
+        self.write(move |connection| -> Result<()> {
+            connection.exec_bound::<(&str, &str, &str, &str)>(sql! {
+                INSERT INTO managed_workspaces (workspace_id, name, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+            })?((key.as_str(), name.as_str(), now.as_str(), now.as_str()))?;
 
-        for (position, path) in project_paths.into_iter().enumerate() {
-            let path = path.to_string_lossy().into_owned();
-            self.exec_bound::<(&str, &str, i64)>(sql! {
-                INSERT INTO managed_workspace_projects (workspace_id, path, position)
-                VALUES (?, ?, ?)
-            })?((key.as_str(), path.as_str(), position as i64))?;
-        }
+            for (position, path) in project_paths.into_iter().enumerate() {
+                let path = path.to_string_lossy().into_owned();
+                connection.exec_bound::<(&str, &str, i64)>(sql! {
+                    INSERT INTO managed_workspace_projects (workspace_id, path, position)
+                    VALUES (?, ?, ?)
+                })?((key.as_str(), path.as_str(), position as i64))?;
+            }
+            Ok(())
+        })
+        .await?;
 
         Ok(workspace_id)
     }
