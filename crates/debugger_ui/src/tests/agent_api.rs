@@ -4,15 +4,17 @@ use dap::{
     ErrorResponse, Message, Scope, StackFrame, Variable,
     adapters::DebugTaskDefinition,
     requests::{
-        Attach, Continue, Disconnect, Evaluate, Initialize, Restart, RestartFrame, Scopes,
-        SetBreakpoints, SetVariable, StackTrace, StepBack, Threads, Variables,
+        Attach, Continue, DataBreakpointInfo, Disconnect, Evaluate, Initialize, Restart,
+        RestartFrame, Scopes, SetBreakpoints, SetDataBreakpoints, SetVariable, StackTrace,
+        StepBack, Threads, Variables,
     },
 };
 use gpui::{BackgroundExecutor, TestAppContext};
 use project::debugger::{
     agent_api::{
-        AgentDebuggerApi, AgentDebuggerSessionStatus, AgentDebuggerSnapshotLimits,
-        AgentDebuggerStepKind, AgentDebuggerThreadStatus, AgentSourceBreakpointInput,
+        AgentDataBreakpointInput, AgentDebuggerApi, AgentDebuggerSessionStatus,
+        AgentDebuggerSnapshotLimits, AgentDebuggerStepKind, AgentDebuggerThreadStatus,
+        AgentExceptionBreakpointInput, AgentSourceBreakpointInput,
     },
     session::ThreadId,
 };
@@ -1269,10 +1271,7 @@ async fn test_agent_api_restart_rejects_when_unsupported(
 }
 
 #[gpui::test]
-async fn test_agent_api_restart_stack_frame(
-    executor: BackgroundExecutor,
-    cx: &mut TestAppContext,
-) {
+async fn test_agent_api_restart_stack_frame(executor: BackgroundExecutor, cx: &mut TestAppContext) {
     init_test(cx);
 
     let fs = FakeFs::new(executor.clone());
@@ -1432,4 +1431,328 @@ async fn test_agent_api_detach_rejects_when_not_attached(
         error.to_string().contains("not attached"),
         "unexpected error: {error}"
     );
+}
+
+#[gpui::test]
+async fn test_agent_api_exception_breakpoints(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let session = start_debug_session(&workspace, cx, move |client| {
+        client.on_request::<Initialize, _>(move |_, _| {
+            Ok(dap::Capabilities {
+                exception_breakpoint_filters: Some(vec![dap::ExceptionBreakpointsFilter {
+                    filter: "uncaught".into(),
+                    label: "Uncaught Exceptions".into(),
+                    description: None,
+                    default: Some(false),
+                    supports_condition: None,
+                    condition_description: None,
+                }]),
+                ..Default::default()
+            })
+        });
+    })
+    .unwrap();
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+
+    // The advertised filter is surfaced, disabled by default.
+    let breakpoints = cx
+        .update(|cx| api.list_exception_breakpoints(session_id, cx))
+        .unwrap();
+    assert_eq!(breakpoints.len(), 1);
+    assert_eq!(breakpoints[0].id, "uncaught");
+    assert_eq!(breakpoints[0].label, "Uncaught Exceptions");
+    assert!(!breakpoints[0].enabled);
+
+    // Enabling is an idempotent set, not a toggle.
+    let result = cx
+        .update(|cx| {
+            api.set_exception_breakpoints(
+                session_id,
+                vec![AgentExceptionBreakpointInput {
+                    id: "uncaught".into(),
+                    enabled: true,
+                }],
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.len(), 1);
+    assert!(result[0].enabled);
+
+    // Setting an unknown filter fails with a clear error.
+    let error = cx
+        .update(|cx| {
+            api.set_exception_breakpoints(
+                session_id,
+                vec![AgentExceptionBreakpointInput {
+                    id: "missing".into(),
+                    enabled: true,
+                }],
+                cx,
+            )
+        })
+        .await
+        .expect_err("setting an unknown filter should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("unknown exception breakpoint filter"),
+        "unexpected error: {error}"
+    );
+}
+
+#[gpui::test]
+async fn test_agent_api_exception_breakpoints_reject_when_unsupported(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let session = start_debug_session(&workspace, cx, |_| {}).unwrap();
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+    let error = cx
+        .update(|cx| {
+            api.set_exception_breakpoints(
+                session_id,
+                vec![AgentExceptionBreakpointInput {
+                    id: "uncaught".into(),
+                    enabled: true,
+                }],
+                cx,
+            )
+        })
+        .await
+        .expect_err("setting exception breakpoints should fail when unsupported");
+
+    assert!(
+        error.to_string().contains("does not support"),
+        "unexpected error: {error}"
+    );
+}
+
+#[gpui::test]
+async fn test_agent_api_data_breakpoints(executor: BackgroundExecutor, cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let set_data_received = Arc::new(Mutex::new(Vec::new()));
+    let session = start_debug_session(&workspace, cx, {
+        let set_data_received = set_data_received.clone();
+        move |client| {
+            client.on_request::<Initialize, _>(move |_, _| {
+                Ok(dap::Capabilities {
+                    supports_data_breakpoints: Some(true),
+                    ..Default::default()
+                })
+            });
+            client.on_request::<DataBreakpointInfo, _>(move |_, args| {
+                assert_eq!(args.variables_reference, Some(100));
+                assert_eq!(args.name, "a");
+                Ok(dap::DataBreakpointInfoResponse {
+                    data_id: Some("data-1".into()),
+                    description: "a".into(),
+                    access_types: None,
+                    can_persist: None,
+                })
+            });
+            client.on_request::<SetDataBreakpoints, _>({
+                let set_data_received = set_data_received.clone();
+                move |_, args| {
+                    *set_data_received.lock().unwrap() = args.breakpoints.clone();
+                    Ok(dap::SetDataBreakpointsResponse {
+                        breakpoints: vec![],
+                    })
+                }
+            });
+        }
+    })
+    .unwrap();
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+    let result = cx
+        .update(|cx| {
+            api.set_data_breakpoints(
+                session_id,
+                vec![AgentDataBreakpointInput {
+                    variables_reference: 100,
+                    name: "a".into(),
+                    access_type: Some("write".into()),
+                    condition: None,
+                    hit_condition: None,
+                }],
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].data_id, "data-1");
+    assert_eq!(result[0].access_type.as_deref(), Some("write"));
+    assert!(result[0].enabled);
+
+    cx.run_until_parked();
+    let sent = set_data_received.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].data_id, "data-1");
+    assert_eq!(
+        sent[0].access_type,
+        Some(dap::DataBreakpointAccessType::Write)
+    );
+}
+
+#[gpui::test]
+async fn test_agent_api_data_breakpoints_reject_when_unsupported(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let session = start_debug_session(&workspace, cx, |_| {}).unwrap();
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+    let error = cx
+        .update(|cx| {
+            api.set_data_breakpoints(
+                session_id,
+                vec![AgentDataBreakpointInput {
+                    variables_reference: 100,
+                    name: "a".into(),
+                    access_type: None,
+                    condition: None,
+                    hit_condition: None,
+                }],
+                cx,
+            )
+        })
+        .await
+        .expect_err("setting data breakpoints should fail when unsupported");
+
+    assert!(
+        error.to_string().contains("does not support"),
+        "unexpected error: {error}"
+    );
+}
+
+#[gpui::test]
+async fn test_agent_api_set_ignore_breakpoints(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let session = start_debug_session(&workspace, cx, |_| {}).unwrap();
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+    cx.update(|cx| api.set_ignore_breakpoints(session_id, true, cx))
+        .await
+        .unwrap();
+    assert!(session.read_with(cx, |session, _| session.ignore_breakpoints()));
+
+    cx.update(|cx| api.set_ignore_breakpoints(session_id, false, cx))
+        .await
+        .unwrap();
+    assert!(!session.read_with(cx, |session, _| session.ignore_breakpoints()));
+}
+
+#[gpui::test]
+async fn test_agent_api_clear_breakpoints(executor: BackgroundExecutor, cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({
+            "src": {
+                "main.js": "let a = 1;\nlet b = 2;\nlet c = 3;\n",
+            }
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let api = agent_api(&project, cx);
+    let path = PathBuf::from(path!("/project/src/main.js"));
+
+    let input = AgentSourceBreakpointInput {
+        path: path.clone(),
+        line: 2,
+        enabled: true,
+        condition: None,
+        hit_condition: None,
+        log_message: None,
+    };
+    cx.update(|cx| api.set_source_breakpoint(input, cx))
+        .await
+        .unwrap();
+    assert_eq!(cx.update(|cx| api.list_breakpoints(cx)).len(), 1);
+
+    cx.update(|cx| api.clear_breakpoints(cx)).await.unwrap();
+    assert_eq!(cx.update(|cx| api.list_breakpoints(cx)).len(), 0);
 }
