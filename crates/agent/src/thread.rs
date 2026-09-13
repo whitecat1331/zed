@@ -2063,8 +2063,16 @@ impl Thread {
         self.draft_prompt.as_deref()
     }
 
-    pub fn set_draft_prompt(&mut self, prompt: Option<Vec<acp::ContentBlock>>) {
-        self.draft_prompt = prompt;
+    pub fn set_draft_prompt(
+        &mut self,
+        prompt: Option<Vec<acp::ContentBlock>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.draft_prompt != prompt {
+            self.draft_prompt = prompt;
+            self.updated_at = Utc::now();
+            cx.notify();
+        }
     }
 
     pub fn queued_messages(&self) -> &[DbQueuedMessage] {

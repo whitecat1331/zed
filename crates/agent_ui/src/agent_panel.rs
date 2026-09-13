@@ -4639,13 +4639,15 @@ impl AgentPanel {
                 {
                     log::error!("[THREAD_SYNC] surgical reload failed: {error:#}");
                 }
-                // Re-render the send queue from the converged native state.
+                // Re-render the send queue and unsent draft from the converged
+                // native state.
                 if let Some(thread_view) = this
                     .active_conversation_view()
                     .and_then(|view| view.read(cx).thread_view(&session_id))
                 {
                     thread_view.update(cx, |view, cx| {
                         view.reload_queue_from_native_thread(window, cx);
+                        view.reload_draft_prompt_from_native_thread(window, cx);
                     });
                 }
             })

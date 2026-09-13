@@ -2291,6 +2291,49 @@ impl ThreadView {
         self.sync_queue_flag_to_native_thread(cx);
     }
 
+    /// Converges the input editor (and the UI thread's draft prompt) to the
+    /// authoritative unsent draft persisted by another instance. Called from the
+    /// cross-instance reload path so a draft typed elsewhere shows up here and is
+    /// not clobbered by the next local save.
+    pub fn reload_draft_prompt_from_native_thread(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(native_thread) = self.as_native_thread(cx) else {
+            return;
+        };
+        let draft = native_thread
+            .read(cx)
+            .draft_prompt()
+            .map(|blocks| blocks.to_vec());
+
+        // Skip when the local draft already matches, so a remote content-only
+        // change never resets the input editor's focus or cursor mid-typing.
+        if self.thread.read(cx).draft_prompt().map(|p| p.to_vec()) == draft {
+            return;
+        }
+
+        // Update the UI thread first so any save triggered by the editor observer
+        // below reads back the converged value, not a stale local draft.
+        self.thread.update(cx, |thread, cx| {
+            thread.set_draft_prompt(draft.clone(), cx);
+        });
+
+        match draft {
+            Some(blocks) => {
+                self.message_editor.update(cx, |editor, cx| {
+                    editor.set_message(blocks, window, cx);
+                });
+            }
+            None => {
+                self.message_editor.update(cx, |editor, cx| {
+                    editor.clear(window, cx);
+                });
+            }
+        }
+    }
+
     pub fn send_queued_message_now(
         &mut self,
         id: QueueEntryId,

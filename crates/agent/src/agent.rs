@@ -2010,7 +2010,7 @@ impl NativeAgent {
         );
         let id = session.thread.read(cx).id().clone();
         let db_thread = session.thread.update(cx, |thread, cx| {
-            thread.set_draft_prompt(draft_prompt);
+            thread.set_draft_prompt(draft_prompt, cx);
             thread.to_db(cx)
         });
         Some((id, folder_paths, db_thread))
