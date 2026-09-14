@@ -4,8 +4,8 @@ use dap::{
     ErrorResponse, Message, Scope, StackFrame, Variable,
     adapters::DebugTaskDefinition,
     requests::{
-        Attach, Continue, DataBreakpointInfo, Disconnect, Evaluate, Initialize, Restart,
-        RestartFrame, Scopes, SetBreakpoints, SetDataBreakpoints, SetVariable, StackTrace,
+        Attach, Continue, DataBreakpointInfo, Disconnect, Evaluate, Initialize, ReadMemory,
+        Restart, RestartFrame, Scopes, SetBreakpoints, SetDataBreakpoints, SetVariable, StackTrace,
         StepBack, Threads, Variables,
     },
 };
@@ -1064,6 +1064,182 @@ async fn test_agent_api_set_variable_rejects_when_unsupported(
 
     assert!(
         error.to_string().contains("does not support"),
+        "unexpected error: {error}"
+    );
+}
+
+#[gpui::test]
+async fn test_agent_api_read_memory(executor: BackgroundExecutor, cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let session = start_debug_session(&workspace, cx, |client| {
+        client.on_request::<Initialize, _>(move |_, _| {
+            Ok(dap::Capabilities {
+                supports_read_memory_request: Some(true),
+                ..Default::default()
+            })
+        });
+        client.on_request::<ReadMemory, _>(move |_, args| {
+            assert_eq!(args.memory_reference, "0x1000");
+            assert_eq!(args.count, 4);
+            Ok(dap::ReadMemoryResponse {
+                address: "0x1000".into(),
+                unreadable_bytes: None,
+                data: Some("AQIDBA==".into()),
+            })
+        });
+    })
+    .unwrap();
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+    let result = cx
+        .update(|cx| api.read_memory(session_id, "0x1000".into(), None, 4, cx))
+        .await
+        .unwrap();
+
+    assert_eq!(result.address, "0x1000");
+    assert_eq!(result.byte_count, 4);
+    assert_eq!(result.unreadable_bytes, None);
+    assert_eq!(result.content, "AQIDBA==");
+}
+
+#[gpui::test]
+async fn test_agent_api_read_memory_rejects_when_unsupported(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let session = start_debug_session(&workspace, cx, |_| {}).unwrap();
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+
+    cx.run_until_parked();
+
+    // The fake adapter advertises no capabilities, so `read_memory` must fail
+    // fast with a clear unsupported-capability error rather than sending a
+    // `readMemory` request.
+    let api = agent_api(&project, cx);
+    let error = cx
+        .update(|cx| api.read_memory(session_id, "0x1000".into(), None, 4, cx))
+        .await
+        .expect_err("read_memory should fail when the adapter lacks support");
+
+    assert!(
+        error.to_string().contains("does not support"),
+        "unexpected error: {error}"
+    );
+}
+
+#[gpui::test]
+async fn test_agent_api_watch_expressions(executor: BackgroundExecutor, cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let session = start_debug_session(&workspace, cx, |client| {
+        client.on_request::<Evaluate, _>(move |_, args| {
+            Ok(dap::EvaluateResponse {
+                result: args.expression.clone(),
+                type_: Some("int".into()),
+                presentation_hint: None,
+                variables_reference: 0,
+                named_variables: None,
+                indexed_variables: None,
+                memory_reference: None,
+                value_location_reference: None,
+            })
+        });
+    })
+    .unwrap();
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+
+    cx.update(|cx| api.add_watch_expression(session_id, "a + b".into(), None, cx))
+        .await
+        .unwrap();
+
+    let expressions = cx
+        .update(|cx| api.list_watch_expressions(session_id, cx))
+        .unwrap();
+    assert_eq!(expressions.len(), 1);
+    assert_eq!(expressions[0].expression, "a + b");
+    assert_eq!(expressions[0].value, "a + b");
+    assert_eq!(expressions[0].variables_reference, 0);
+
+    cx.update(|cx| api.remove_watch_expression(session_id, "a + b".into(), cx))
+        .await
+        .unwrap();
+    let expressions = cx
+        .update(|cx| api.list_watch_expressions(session_id, cx))
+        .unwrap();
+    assert!(expressions.is_empty());
+}
+
+#[gpui::test]
+async fn test_agent_api_select_history_out_of_bounds(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let session = start_debug_session(&workspace, cx, |_| {}).unwrap();
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+
+    // A fresh session has no historic snapshots.
+    let history = cx.update(|cx| api.list_history(session_id, cx)).unwrap();
+    assert!(history.is_empty());
+
+    // Selecting any index is therefore out of bounds.
+    let error = cx
+        .update(|cx| api.select_history(session_id, 0, cx))
+        .await
+        .expect_err("select_history should fail when history is empty");
+    assert!(
+        error.to_string().contains("out of bounds"),
         "unexpected error: {error}"
     );
 }
