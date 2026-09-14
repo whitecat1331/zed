@@ -674,7 +674,7 @@ pub fn init(
              _window: &mut Window,
              cx: &mut Context<Workspace>| {
                 thread_metadata_store::ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-                    store.reload(cx);
+                    let _ = store.reload(cx);
                 });
             },
         );
