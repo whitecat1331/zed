@@ -667,6 +667,21 @@ impl ThreadMetadataStore {
                     return;
                 };
 
+                let session_ids: Vec<String> = rows
+                    .iter()
+                    .filter_map(|row| row.session_id.as_ref().map(|s| s.0.to_string()))
+                    .collect();
+                log::info!(
+                    "[SYNC] sidebar metadata reload: {} rows, {} session_ids: {}",
+                    rows.len(),
+                    session_ids.len(),
+                    session_ids
+                        .into_iter()
+                        .take(10)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+
                 this.update(cx, |this, cx| {
                     this.threads.clear();
                     this.threads_by_paths.clear();
