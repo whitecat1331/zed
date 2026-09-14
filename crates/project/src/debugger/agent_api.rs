@@ -5,6 +5,7 @@ use super::{
     session::{OutputToken, Session, SessionEvent, SessionStateEvent, ThreadId, ThreadStatus},
 };
 use anyhow::{Context as _, Result, anyhow};
+use base64::Engine as _;
 use dap::{
     EvaluateArgumentsContext, StackFrameId, StackFramePresentationHint, SteppingGranularity,
     VariableReference, client::SessionId,
@@ -244,6 +245,27 @@ pub struct AgentDebuggerSetVariableResult {
     pub value: String,
     pub type_name: Option<String>,
     pub variables_reference: Option<VariableReference>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentMemoryRead {
+    pub address: String,
+    pub unreadable_bytes: Option<u64>,
+    pub content: String,
+    pub byte_count: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentDebuggerHistoryEntry {
+    pub index: usize,
+    pub thread_count: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentWatchExpression {
+    pub expression: String,
+    pub value: String,
+    pub variables_reference: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -819,6 +841,137 @@ impl AgentDebuggerApi {
                 type_name: response.type_,
                 variables_reference: response.variables_reference,
             })
+        })
+    }
+
+    pub fn read_memory(
+        &self,
+        session_id: SessionId,
+        memory_reference: String,
+        offset: Option<u64>,
+        count: u64,
+        cx: &mut App,
+    ) -> Task<Result<AgentMemoryRead>> {
+        let dap_store = self.dap_store.clone();
+        cx.spawn(async move |cx| {
+            let session = session_by_id(&dap_store, session_id, cx)?;
+            let response = session
+                .update(cx, |session, cx| {
+                    session.agent_read_memory(memory_reference, offset, count, cx)
+                })
+                .await?;
+            let content =
+                base64::engine::general_purpose::STANDARD.encode(response.content.as_ref());
+            Ok(AgentMemoryRead {
+                address: response.address.to_string(),
+                unreadable_bytes: response.unreadable_bytes,
+                byte_count: response.content.len(),
+                content,
+            })
+        })
+    }
+
+    pub fn list_history(
+        &self,
+        session_id: SessionId,
+        cx: &App,
+    ) -> Result<Vec<AgentDebuggerHistoryEntry>> {
+        let session = self
+            .dap_store
+            .read(cx)
+            .session_by_id(session_id)
+            .with_context(|| format!("Could not find debugger session {:?}", session_id))?;
+        Ok(session.read_with(cx, |session, _| {
+            session
+                .historic_snapshots()
+                .iter()
+                .enumerate()
+                .map(|(index, snapshot)| AgentDebuggerHistoryEntry {
+                    index,
+                    thread_count: snapshot.thread_count(),
+                })
+                .collect()
+        }))
+    }
+
+    pub fn select_history(
+        &self,
+        session_id: SessionId,
+        index: usize,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let dap_store = self.dap_store.clone();
+        cx.spawn(async move |cx| {
+            let session = session_by_id(&dap_store, session_id, cx)?;
+            let history_len =
+                session.read_with(cx, |session, _| session.historic_snapshots().len());
+            if index >= history_len {
+                return Err(anyhow!(
+                    "history index {index} is out of bounds (history has {history_len} entries)"
+                ));
+            }
+            session.update(cx, |session, cx| {
+                session.select_historic_snapshot(Some(index), cx);
+            });
+            Ok(())
+        })
+    }
+
+    pub fn list_watch_expressions(
+        &self,
+        session_id: SessionId,
+        cx: &App,
+    ) -> Result<Vec<AgentWatchExpression>> {
+        let session = self
+            .dap_store
+            .read(cx)
+            .session_by_id(session_id)
+            .with_context(|| format!("Could not find debugger session {:?}", session_id))?;
+        Ok(session.read_with(cx, |session, _| {
+            session
+                .watchers()
+                .values()
+                .map(|watch| AgentWatchExpression {
+                    expression: watch.expression.to_string(),
+                    value: watch.value.to_string(),
+                    variables_reference: watch.variables_reference,
+                })
+                .collect()
+        }))
+    }
+
+    pub fn add_watch_expression(
+        &self,
+        session_id: SessionId,
+        expression: String,
+        frame_id: Option<u64>,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let dap_store = self.dap_store.clone();
+        cx.spawn(async move |cx| {
+            let session = session_by_id(&dap_store, session_id, cx)?;
+            session
+                .update(cx, |session, cx| {
+                    session.agent_add_watcher(expression, frame_id, cx)
+                })
+                .await?;
+            Ok(())
+        })
+    }
+
+    pub fn remove_watch_expression(
+        &self,
+        session_id: SessionId,
+        expression: String,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let dap_store = self.dap_store.clone();
+        cx.spawn(async move |cx| {
+            let session = session_by_id(&dap_store, session_id, cx)?;
+            session.update(cx, |session, _| {
+                session.remove_watcher(expression.into());
+            });
+            Ok(())
         })
     }
 

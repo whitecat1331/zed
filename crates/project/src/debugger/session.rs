@@ -11,7 +11,7 @@ use super::dap_command::{
 };
 use super::dap_store::DapStore;
 use crate::debugger::breakpoint_store::BreakpointSessionState;
-use crate::debugger::dap_command::{DataBreakpointContext, ReadMemory};
+use crate::debugger::dap_command::{DataBreakpointContext, ReadMemory, ReadMemoryResponse};
 use crate::debugger::memory::{self, Memory, MemoryIterator, MemoryPageBuilder, PageAddress};
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine;
@@ -699,6 +699,12 @@ pub struct SessionSnapshot {
     locations: HashMap<u64, dap::LocationsResponse>,
     modules: Vec<dap::Module>,
     loaded_sources: Vec<dap::Source>,
+}
+
+impl SessionSnapshot {
+    pub fn thread_count(&self) -> usize {
+        self.threads.len()
+    }
 }
 
 type IsEnabled = bool;
@@ -2011,6 +2017,29 @@ impl Session {
         self.memory.memory_range(range)
     }
 
+    pub(crate) fn agent_read_memory(
+        &mut self,
+        memory_reference: String,
+        offset: Option<u64>,
+        count: u64,
+        _cx: &mut Context<Self>,
+    ) -> Task<Result<ReadMemoryResponse>> {
+        if !self
+            .capabilities
+            .supports_read_memory_request
+            .unwrap_or_default()
+        {
+            return Task::ready(Err(anyhow!(
+                "debug adapter does not support reading memory"
+            )));
+        }
+        self.state.request_dap(ReadMemory {
+            memory_reference,
+            offset,
+            count,
+        })
+    }
+
     fn read_single_page_memory(&mut self, page_start: PageAddress, cx: &mut Context<Self>) {
         _ = maybe!({
             let builder = self.memory.build_page(page_start)?;
@@ -2646,9 +2675,7 @@ impl Session {
         }
 
         let Some((_, is_enabled)) = self.exception_breakpoints.get_mut(id) else {
-            return Task::ready(Err(anyhow!(
-                "unknown exception breakpoint filter {id:?}"
-            )));
+            return Task::ready(Err(anyhow!("unknown exception breakpoint filter {id:?}")));
         };
 
         if *is_enabled != enabled {
@@ -3170,6 +3197,38 @@ impl Session {
             let response = request.await?;
 
             this.update(cx, |session, cx| {
+                session.watchers.insert(
+                    expression.clone(),
+                    Watcher {
+                        expression,
+                        value: response.result.into(),
+                        variables_reference: response.variables_reference,
+                        presentation_hint: response.presentation_hint,
+                    },
+                );
+                cx.emit(SessionEvent::Watchers);
+            })
+        })
+    }
+
+    pub(crate) fn agent_add_watcher(
+        &mut self,
+        expression: String,
+        frame_id: Option<u64>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let request = self.state.request_dap(EvaluateCommand {
+            expression: expression.clone(),
+            context: Some(EvaluateArgumentsContext::Watch),
+            frame_id,
+            source: None,
+        });
+
+        cx.spawn(async move |this, cx| {
+            let response = request.await?;
+
+            this.update(cx, |session, cx| {
+                let expression = SharedString::from(expression.clone());
                 session.watchers.insert(
                     expression.clone(),
                     Watcher {
