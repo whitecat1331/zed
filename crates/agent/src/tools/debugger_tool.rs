@@ -102,6 +102,18 @@ pub enum DebuggerOperation {
     SetIgnoreBreakpoints,
     /// Clear all source breakpoints in the project.
     ClearBreakpoints,
+    /// Read raw memory from a debug session.
+    ReadMemory,
+    /// List historic debug session snapshots.
+    ListHistory,
+    /// Select a historic debug session snapshot.
+    SelectHistory,
+    /// List watch expressions for a debug session.
+    ListWatchExpressions,
+    /// Add a watch expression to a debug session.
+    AddWatchExpression,
+    /// Remove a watch expression from a debug session.
+    RemoveWatchExpression,
 }
 
 /// A single debugger operation and the fields it needs.
@@ -173,6 +185,18 @@ pub struct DebuggerToolInput {
     /// Whether to ignore all breakpoints, used by set_ignore_breakpoints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignore: Option<bool>,
+    /// Memory reference for read_memory (e.g. "0x1000").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_reference: Option<String>,
+    /// Byte offset into the memory reference, used by read_memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    /// Number of bytes to read, used by read_memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+    /// History snapshot index, used by select_history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -869,6 +893,144 @@ impl DebuggerTool {
                 task.await?;
                 Ok(success(operation, "cleared all breakpoints", json!({})))
             }
+            DebuggerOperation::ReadMemory => {
+                let memory_reference = input
+                    .memory_reference
+                    .context("memory_reference is required for debugger read_memory")?;
+                let count = input
+                    .count
+                    .context("count is required for debugger read_memory")?;
+                let api = cx.update(|cx| self.api(cx));
+                let session_id =
+                    cx.update(|cx| resolve_session_id(&self.project, &api, input.session_id, cx))?;
+                authorize_debugger_operation(
+                    &event_stream,
+                    "Read debug session memory",
+                    read_memory_permission_inputs(
+                        &operation,
+                        session_id,
+                        &memory_reference,
+                        input.offset,
+                        count,
+                    ),
+                    cx,
+                )
+                .await?;
+                let task = cx.update(|cx| {
+                    api.read_memory(session_id, memory_reference, input.offset, count, cx)
+                });
+                let result = task.await?;
+                Ok(success(
+                    operation,
+                    "read debug session memory",
+                    memory_read_to_json(result),
+                ))
+            }
+            DebuggerOperation::ListHistory => {
+                let api = cx.update(|cx| self.api(cx));
+                let session_id =
+                    cx.update(|cx| resolve_session_id(&self.project, &api, input.session_id, cx))?;
+                let data = cx.update(|cx| api.list_history(session_id, cx))?;
+                Ok(success(
+                    operation,
+                    "listed debug session history",
+                    history_to_json(data),
+                ))
+            }
+            DebuggerOperation::SelectHistory => {
+                self.ensure_write_mode(&operation, cx)?;
+                let index = input
+                    .index
+                    .context("index is required for debugger select_history")?;
+                let api = cx.update(|cx| self.api(cx));
+                let session_id =
+                    cx.update(|cx| resolve_session_id(&self.project, &api, input.session_id, cx))?;
+                authorize_debugger_operation(
+                    &event_stream,
+                    "Select debug session history snapshot",
+                    select_history_permission_inputs(&operation, session_id, index),
+                    cx,
+                )
+                .await?;
+                let task = cx.update(|cx| api.select_history(session_id, index, cx));
+                task.await?;
+                Ok(success(
+                    operation,
+                    "selected debug session history snapshot",
+                    json!({ "session_id": session_id.0, "index": index }),
+                ))
+            }
+            DebuggerOperation::ListWatchExpressions => {
+                let api = cx.update(|cx| self.api(cx));
+                let session_id =
+                    cx.update(|cx| resolve_session_id(&self.project, &api, input.session_id, cx))?;
+                let data = cx.update(|cx| api.list_watch_expressions(session_id, cx))?;
+                Ok(success(
+                    operation,
+                    "listed watch expressions",
+                    watch_expressions_to_json(data),
+                ))
+            }
+            DebuggerOperation::AddWatchExpression => {
+                self.ensure_write_mode(&operation, cx)?;
+                let expression = input
+                    .expression
+                    .context("expression is required for debugger add_watch_expression")?;
+                let frame_id = input.frame_id;
+                let api = cx.update(|cx| self.api(cx));
+                let session_id =
+                    cx.update(|cx| resolve_session_id(&self.project, &api, input.session_id, cx))?;
+                authorize_debugger_operation(
+                    &event_stream,
+                    format!(
+                        "Add debugger watch expression {}",
+                        MarkdownInlineCode(&expression)
+                    ),
+                    add_watch_expression_permission_inputs(
+                        &operation,
+                        session_id,
+                        &expression,
+                        frame_id,
+                    )?,
+                    cx,
+                )
+                .await?;
+                let _guard = api.acquire_agent_control(session_id, cx)?;
+                let task =
+                    cx.update(|cx| api.add_watch_expression(session_id, expression, frame_id, cx));
+                task.await?;
+                Ok(success(
+                    operation,
+                    "added watch expression",
+                    json!({ "session_id": session_id.0 }),
+                ))
+            }
+            DebuggerOperation::RemoveWatchExpression => {
+                self.ensure_write_mode(&operation, cx)?;
+                let expression = input
+                    .expression
+                    .context("expression is required for debugger remove_watch_expression")?;
+                let api = cx.update(|cx| self.api(cx));
+                let session_id =
+                    cx.update(|cx| resolve_session_id(&self.project, &api, input.session_id, cx))?;
+                authorize_debugger_operation(
+                    &event_stream,
+                    format!(
+                        "Remove debugger watch expression {}",
+                        MarkdownInlineCode(&expression)
+                    ),
+                    remove_watch_expression_permission_inputs(&operation, session_id, &expression)?,
+                    cx,
+                )
+                .await?;
+                let task = cx.update(|cx| api.remove_watch_expression(session_id, expression, cx));
+                task.await?;
+                Ok(success(
+                    operation,
+                    "removed watch expression",
+                    json!({ "session_id": session_id.0 }),
+                ))
+            }
         }
     }
 
@@ -1327,6 +1489,70 @@ fn set_variable_permission_inputs(
     ))
 }
 
+fn read_memory_permission_inputs(
+    operation: &str,
+    session_id: SessionId,
+    memory_reference: &str,
+    offset: Option<u64>,
+    count: u64,
+) -> Vec<String> {
+    let offset = offset
+        .map(|offset| offset.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    permission_inputs(
+        operation,
+        [format!(
+            "session_id:{} memory_reference:{} offset:{} count:{}",
+            session_id.0, memory_reference, offset, count
+        )],
+    )
+}
+
+fn select_history_permission_inputs(
+    operation: &str,
+    session_id: SessionId,
+    index: usize,
+) -> Vec<String> {
+    permission_inputs(
+        operation,
+        [format!("session_id:{} index:{}", session_id.0, index)],
+    )
+}
+
+fn add_watch_expression_permission_inputs(
+    operation: &str,
+    session_id: SessionId,
+    expression: &str,
+    frame_id: Option<u64>,
+) -> Result<Vec<String>> {
+    let expression = permission_value_to_string(&expression, "add_watch_expression expression")?;
+    let frame_id = frame_id
+        .map(|frame_id| frame_id.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    Ok(permission_inputs(
+        operation,
+        [format!(
+            "session_id:{} expression:{} frame_id:{}",
+            session_id.0, expression, frame_id
+        )],
+    ))
+}
+
+fn remove_watch_expression_permission_inputs(
+    operation: &str,
+    session_id: SessionId,
+    expression: &str,
+) -> Result<Vec<String>> {
+    let expression = permission_value_to_string(&expression, "remove_watch_expression expression")?;
+    Ok(permission_inputs(
+        operation,
+        [format!(
+            "session_id:{} expression:{}",
+            session_id.0, expression
+        )],
+    ))
+}
+
 #[cfg(test)]
 pub fn control_permission_inputs_for_test(
     operation: &str,
@@ -1529,6 +1755,12 @@ fn operation_name(input: &DebuggerToolInput) -> &'static str {
         DebuggerOperation::SetDataBreakpoints => "set_data_breakpoints",
         DebuggerOperation::SetIgnoreBreakpoints => "set_ignore_breakpoints",
         DebuggerOperation::ClearBreakpoints => "clear_breakpoints",
+        DebuggerOperation::ReadMemory => "read_memory",
+        DebuggerOperation::ListHistory => "list_history",
+        DebuggerOperation::SelectHistory => "select_history",
+        DebuggerOperation::ListWatchExpressions => "list_watch_expressions",
+        DebuggerOperation::AddWatchExpression => "add_watch_expression",
+        DebuggerOperation::RemoveWatchExpression => "remove_watch_expression",
     }
 }
 
@@ -1632,6 +1864,45 @@ fn initial_title_for_input(input: &DebuggerToolInput) -> SharedString {
             None => "Set debugger ignore breakpoints".into(),
         },
         DebuggerOperation::ClearBreakpoints => "Clear all debugger breakpoints".into(),
+        DebuggerOperation::ReadMemory => input
+            .memory_reference
+            .as_ref()
+            .map(|memory_reference| {
+                format!(
+                    "Read debugger memory {}",
+                    MarkdownInlineCode(memory_reference)
+                )
+                .into()
+            })
+            .unwrap_or_else(|| "Read debugger memory".into()),
+        DebuggerOperation::ListHistory => "List debugger history".into(),
+        DebuggerOperation::SelectHistory => input
+            .index
+            .map(|index| format!("Select debugger history snapshot {index}").into())
+            .unwrap_or_else(|| "Select debugger history snapshot".into()),
+        DebuggerOperation::ListWatchExpressions => "List debugger watch expressions".into(),
+        DebuggerOperation::AddWatchExpression => input
+            .expression
+            .as_ref()
+            .map(|expression| {
+                format!(
+                    "Add debugger watch expression {}",
+                    MarkdownInlineCode(expression)
+                )
+                .into()
+            })
+            .unwrap_or_else(|| "Add debugger watch expression".into()),
+        DebuggerOperation::RemoveWatchExpression => input
+            .expression
+            .as_ref()
+            .map(|expression| {
+                format!(
+                    "Remove debugger watch expression {}",
+                    MarkdownInlineCode(expression)
+                )
+                .into()
+            })
+            .unwrap_or_else(|| "Remove debugger watch expression".into()),
     }
 }
 
@@ -1972,6 +2243,44 @@ fn set_variable_result_to_json(result: AgentDebuggerSetVariableResult) -> Value 
     })
 }
 
+fn memory_read_to_json(read: AgentMemoryRead) -> Value {
+    json!({
+        "address": read.address,
+        "unreadable_bytes": read.unreadable_bytes,
+        "content": read.content,
+        "byte_count": read.byte_count,
+    })
+}
+
+fn history_to_json(entries: Vec<AgentDebuggerHistoryEntry>) -> Value {
+    Value::Array(
+        entries
+            .into_iter()
+            .map(|entry| {
+                json!({
+                    "index": entry.index,
+                    "thread_count": entry.thread_count,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn watch_expressions_to_json(expressions: Vec<AgentWatchExpression>) -> Value {
+    Value::Array(
+        expressions
+            .into_iter()
+            .map(|expression| {
+                json!({
+                    "expression": expression.expression,
+                    "value": expression.value,
+                    "variables_reference": expression.variables_reference,
+                })
+            })
+            .collect(),
+    )
+}
+
 fn snapshot_to_json(snapshot: AgentDebuggerSnapshot) -> Value {
     json!({
         "session": session_to_json(snapshot.session),
@@ -2153,6 +2462,97 @@ mod tests {
             inputs,
             vec!["set_variable session_id:7 name:\"count\" value:\"42\"".to_string()]
         );
+    }
+
+    #[test]
+    fn read_memory_permission_inputs_include_memory_reference_and_count() {
+        let inputs = read_memory_permission_inputs(
+            "read_memory",
+            SessionId::from_proto(7),
+            "0x1000",
+            Some(0),
+            4,
+        );
+        assert_eq!(
+            inputs,
+            vec!["read_memory session_id:7 memory_reference:0x1000 offset:0 count:4".to_string()]
+        );
+
+        let inputs = read_memory_permission_inputs(
+            "read_memory",
+            SessionId::from_proto(7),
+            "0x1000",
+            None,
+            4,
+        );
+        assert_eq!(
+            inputs,
+            vec![
+                "read_memory session_id:7 memory_reference:0x1000 offset:none count:4".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn select_history_permission_inputs_include_index() {
+        let inputs =
+            select_history_permission_inputs("select_history", SessionId::from_proto(7), 2);
+        assert_eq!(
+            inputs,
+            vec!["select_history session_id:7 index:2".to_string()]
+        );
+    }
+
+    #[test]
+    fn watch_expression_permission_inputs_include_expression_and_frame() {
+        let inputs = add_watch_expression_permission_inputs(
+            "add_watch_expression",
+            SessionId::from_proto(7),
+            "a + b",
+            Some(3),
+        )
+        .unwrap();
+        assert_eq!(
+            inputs,
+            vec!["add_watch_expression session_id:7 expression:\"a + b\" frame_id:3".to_string()]
+        );
+
+        let inputs = remove_watch_expression_permission_inputs(
+            "remove_watch_expression",
+            SessionId::from_proto(7),
+            "a + b",
+        )
+        .unwrap();
+        assert_eq!(
+            inputs,
+            vec!["remove_watch_expression session_id:7 expression:\"a + b\"".to_string()]
+        );
+    }
+
+    #[test]
+    fn debugger_operation_serializes_snake_case() {
+        for (operation, expected) in [
+            (DebuggerOperation::ReadMemory, "read_memory"),
+            (DebuggerOperation::ListHistory, "list_history"),
+            (DebuggerOperation::SelectHistory, "select_history"),
+            (
+                DebuggerOperation::ListWatchExpressions,
+                "list_watch_expressions",
+            ),
+            (
+                DebuggerOperation::AddWatchExpression,
+                "add_watch_expression",
+            ),
+            (
+                DebuggerOperation::RemoveWatchExpression,
+                "remove_watch_expression",
+            ),
+        ] {
+            assert_eq!(
+                serde_json::to_value(operation).unwrap(),
+                Value::String(expected.to_string())
+            );
+        }
     }
 
     #[test]
