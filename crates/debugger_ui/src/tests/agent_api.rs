@@ -1167,7 +1167,7 @@ async fn test_agent_api_watch_expressions(executor: BackgroundExecutor, cx: &mut
     let session = start_debug_session(&workspace, cx, |client| {
         client.on_request::<Evaluate, _>(move |_, args| {
             Ok(dap::EvaluateResponse {
-                result: args.expression.clone(),
+                result: args.expression,
                 type_: Some("int".into()),
                 presentation_hint: None,
                 variables_reference: 0,
@@ -1773,7 +1773,7 @@ async fn test_agent_api_data_breakpoints(executor: BackgroundExecutor, cx: &mut 
             client.on_request::<SetDataBreakpoints, _>({
                 let set_data_received = set_data_received.clone();
                 move |_, args| {
-                    *set_data_received.lock().unwrap() = args.breakpoints.clone();
+                    *set_data_received.lock().unwrap() = args.breakpoints;
                     Ok(dap::SetDataBreakpointsResponse {
                         breakpoints: vec![],
                     })
