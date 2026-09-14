@@ -324,6 +324,9 @@ actions!(
         ToggleSearch,
         /// Import agent threads from other Zed release channels (e.g. Preview, Nightly).
         ImportThreadsFromOtherChannels,
+        /// Reloads the sidebar thread list from the shared database, so threads
+        /// finished in another Zed instance appear here (and vice versa).
+        SyncThreads,
         /// Starts a new terminal thread.
         NewTerminalThread,
     ]
@@ -660,6 +663,19 @@ pub fn init(
              _window: &mut Window,
              cx: &mut Context<Workspace>| {
                 import_threads_from_other_channels(workspace, cx);
+            },
+        );
+    })
+    .detach();
+    cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
+        workspace.register_action(
+            |_workspace: &mut Workspace,
+             _: &SyncThreads,
+             _window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                thread_metadata_store::ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                    store.reload(cx);
+                });
             },
         );
     })
