@@ -6,6 +6,7 @@ use super::{
 };
 use anyhow::{Context as _, Result, anyhow};
 use base64::Engine as _;
+use collections::HashMap;
 use dap::{
     EvaluateArgumentsContext, StackFrameId, StackFramePresentationHint, SteppingGranularity,
     VariableReference, client::SessionId,
@@ -1217,6 +1218,23 @@ async fn snapshot_session(
         });
     }
 
+    // In history mode the debuggee has not actually moved — the session is
+    // merely displaying a previously-recorded stopped state. Render that stored
+    // snapshot instead of re-fetching the live debuggee, which would otherwise
+    // always report the current frame regardless of `select_history`.
+    if session.read_with(cx, |session, _| session.active_snapshot_index().is_some()) {
+        return snapshot_from_selected_snapshot(
+            &session,
+            &breakpoint_store,
+            &limits,
+            session_summary,
+            output,
+            notes,
+            cx,
+        )
+        .await;
+    }
+
     // The adapter connects asynchronously after the session is registered;
     // fetching threads while the session is still booting races the
     // connection and fails with "no adapter running". Wait for the session
@@ -1395,6 +1413,290 @@ async fn snapshot_session(
         output,
         notes,
     })
+}
+
+async fn snapshot_from_selected_snapshot(
+    session: &Entity<Session>,
+    breakpoint_store: &Entity<BreakpointStore>,
+    limits: &AgentDebuggerSnapshotLimits,
+    session_summary: AgentDebuggerSession,
+    output: Vec<AgentDebuggerOutputEvent>,
+    mut notes: Vec<String>,
+    cx: &mut AsyncApp,
+) -> Result<AgentDebuggerSnapshot> {
+    let (stored_threads, variables) = session.read_with(cx, |session, _| {
+        let snapshot = session.session_state();
+        let threads = snapshot
+            .threads
+            .iter()
+            .map(|(thread_id, thread)| {
+                let status = snapshot.thread_status(*thread_id);
+                let frames = thread
+                    .stack_frames
+                    .iter()
+                    .map(|frame| {
+                        let scopes = snapshot
+                            .stack_frames
+                            .get(&frame.dap.id)
+                            .map(|stored| stored.scopes.clone())
+                            .unwrap_or_else(|| frame.scopes.clone());
+                        (frame.dap.clone(), scopes)
+                    })
+                    .collect::<Vec<_>>();
+                (thread.dap.clone(), status, frames)
+            })
+            .collect::<Vec<_>>();
+        let variables = snapshot.variables.clone();
+        (threads, variables)
+    });
+
+    let mut remaining_frames = limits.max_frames;
+    let mut frames_truncated = false;
+    let mut threads = Vec::new();
+
+    if limits.max_frames == 0 {
+        notes.push("Stack frames omitted because max_frames is 0".to_string());
+    }
+
+    for (dap_thread, status, frames) in stored_threads {
+        let thread_id = ThreadId(dap_thread.id);
+
+        if status != ThreadStatus::Stopped {
+            threads.push(AgentDebuggerThread {
+                thread_id,
+                name: dap_thread.name,
+                status: AgentDebuggerThreadStatus::from_thread_status(status),
+                frames: Vec::new(),
+            });
+            continue;
+        }
+
+        if dap_thread.name == "Dummy" {
+            notes.push("Synthetic `Dummy` thread has no stack; frames omitted".to_string());
+            threads.push(AgentDebuggerThread {
+                thread_id,
+                name: dap_thread.name,
+                status: AgentDebuggerThreadStatus::Stopped,
+                frames: Vec::new(),
+            });
+            continue;
+        }
+
+        let mut snapshot_frames = Vec::new();
+        if remaining_frames > 0 {
+            let available = remaining_frames;
+            let mut frames = frames
+                .into_iter()
+                .filter(|(frame, _)| {
+                    !(frame.id == 0
+                        && frame.line == 0
+                        && frame.column == 0
+                        && frame.presentation_hint == Some(StackFramePresentationHint::Label))
+                })
+                .collect::<Vec<_>>();
+            if frames.len() > available {
+                frames_truncated = true;
+                frames.truncate(available);
+            }
+            remaining_frames = remaining_frames.saturating_sub(frames.len());
+            for (frame_index, (frame, scopes)) in frames.into_iter().enumerate() {
+                snapshot_frames.push(
+                    historic_stack_frame_snapshot(
+                        frame,
+                        scopes,
+                        &variables,
+                        frame_index,
+                        breakpoint_store,
+                        limits,
+                        &mut notes,
+                        cx,
+                    )
+                    .await,
+                );
+            }
+        }
+
+        threads.push(AgentDebuggerThread {
+            thread_id,
+            name: dap_thread.name,
+            status: AgentDebuggerThreadStatus::Stopped,
+            frames: snapshot_frames,
+        });
+    }
+
+    if remaining_frames == limits.max_frames
+        && !threads
+            .iter()
+            .any(|thread| thread.status == AgentDebuggerThreadStatus::Stopped)
+    {
+        notes.push("No stopped threads; stack frames and variables were not requested".to_string());
+    } else if frames_truncated {
+        notes.push(format!(
+            "Stack frames truncated to {} frame(s)",
+            limits.max_frames
+        ));
+    }
+
+    Ok(AgentDebuggerSnapshot {
+        session: session_summary,
+        threads,
+        output,
+        notes,
+    })
+}
+
+async fn historic_stack_frame_snapshot(
+    frame: dap::StackFrame,
+    scopes: Vec<dap::Scope>,
+    variables: &HashMap<VariableReference, Vec<dap::Variable>>,
+    frame_index: usize,
+    breakpoint_store: &Entity<BreakpointStore>,
+    limits: &AgentDebuggerSnapshotLimits,
+    notes: &mut Vec<String>,
+    cx: &mut AsyncApp,
+) -> AgentDebuggerStackFrame {
+    let source_path = frame
+        .source
+        .as_ref()
+        .and_then(|source| source.path.as_ref())
+        .map(PathBuf::from);
+
+    let mut snapshot_scopes = Vec::new();
+    if frame_index > 1 && source_path.is_none() {
+        notes.push(format!(
+            "Scopes for frame `{}` ({}) omitted: no source path",
+            frame.name, frame.id
+        ));
+    } else {
+        for scope in scopes {
+            if scope.name == "Registers" {
+                notes.push("Registers scope omitted from the snapshot".to_string());
+                continue;
+            }
+            if scope.name == "Global" || scope.name == "Static" {
+                notes.push(format!(
+                    "`{}` scope omitted from frame `{}`",
+                    scope.name, frame.name
+                ));
+                continue;
+            }
+
+            let raw_variables =
+                if scope.variables_reference == 0 || limits.max_variables_per_scope == 0 {
+                    if scope.variables_reference != 0 && limits.max_variables_per_scope == 0 {
+                        notes.push(format!(
+                            "Variables for scope `{}` omitted because max_variables_per_scope is 0",
+                            scope.name
+                        ));
+                    }
+                    Vec::new()
+                } else {
+                    variables
+                        .get(&scope.variables_reference)
+                        .cloned()
+                        .unwrap_or_default()
+                };
+
+            let known_variable_count = scope
+                .named_variables
+                .unwrap_or(0)
+                .saturating_add(scope.indexed_variables.unwrap_or(0));
+            let variables_truncated = if limits.max_variables_per_scope == 0 {
+                scope.variables_reference != 0
+            } else {
+                known_variable_count > raw_variables.len() as u64
+                    || raw_variables.len() >= limits.max_variables_per_scope
+            };
+            if variables_truncated && limits.max_variables_per_scope > 0 {
+                notes.push(format!(
+                    "Variables for scope `{}` truncated to {} variable(s)",
+                    scope.name,
+                    raw_variables.len()
+                ));
+            }
+
+            let raw_variables = raw_variables
+                .into_iter()
+                .filter(|variable| !variable.name.starts_with("~r"))
+                .collect::<Vec<_>>();
+
+            let mut filtered_unavailable = 0usize;
+            let mut snapshot_variables = Vec::with_capacity(raw_variables.len());
+            for variable in raw_variables {
+                if matches!(
+                    variable.value.as_str(),
+                    "<not available>" | "<variable not available>" | "<optimized out>"
+                ) {
+                    filtered_unavailable += 1;
+                    continue;
+                }
+
+                snapshot_variables.push(variable_snapshot(
+                    variable,
+                    limits.max_variable_value_length,
+                ));
+            }
+            if filtered_unavailable > 0 {
+                notes.push(format!(
+                    "Variables for scope `{}` filtered {} `<not available>` entr{}",
+                    scope.name,
+                    filtered_unavailable,
+                    if filtered_unavailable == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    }
+                ));
+            }
+            if snapshot_variables
+                .iter()
+                .any(|variable| variable.value_truncated)
+            {
+                notes.push(format!(
+                    "Variable values for scope `{}` truncated to {} byte(s)",
+                    scope.name, limits.max_variable_value_length
+                ));
+            }
+
+            snapshot_scopes.push(AgentDebuggerScope {
+                name: scope.name,
+                expensive: scope.expensive,
+                variables_reference: scope.variables_reference,
+                variables: snapshot_variables,
+                variables_truncated,
+            });
+        }
+    }
+
+    let source_context = match source_context_for_frame(
+        breakpoint_store,
+        frame.source.as_ref(),
+        frame.line,
+        limits.max_source_context_lines,
+        notes,
+        cx,
+    )
+    .await
+    {
+        Ok(context) => context,
+        Err(error) => {
+            notes.push(format!(
+                "Source context for frame `{}` ({}) omitted: {error}",
+                frame.name, frame.id
+            ));
+            None
+        }
+    };
+
+    AgentDebuggerStackFrame {
+        frame_id: frame.id,
+        name: frame.name,
+        source_path,
+        line: frame.line,
+        column: frame.column,
+        scopes: snapshot_scopes,
+        source_context,
+    }
 }
 
 fn subscribe_to_stop(session: Entity<Session>, cx: &mut AsyncApp) -> Result<AgentDebuggerStopWait> {

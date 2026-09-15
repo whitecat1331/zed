@@ -119,8 +119,8 @@ impl ThreadStatus {
 
 #[derive(Debug, Clone)]
 pub struct Thread {
-    dap: dap::Thread,
-    stack_frames: Vec<StackFrame>,
+    pub(crate) dap: dap::Thread,
+    pub(crate) stack_frames: Vec<StackFrame>,
     stack_frames_error: Option<SharedString>,
     _has_stopped: bool,
 }
@@ -692,10 +692,10 @@ impl ThreadStates {
 // TODO(debugger): Wrap dap types with reference counting so the UI doesn't have to clone them on refresh
 #[derive(Default)]
 pub struct SessionSnapshot {
-    threads: IndexMap<ThreadId, Thread>,
+    pub(crate) threads: IndexMap<ThreadId, Thread>,
     thread_states: ThreadStates,
-    variables: HashMap<VariableReference, Vec<dap::Variable>>,
-    stack_frames: IndexMap<StackFrameId, StackFrame>,
+    pub(crate) variables: HashMap<VariableReference, Vec<dap::Variable>>,
+    pub(crate) stack_frames: IndexMap<StackFrameId, StackFrame>,
     locations: HashMap<u64, dap::LocationsResponse>,
     modules: Vec<dap::Module>,
     loaded_sources: Vec<dap::Source>,
@@ -704,6 +704,10 @@ pub struct SessionSnapshot {
 impl SessionSnapshot {
     pub fn thread_count(&self) -> usize {
         self.threads.len()
+    }
+
+    pub(crate) fn thread_status(&self, thread_id: ThreadId) -> ThreadStatus {
+        self.thread_states.thread_status(thread_id)
     }
 }
 
@@ -1492,7 +1496,7 @@ impl Session {
         })
     }
 
-    fn session_state(&self) -> &SessionSnapshot {
+    pub(crate) fn session_state(&self) -> &SessionSnapshot {
         self.selected_snapshot_index
             .and_then(|ix| self.snapshots.get(ix))
             .unwrap_or_else(|| &self.active_snapshot)
