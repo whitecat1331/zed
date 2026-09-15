@@ -1299,6 +1299,7 @@ async fn test_agent_api_step_back(executor: BackgroundExecutor, cx: &mut TestApp
             session_id,
             ThreadId(1),
             AgentDebuggerStepKind::Back,
+            dap::SteppingGranularity::Line,
             Duration::from_millis(100),
             cx,
         )
@@ -1352,6 +1353,7 @@ async fn test_agent_api_step_back_rejects_when_unsupported(
                 session_id,
                 ThreadId(1),
                 AgentDebuggerStepKind::Back,
+                dap::SteppingGranularity::Line,
                 Duration::from_millis(100),
                 cx,
             )

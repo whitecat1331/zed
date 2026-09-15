@@ -8,8 +8,8 @@ use anyhow::{Context as _, Result, anyhow};
 use base64::Engine as _;
 use collections::HashMap;
 use dap::{
-    EvaluateArgumentsContext, StackFrameId, StackFramePresentationHint, SteppingGranularity,
-    VariableReference, client::SessionId,
+    EvaluateArgumentsContext, ModuleId, StackFrameId, StackFramePresentationHint,
+    SteppingGranularity, VariableReference, client::SessionId,
 };
 use futures::{FutureExt as _, select_biased};
 use gpui::{App, AsyncApp, Entity, Subscription, Task};
@@ -267,6 +267,24 @@ pub struct AgentWatchExpression {
     pub expression: String,
     pub value: String,
     pub variables_reference: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentModule {
+    pub id: String,
+    pub name: String,
+    pub path: Option<String>,
+    pub symbol_status: Option<String>,
+    pub symbol_file_path: Option<String>,
+    pub version: Option<String>,
+    pub is_optimized: Option<bool>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentLoadedSource {
+    pub name: Option<String>,
+    pub path: Option<String>,
+    pub source_reference: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -701,6 +719,7 @@ impl AgentDebuggerApi {
         session_id: SessionId,
         thread_id: ThreadId,
         step_kind: AgentDebuggerStepKind,
+        granularity: SteppingGranularity,
         timeout: Duration,
         cx: &mut App,
     ) -> Task<Result<AgentDebuggerControlResult>> {
@@ -717,17 +736,15 @@ impl AgentDebuggerApi {
             let stop_wait = subscribe_to_stop(session.clone(), cx)?;
             session
                 .update(cx, |session, cx| match step_kind {
-                    AgentDebuggerStepKind::In => {
-                        session.agent_step_in(thread_id, SteppingGranularity::Line, cx)
-                    }
+                    AgentDebuggerStepKind::In => session.agent_step_in(thread_id, granularity, cx),
                     AgentDebuggerStepKind::Out => {
-                        session.agent_step_out(thread_id, SteppingGranularity::Line, cx)
+                        session.agent_step_out(thread_id, granularity, cx)
                     }
                     AgentDebuggerStepKind::Over => {
-                        session.agent_step_over(thread_id, SteppingGranularity::Line, cx)
+                        session.agent_step_over(thread_id, granularity, cx)
                     }
                     AgentDebuggerStepKind::Back => {
-                        session.agent_step_back(thread_id, SteppingGranularity::Line, cx)
+                        session.agent_step_back(thread_id, granularity, cx)
                     }
                 })
                 .await?;
@@ -973,6 +990,57 @@ impl AgentDebuggerApi {
                 session.remove_watcher(expression.into());
             });
             Ok(())
+        })
+    }
+
+    pub fn list_modules(
+        &self,
+        session_id: SessionId,
+        cx: &mut App,
+    ) -> Task<Result<Vec<AgentModule>>> {
+        let dap_store = self.dap_store.clone();
+        cx.spawn(async move |cx| {
+            let session = session_by_id(&dap_store, session_id, cx)?;
+            let modules = session
+                .update(cx, |session, _| session.agent_list_modules())
+                .await?;
+            Ok(modules
+                .into_iter()
+                .map(|module| AgentModule {
+                    id: match module.id {
+                        ModuleId::Number(number) => number.to_string(),
+                        ModuleId::String(string) => string,
+                    },
+                    name: module.name,
+                    path: module.path,
+                    symbol_status: module.symbol_status,
+                    symbol_file_path: module.symbol_file_path,
+                    version: module.version,
+                    is_optimized: module.is_optimized,
+                })
+                .collect())
+        })
+    }
+
+    pub fn list_loaded_sources(
+        &self,
+        session_id: SessionId,
+        cx: &mut App,
+    ) -> Task<Result<Vec<AgentLoadedSource>>> {
+        let dap_store = self.dap_store.clone();
+        cx.spawn(async move |cx| {
+            let session = session_by_id(&dap_store, session_id, cx)?;
+            let sources = session
+                .update(cx, |session, _| session.agent_list_loaded_sources())
+                .await?;
+            Ok(sources
+                .into_iter()
+                .map(|source| AgentLoadedSource {
+                    name: source.name,
+                    path: source.path,
+                    source_reference: source.source_reference,
+                })
+                .collect())
         })
     }
 

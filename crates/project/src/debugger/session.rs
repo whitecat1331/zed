@@ -2051,6 +2051,32 @@ impl Session {
         })
     }
 
+    pub(crate) fn agent_list_modules(&self) -> Task<Result<Vec<Module>>> {
+        if !self
+            .capabilities
+            .supports_modules_request
+            .unwrap_or_default()
+        {
+            return Task::ready(Err(anyhow!(
+                "debug adapter does not support listing modules"
+            )));
+        }
+        self.state.request_dap(ModulesCommand)
+    }
+
+    pub(crate) fn agent_list_loaded_sources(&self) -> Task<Result<Vec<Source>>> {
+        if !self
+            .capabilities
+            .supports_loaded_sources_request
+            .unwrap_or_default()
+        {
+            return Task::ready(Err(anyhow!(
+                "debug adapter does not support listing loaded sources"
+            )));
+        }
+        self.state.request_dap(LoadedSourcesCommand)
+    }
+
     fn read_single_page_memory(&mut self, page_start: PageAddress, cx: &mut Context<Self>) {
         _ = maybe!({
             let builder = self.memory.build_page(page_start)?;

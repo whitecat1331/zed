@@ -1,6 +1,6 @@
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context as _, Result, anyhow};
-use dap::{DapRegistry, client::SessionId};
+use dap::{DapRegistry, SteppingGranularity, client::SessionId};
 use gpui::{App, Entity, SharedString, Task, WeakEntity};
 use language_model::LanguageModelToolResultContent;
 use project::{Project, WorktreeId, debugger::agent_api::*};
@@ -114,6 +114,10 @@ pub enum DebuggerOperation {
     AddWatchExpression,
     /// Remove a watch expression from a debug session.
     RemoveWatchExpression,
+    /// List the modules (DLLs/shared libraries) loaded by the debuggee.
+    ListModules,
+    /// List the source files the debugger has loaded.
+    ListLoadedSources,
 }
 
 /// A single debugger operation and the fields it needs.
@@ -143,6 +147,10 @@ pub struct DebuggerToolInput {
     /// Execution control action, used by control.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<ControlAction>,
+    /// Step granularity for control step actions. One of `line`, `statement`,
+    /// or `instruction`. Defaults to `line`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granularity: Option<SteppingGranularity>,
     /// Source path for control run_to_line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
@@ -302,6 +310,9 @@ pub struct ControlInput {
     pub thread_id: Option<i64>,
     /// Execution control action.
     pub action: ControlAction,
+    /// Step granularity for step actions. Defaults to `line`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granularity: Option<SteppingGranularity>,
     /// Source path for `run_to_line`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
@@ -581,6 +592,7 @@ impl DebuggerTool {
                     action: input
                         .action
                         .context("action is required for debugger control")?,
+                    granularity: input.granularity,
                     path: input.path,
                     line: input.line,
                     frame_id: input.frame_id,
@@ -1031,6 +1043,30 @@ impl DebuggerTool {
                     json!({ "session_id": session_id.0 }),
                 ))
             }
+            DebuggerOperation::ListModules => {
+                let api = cx.update(|cx| self.api(cx));
+                let session_id =
+                    cx.update(|cx| resolve_session_id(&self.project, &api, input.session_id, cx))?;
+                let task = cx.update(|cx| api.list_modules(session_id, cx));
+                let data = task.await?;
+                Ok(success(
+                    operation,
+                    "listed debug session modules",
+                    modules_to_json(data),
+                ))
+            }
+            DebuggerOperation::ListLoadedSources => {
+                let api = cx.update(|cx| self.api(cx));
+                let session_id =
+                    cx.update(|cx| resolve_session_id(&self.project, &api, input.session_id, cx))?;
+                let task = cx.update(|cx| api.list_loaded_sources(session_id, cx));
+                let data = task.await?;
+                Ok(success(
+                    operation,
+                    "listed debug session loaded sources",
+                    loaded_sources_to_json(data),
+                ))
+            }
         }
     }
 
@@ -1078,6 +1114,7 @@ impl DebuggerTool {
             session_id,
             thread_id,
             action: input.action,
+            granularity: input.granularity,
             path: input.path,
             line: input.line,
             frame_id: input.frame_id,
@@ -1093,6 +1130,7 @@ impl DebuggerTool {
         let timeout = Duration::from_millis(control_timeout_ms(input.timeout_ms)?);
         let session_id = input.session_id;
         let api = cx.update(|cx| self.api(cx));
+        let granularity = input.granularity.unwrap_or(SteppingGranularity::Line);
 
         let result = match input.action {
             ControlAction::Continue => {
@@ -1118,6 +1156,7 @@ impl DebuggerTool {
                         session_id,
                         thread_id,
                         AgentDebuggerStepKind::Over,
+                        granularity,
                         timeout,
                         cx,
                     )
@@ -1133,6 +1172,7 @@ impl DebuggerTool {
                         session_id,
                         thread_id,
                         AgentDebuggerStepKind::In,
+                        granularity,
                         timeout,
                         cx,
                     )
@@ -1148,6 +1188,7 @@ impl DebuggerTool {
                         session_id,
                         thread_id,
                         AgentDebuggerStepKind::Out,
+                        granularity,
                         timeout,
                         cx,
                     )
@@ -1163,6 +1204,7 @@ impl DebuggerTool {
                         session_id,
                         thread_id,
                         AgentDebuggerStepKind::Back,
+                        granularity,
                         timeout,
                         cx,
                     )
@@ -1245,6 +1287,7 @@ struct ResolvedControlInput {
     session_id: SessionId,
     thread_id: Option<project::debugger::session::ThreadId>,
     action: ControlAction,
+    granularity: Option<SteppingGranularity>,
     path: Option<PathBuf>,
     line: Option<u32>,
     frame_id: Option<u64>,
@@ -1566,6 +1609,7 @@ pub fn control_permission_inputs_for_test(
             session_id: SessionId::from_proto(resolved_session_id),
             thread_id: Some(project::debugger::session::ThreadId(resolved_thread_id)),
             action: input.action,
+            granularity: input.granularity,
             path: input.path,
             line: input.line,
             frame_id: input.frame_id,
@@ -1761,6 +1805,8 @@ fn operation_name(input: &DebuggerToolInput) -> &'static str {
         DebuggerOperation::ListWatchExpressions => "list_watch_expressions",
         DebuggerOperation::AddWatchExpression => "add_watch_expression",
         DebuggerOperation::RemoveWatchExpression => "remove_watch_expression",
+        DebuggerOperation::ListModules => "list_modules",
+        DebuggerOperation::ListLoadedSources => "list_loaded_sources",
     }
 }
 
@@ -1903,6 +1949,8 @@ fn initial_title_for_input(input: &DebuggerToolInput) -> SharedString {
                 .into()
             })
             .unwrap_or_else(|| "Remove debugger watch expression".into()),
+        DebuggerOperation::ListModules => "List debugger modules".into(),
+        DebuggerOperation::ListLoadedSources => "List debugger loaded sources".into(),
     }
 }
 
@@ -2281,6 +2329,40 @@ fn watch_expressions_to_json(expressions: Vec<AgentWatchExpression>) -> Value {
     )
 }
 
+fn modules_to_json(modules: Vec<AgentModule>) -> Value {
+    Value::Array(
+        modules
+            .into_iter()
+            .map(|module| {
+                json!({
+                    "id": module.id,
+                    "name": module.name,
+                    "path": module.path,
+                    "symbol_status": module.symbol_status,
+                    "symbol_file_path": module.symbol_file_path,
+                    "version": module.version,
+                    "is_optimized": module.is_optimized,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn loaded_sources_to_json(sources: Vec<AgentLoadedSource>) -> Value {
+    Value::Array(
+        sources
+            .into_iter()
+            .map(|source| {
+                json!({
+                    "name": source.name,
+                    "path": source.path,
+                    "source_reference": source.source_reference,
+                })
+            })
+            .collect(),
+    )
+}
+
 fn snapshot_to_json(snapshot: AgentDebuggerSnapshot) -> Value {
     json!({
         "session": session_to_json(snapshot.session),
@@ -2547,6 +2629,8 @@ mod tests {
                 DebuggerOperation::RemoveWatchExpression,
                 "remove_watch_expression",
             ),
+            (DebuggerOperation::ListModules, "list_modules"),
+            (DebuggerOperation::ListLoadedSources, "list_loaded_sources"),
         ] {
             assert_eq!(
                 serde_json::to_value(operation).unwrap(),
@@ -2582,6 +2666,7 @@ mod tests {
             session_id: SessionId::from_proto(7),
             thread_id: None,
             action: ControlAction::RestartFrame,
+            granularity: None,
             path: None,
             line: None,
             frame_id: Some(3),
@@ -2596,6 +2681,7 @@ mod tests {
             session_id: SessionId::from_proto(7),
             thread_id: None,
             action: ControlAction::Detach,
+            granularity: None,
             path: None,
             line: None,
             frame_id: None,
