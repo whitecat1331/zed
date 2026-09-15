@@ -1410,19 +1410,24 @@ async fn test_agent_api_step_back(executor: BackgroundExecutor, cx: &mut TestApp
     let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
     let workspace = init_test_workspace(&project, cx).await;
     let step_back_thread_id = Arc::new(Mutex::new(None));
+    let step_back_granularity = Arc::new(Mutex::new(None));
     let session = start_debug_session(&workspace, cx, {
         let step_back_thread_id = step_back_thread_id.clone();
+        let step_back_granularity = step_back_granularity.clone();
         move |client| {
             client.on_request::<Initialize, _>(move |_, _| {
                 Ok(dap::Capabilities {
                     supports_step_back: Some(true),
+                    supports_stepping_granularity: Some(true),
                     ..Default::default()
                 })
             });
             client.on_request::<StepBack, _>({
                 let step_back_thread_id = step_back_thread_id.clone();
+                let step_back_granularity = step_back_granularity.clone();
                 move |_, args| {
                     *step_back_thread_id.lock().unwrap() = Some(args.thread_id);
+                    *step_back_granularity.lock().unwrap() = args.granularity;
                     Ok(())
                 }
             });
@@ -1451,7 +1456,7 @@ async fn test_agent_api_step_back(executor: BackgroundExecutor, cx: &mut TestApp
             session_id,
             ThreadId(1),
             AgentDebuggerStepKind::Back,
-            dap::SteppingGranularity::Line,
+            dap::SteppingGranularity::Instruction,
             Duration::from_millis(100),
             cx,
         )
@@ -1460,6 +1465,10 @@ async fn test_agent_api_step_back(executor: BackgroundExecutor, cx: &mut TestApp
     .expect("step_back should succeed when the adapter supports it");
 
     assert_eq!(*step_back_thread_id.lock().unwrap(), Some(1));
+    assert_eq!(
+        *step_back_granularity.lock().unwrap(),
+        Some(dap::SteppingGranularity::Instruction)
+    );
 }
 
 #[gpui::test]
