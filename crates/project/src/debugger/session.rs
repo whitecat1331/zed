@@ -1511,6 +1511,13 @@ impl Session {
             self.snapshots.pop_front();
         }
 
+        // The snapshot being archived represents the previous stopped state,
+        // but the continue/step that preceded this stop left its threads
+        // marked `Running`. Restore `Stopped` before archiving so history (and
+        // the agent snapshot path) renders the stored stack frames instead of
+        // an empty frame list.
+        self.active_snapshot.thread_states.stop_all_threads();
+
         self.snapshots
             .push_back(std::mem::take(&mut self.active_snapshot));
     }
