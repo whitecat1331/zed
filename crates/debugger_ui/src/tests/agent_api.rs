@@ -4,9 +4,9 @@ use dap::{
     ErrorResponse, Message, Scope, StackFrame, Variable,
     adapters::DebugTaskDefinition,
     requests::{
-        Attach, Continue, DataBreakpointInfo, Disconnect, Evaluate, Initialize, ReadMemory,
-        Restart, RestartFrame, Scopes, SetBreakpoints, SetDataBreakpoints, SetVariable, StackTrace,
-        StepBack, Threads, Variables,
+        Attach, Continue, DataBreakpointInfo, Disconnect, Evaluate, Initialize, LoadedSources,
+        Modules, ReadMemory, Restart, RestartFrame, Scopes, SetBreakpoints, SetDataBreakpoints,
+        SetVariable, StackTrace, StepBack, Threads, Variables,
     },
 };
 use gpui::{BackgroundExecutor, TestAppContext};
@@ -1148,6 +1148,158 @@ async fn test_agent_api_read_memory_rejects_when_unsupported(
     assert!(
         error.to_string().contains("does not support"),
         "unexpected error: {error}"
+    );
+}
+
+#[gpui::test]
+async fn test_agent_api_list_modules(executor: BackgroundExecutor, cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let session = start_debug_session(&workspace, cx, |client| {
+        client.on_request::<Initialize, _>(move |_, _| {
+            Ok(dap::Capabilities {
+                supports_modules_request: Some(true),
+                ..Default::default()
+            })
+        });
+        client.on_request::<Modules, _>(move |_, _| {
+            Ok(dap::ModulesResponse {
+                modules: vec![dap::Module {
+                    id: dap::ModuleId::Number(1),
+                    name: "main".into(),
+                    path: Some("/project/main.js".into()),
+                    is_optimized: Some(false),
+                    is_user_code: Some(true),
+                    version: None,
+                    symbol_status: Some("Symbols loaded.".into()),
+                    symbol_file_path: None,
+                    date_time_stamp: None,
+                    address_range: None,
+                }],
+                total_modules: Some(1),
+            })
+        });
+    })
+    .unwrap();
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+    let modules = cx
+        .update(|cx| api.list_modules(session_id, cx))
+        .await
+        .unwrap();
+
+    assert_eq!(modules.len(), 1);
+    let module = &modules[0];
+    assert_eq!(module.id, "1");
+    assert_eq!(module.name, "main");
+    assert_eq!(module.path.as_deref(), Some("/project/main.js"));
+    assert_eq!(module.symbol_status.as_deref(), Some("Symbols loaded."));
+    assert_eq!(module.is_optimized, Some(false));
+}
+
+#[gpui::test]
+async fn test_agent_api_list_loaded_sources(executor: BackgroundExecutor, cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let session = start_debug_session(&workspace, cx, |client| {
+        client.on_request::<Initialize, _>(move |_, _| {
+            Ok(dap::Capabilities {
+                supports_loaded_sources_request: Some(true),
+                ..Default::default()
+            })
+        });
+        client.on_request::<LoadedSources, _>(move |_, _| {
+            Ok(dap::LoadedSourcesResponse {
+                sources: vec![dap::Source {
+                    name: Some("main.js".into()),
+                    path: Some("/project/main.js".into()),
+                    source_reference: Some(0),
+                    presentation_hint: None,
+                    origin: None,
+                    sources: None,
+                    adapter_data: None,
+                    checksums: None,
+                }],
+            })
+        });
+    })
+    .unwrap();
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+    let sources = cx
+        .update(|cx| api.list_loaded_sources(session_id, cx))
+        .await
+        .unwrap();
+
+    assert_eq!(sources.len(), 1);
+    let source = &sources[0];
+    assert_eq!(source.name.as_deref(), Some("main.js"));
+    assert_eq!(source.path.as_deref(), Some("/project/main.js"));
+    assert_eq!(source.source_reference, Some(0));
+}
+
+#[gpui::test]
+async fn test_agent_api_listing_rejects_when_unsupported(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let session = start_debug_session(&workspace, cx, |_| {}).unwrap();
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+    let modules_error = cx
+        .update(|cx| api.list_modules(session_id, cx))
+        .await
+        .expect_err("list_modules should fail when the adapter lacks support");
+    assert!(
+        modules_error.to_string().contains("does not support"),
+        "unexpected error: {modules_error}"
+    );
+
+    let sources_error = cx
+        .update(|cx| api.list_loaded_sources(session_id, cx))
+        .await
+        .expect_err("list_loaded_sources should fail when the adapter lacks support");
+    assert!(
+        sources_error.to_string().contains("does not support"),
+        "unexpected error: {sources_error}"
     );
 }
 
