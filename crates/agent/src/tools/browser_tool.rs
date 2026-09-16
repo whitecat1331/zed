@@ -1,5 +1,5 @@
 use agent_client_protocol::schema::v1 as acp;
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result};
 use browser_tools::AgentBrowserApi;
 use gpui::{App, SharedString, Task, WeakEntity};
 use language_model::LanguageModelToolResultContent;
@@ -206,13 +206,80 @@ impl BrowserTool {
                 self.api.stop_session(session_id).await?;
                 Ok(success(operation, "stopped browser session", json!({})))
             }
-            BrowserOperation::Click
-            | BrowserOperation::Type
-            | BrowserOperation::Evaluate
-            | BrowserOperation::ReadConsole
-            | BrowserOperation::ReadNetwork => Err(anyhow!(
-                "browser.{operation} is not implemented yet"
-            )),
+            BrowserOperation::Click => {
+                self.ensure_write_mode(&operation, cx)?;
+                let session_id = input
+                    .session_id
+                    .context("session_id is required for browser click")?;
+                let selector = input
+                    .selector
+                    .context("selector is required for browser click")?;
+                authorize_browser_operation(
+                    &event_stream,
+                    "Click browser element",
+                    permission_inputs(&operation, [format!("session_id:{session_id} selector:{selector}")]),
+                    cx,
+                )
+                .await?;
+                let result = self.api.click(session_id, &selector).await?;
+                Ok(success(operation, "clicked element", result))
+            }
+            BrowserOperation::Type => {
+                self.ensure_write_mode(&operation, cx)?;
+                let session_id = input
+                    .session_id
+                    .context("session_id is required for browser type")?;
+                let selector = input
+                    .selector
+                    .context("selector is required for browser type")?;
+                let text = input
+                    .text
+                    .context("text is required for browser type")?;
+                authorize_browser_operation(
+                    &event_stream,
+                    "Type into browser",
+                    permission_inputs(
+                        &operation,
+                        [format!("session_id:{session_id} selector:{selector} text:{text}")],
+                    ),
+                    cx,
+                )
+                .await?;
+                let result = self.api.type_text(session_id, &selector, &text).await?;
+                Ok(success(operation, "typed text", result))
+            }
+            BrowserOperation::Evaluate => {
+                self.ensure_write_mode(&operation, cx)?;
+                let session_id = input
+                    .session_id
+                    .context("session_id is required for browser evaluate")?;
+                let expression = input
+                    .expression
+                    .context("expression is required for browser evaluate")?;
+                authorize_browser_operation(
+                    &event_stream,
+                    "Evaluate browser JavaScript",
+                    permission_inputs(&operation, [format!("session_id:{session_id} expression:{expression}")]),
+                    cx,
+                )
+                .await?;
+                let result = self.api.evaluate(session_id, &expression).await?;
+                Ok(success(operation, "evaluated expression", result))
+            }
+            BrowserOperation::ReadConsole => {
+                let session_id = input
+                    .session_id
+                    .context("session_id is required for browser read_console")?;
+                let result = self.api.read_console(session_id).await?;
+                Ok(success(operation, "read console events", result))
+            }
+            BrowserOperation::ReadNetwork => {
+                let session_id = input
+                    .session_id
+                    .context("session_id is required for browser read_network")?;
+                let result = self.api.read_network(session_id).await?;
+                Ok(success(operation, "read network events", result))
+            }
         }
     }
 }

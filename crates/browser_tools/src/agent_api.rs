@@ -120,23 +120,115 @@ impl AgentBrowserApi {
             .get_mut(&session_id)
             .context("unknown browser session")?;
 
-        let document = session
+        let page = evaluate_value(&mut session.client, SNAPSHOT_EXPRESSION).await?;
+        let events = session.client.recent_events();
+
+        Ok(json!({
+            "url": page
+                .get("url")
+                .cloned()
+                .unwrap_or_else(|| Value::String(session.url.clone())),
+            "title": page.get("title").cloned().unwrap_or(Value::Null),
+            "text": page.get("text").cloned().unwrap_or(Value::Null),
+            "elements": page
+                .get("elements")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(vec![])),
+            "console": filter_events(events, is_console_event, 100),
+            "network": filter_events(events, is_network_event, 100),
+        }))
+    }
+
+    pub async fn evaluate(&self, session_id: u64, expression: &str) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+
+        let result = session
             .client
             .send_command(
                 "Runtime.evaluate",
                 json!({
-                    "expression": "JSON.stringify({ url: location.href, title: document.title, text: document.body ? document.body.innerText.slice(0, 10000) : '' })",
+                    "expression": expression,
                     "returnByValue": true,
+                    "awaitPromise": true,
                 }),
             )
             .await?;
-        let events = session.client.take_events();
+        let evaluated = result.get("result").cloned().unwrap_or(Value::Null);
+        let exception = result
+            .get("exceptionDetails")
+            .and_then(|details| details.get("text"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
         Ok(json!({
-            "url": session.url,
-            "document": document,
-            "events": events,
+            "value": evaluated.get("value").cloned().unwrap_or(Value::Null),
+            "type": evaluated.get("type").cloned().unwrap_or(Value::Null),
+            "description": evaluated.get("description").cloned().unwrap_or(Value::Null),
+            "exception": exception,
         }))
+    }
+
+    pub async fn click(&self, session_id: u64, selector: &str) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+
+        let expression = format!(
+            "(() => {{ const el = document.querySelector({selector}); if (!el) return {{ clicked: false, reason: 'no element matches selector' }}; el.click(); return {{ clicked: true, tag: el.tagName.toLowerCase(), text: (el.innerText || el.value || '').toString().slice(0, 500) }}; }})()",
+            selector = serde_json::to_string(selector)?,
+        );
+        let value = evaluate_value(&mut session.client, &expression).await?;
+        Ok(json!({ "clicked": value }))
+    }
+
+    pub async fn type_text(&self, session_id: u64, selector: &str, text: &str) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+
+        let focus = format!(
+            "(() => {{ const el = document.querySelector({selector}); if (!el) return {{ focused: false, reason: 'no element matches selector' }}; el.focus(); return {{ focused: true, tag: el.tagName.toLowerCase() }}; }})()",
+            selector = serde_json::to_string(selector)?,
+        );
+        let focused = evaluate_value(&mut session.client, &focus).await?;
+        if focused.get("focused").and_then(Value::as_bool) != Some(true) {
+            return Ok(json!({
+                "typed": false,
+                "reason": focused
+                    .get("reason")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String("no element matches selector".into())),
+            }));
+        }
+
+        session
+            .client
+            .send_command("Input.insertText", json!({ "text": text }))
+            .await?;
+        Ok(json!({ "typed": true, "selector": selector, "text": text }))
+    }
+
+    pub async fn read_console(&self, session_id: u64) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let events = session.client.recent_events();
+        Ok(json!({ "console": filter_events(events, is_console_event, 100) }))
+    }
+
+    pub async fn read_network(&self, session_id: u64) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let events = session.client.recent_events();
+        Ok(json!({ "network": filter_events(events, is_network_event, 100) }))
     }
 
     pub async fn stop_session(&self, session_id: u64) -> Result<()> {
@@ -202,4 +294,92 @@ fn discover_chromium() -> Option<PathBuf> {
         }
     }
     None
+}
+
+const SNAPSHOT_EXPRESSION: &str = r#"(function() {
+  var body = document.body ? document.body.innerText.slice(0, 10000) : '';
+  var elements = [];
+  var all = document.querySelectorAll('a, button, input, textarea, select, [role="button"], [role="link"], [role="textbox"], summary');
+  var seen = 0;
+  for (var i = 0; i < all.length; i++) {
+    if (seen >= 100) break;
+    var el = all[i];
+    var rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) continue;
+    var label = (el.getAttribute('aria-label') || el.innerText || el.value || el.getAttribute('placeholder') || el.getAttribute('name') || '').toString().trim().slice(0, 200);
+    elements.push({
+      tag: el.tagName.toLowerCase(),
+      id: el.id || null,
+      type: el.getAttribute('type') || null,
+      label: label,
+      selector: cssPath(el),
+    });
+    seen += 1;
+  }
+  return { url: location.href, title: document.title, text: body, elements: elements };
+
+  function cssPath(el) {
+    if (el.id) return '#' + CSS.escape(el.id);
+    var parts = [];
+    var node = el;
+    while (node && node.nodeType === 1 && node !== document.body) {
+      var name = node.tagName.toLowerCase();
+      var nth = 1;
+      var sibling = node;
+      while ((sibling = sibling.previousElementSibling)) {
+        if (sibling.tagName.toLowerCase() === name) nth += 1;
+      }
+      parts.unshift(name + ':nth-of-type(' + nth + ')');
+      node = node.parentElement;
+    }
+    return parts.join(' > ');
+  }
+})()"#;
+
+async fn evaluate_value(client: &mut CdpClient, expression: &str) -> Result<Value> {
+    let result = client
+        .send_command(
+            "Runtime.evaluate",
+            json!({
+                "expression": expression,
+                "returnByValue": true,
+                "awaitPromise": true,
+            }),
+        )
+        .await?;
+    Ok(result
+        .get("result")
+        .and_then(|value| value.get("value"))
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
+fn is_console_event(event: &Value) -> bool {
+    event
+        .get("method")
+        .and_then(Value::as_str)
+        .map(|method| method == "Runtime.consoleAPICalled")
+        .unwrap_or(false)
+}
+
+fn is_network_event(event: &Value) -> bool {
+    event
+        .get("method")
+        .and_then(Value::as_str)
+        .map(|method| method.starts_with("Network."))
+        .unwrap_or(false)
+}
+
+fn filter_events(events: &[Value], predicate: fn(&Value) -> bool, max: usize) -> Vec<Value> {
+    let mut out = Vec::new();
+    for event in events.iter().rev() {
+        if predicate(event) {
+            out.push(event.clone());
+            if out.len() >= max {
+                break;
+            }
+        }
+    }
+    out.reverse();
+    out
 }

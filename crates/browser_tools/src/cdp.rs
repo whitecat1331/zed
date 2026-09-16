@@ -15,11 +15,15 @@ pub enum CdpError {
     Other(#[from] anyhow::Error),
 }
 
+/// Maximum number of buffered events kept in memory before older ones drop.
+const MAX_BUFFERED_EVENTS: usize = 500;
+
 /// A minimal CDP client over a single websocket connection.
 ///
 /// Commands are sent serially; events received while awaiting a response are
-/// buffered and can be drained with [`CdpClient::take_events`]. An optional
-/// `session_id` scopes commands to a flattened target session.
+/// buffered (bounded) and can be inspected with [`CdpClient::recent_events`]
+/// or drained with [`CdpClient::take_events`]. An optional `session_id` scopes
+/// commands to a flattened target session.
 pub struct CdpClient {
     socket: WebSocketStream<TcpStream>,
     next_id: u64,
@@ -89,9 +93,17 @@ impl CdpClient {
                 return Ok(value.get("result").cloned().unwrap_or(Value::Null));
             }
             if value.get("method").is_some() {
+                if self.events.len() >= MAX_BUFFERED_EVENTS {
+                    self.events.remove(0);
+                }
                 self.events.push(value);
             }
         }
+    }
+
+    /// Borrow the most recent buffered events without draining them.
+    pub fn recent_events(&self) -> &[Value] {
+        &self.events
     }
 
     /// Drain buffered events (console, network, etc.) since the last drain.
