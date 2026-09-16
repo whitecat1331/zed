@@ -1,7 +1,7 @@
 use crate::cdp::CdpClient;
 use crate::session::BrowserSession;
 use anyhow::{Context, Result, anyhow};
-use futures::AsyncBufReadExt;
+use futures::{AsyncBufReadExt, StreamExt};
 use serde_json::{Value, json};
 use smol::process::Command;
 use std::collections::HashMap;

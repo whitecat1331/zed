@@ -59,7 +59,7 @@ impl CdpClient {
             request["sessionId"] = json!(session_id);
         }
         self.socket
-            .send(Message::Text(request.to_string()))
+            .send(Message::Text(request.to_string().into()))
             .await
             .context("failed to send CDP command")?;
 
@@ -70,7 +70,7 @@ impl CdpClient {
                 .await
                 .context("CDP connection closed while awaiting response")??;
             let text = match message {
-                Message::Text(text) => text,
+                Message::Text(text) => text.to_string(),
                 Message::Binary(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
                 Message::Close(_) => return Err(anyhow!("CDP connection closed")),
                 _ => continue,
