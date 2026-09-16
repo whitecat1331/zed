@@ -3813,15 +3813,15 @@ impl AcpThread {
         let completion = async move |thread: WeakEntity<Self>, cx: &mut AsyncApp| {
             let response = rx.await;
 
-            thread
-                .update(cx, |this, cx| {
-                    if this.turn_id == turn_id {
-                        this.update_last_checkpoint(cx)
-                    } else {
-                        Task::ready(Ok(()))
-                    }
-                })?
-                .await?;
+            // Run the git checkpoint in the background. It only decides whether
+            // to surface the "restore checkpoint" affordance, so awaiting it here
+            // would keep the thread in the "generating" state after the model has
+            // already finished streaming.
+            thread.update(cx, |this, cx| {
+                if this.turn_id == turn_id {
+                    this.update_last_checkpoint(cx).detach();
+                }
+            })?;
 
             thread.update(cx, |this, cx| {
                 if this.turn_id == turn_id && this.parent_session_id.is_none() {
@@ -10419,6 +10419,55 @@ mod tests {
         assert_eq!(
             *statuses.borrow(),
             vec![ThreadStatus::Generating, ThreadStatus::Idle]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_turn_completes_without_awaiting_git_checkpoint(cx: &mut TestAppContext) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+
+        // The git checkpoint that determines whether to show the "restore
+        // checkpoint" affordance must not block the turn from leaving the
+        // generating state. Record the order in which the turn becomes idle
+        // versus the checkpoint updating the user message: `StatusChanged`
+        // (Idle) should fire before the checkpoint's `EntryUpdated`.
+        let ordering = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&thread, {
+                let ordering = ordering.clone();
+                move |thread, event, cx| match event {
+                    AcpThreadEvent::StatusChanged
+                        if thread.read(cx).status() == ThreadStatus::Idle =>
+                    {
+                        ordering.borrow_mut().push("idle");
+                    }
+                    AcpThreadEvent::EntryUpdated(0) => {
+                        ordering.borrow_mut().push("checkpoint");
+                    }
+                    _ => {}
+                }
+            })
+        });
+
+        thread
+            .update(cx, |thread, cx| thread.send(vec!["hello".into()], cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let ordering = ordering.borrow();
+        let idle_position = ordering
+            .iter()
+            .position(|&event| event == "idle")
+            .expect("turn never became idle");
+        let checkpoint_position = ordering
+            .iter()
+            .position(|&event| event == "checkpoint")
+            .expect("checkpoint never updated the user message");
+        assert!(
+            idle_position < checkpoint_position,
+            "turn should become idle before the git checkpoint runs, got {ordering:?}"
         );
     }
 
