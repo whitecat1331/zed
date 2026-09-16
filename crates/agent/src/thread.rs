@@ -1,5 +1,5 @@
 use crate::{
-    ApplyCodeActionTool, AskUserTool, CodeActionStore, ContextServerRegistry, CopyPathTool,
+    ApplyCodeActionTool, AskUserTool, BrowserTool, CodeActionStore, ContextServerRegistry, CopyPathTool,
     CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DebuggerTool, DeletePathTool,
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
     GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
@@ -2214,6 +2214,7 @@ impl Thread {
             environment.clone(),
             cx.weak_entity(),
         ));
+        self.add_tool(BrowserTool::new(cx.weak_entity()));
         self.add_tool(EditFileTool::new(
             self.project.clone(),
             cx.weak_entity(),
