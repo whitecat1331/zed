@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use async_tungstenite::tungstenite::Message;
 use async_tungstenite::{WebSocketStream, client_async};
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use serde_json::{Value, json};
 use smol::net::TcpStream;
 use url::Url;
