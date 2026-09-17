@@ -240,6 +240,80 @@ impl WorkspaceManager {
             .map(|project| project.path)
             .collect())
     }
+
+    /// The full managed-workspace list, ordered by name — backing for the home
+    /// page and the workspace switcher.
+    pub fn all(&self) -> Result<Vec<ManagedWorkspace>> {
+        let rows = self.select_bound::<(), (String, String, String, String)>(sql! {
+            SELECT workspace_id, name, created_at, updated_at
+            FROM managed_workspaces
+            ORDER BY name
+        })?(())?;
+
+        rows.into_iter()
+            .map(|(workspace_id, name, created_at, updated_at)| {
+                Ok(ManagedWorkspace {
+                    workspace_id: ManagedWorkspaceId::from_key_string(&workspace_id)?,
+                    name,
+                    created_at: parse_timestamp(&created_at),
+                    updated_at: parse_timestamp(&updated_at),
+                })
+            })
+            .collect()
+    }
+
+    /// Rename a managed workspace, bumping its `updated_at`.
+    pub async fn rename(&self, workspace_id: ManagedWorkspaceId, name: String) -> Result<()> {
+        let key = workspace_id.to_key_string();
+        let now = Utc::now().to_rfc3339();
+        self.write(move |connection| -> Result<()> {
+            connection.exec_bound::<(&str, &str, &str)>(sql! {
+                UPDATE managed_workspaces
+                SET name = ?, updated_at = ?
+                WHERE workspace_id = ?
+            })?((name.as_str(), now.as_str(), key.as_str()))?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Add a project to a managed workspace, appending it at the end. The id is
+    /// unchanged.
+    pub async fn add_project(
+        &self,
+        workspace_id: ManagedWorkspaceId,
+        path: PathBuf,
+    ) -> Result<()> {
+        let key = workspace_id.to_key_string();
+        let path = path.to_string_lossy().into_owned();
+        let position = self.projects(workspace_id)?.len() as i64;
+        self.write(move |connection| -> Result<()> {
+            connection.exec_bound::<(&str, &str, i64)>(sql! {
+                INSERT INTO managed_workspace_projects (workspace_id, path, position)
+                VALUES (?, ?, ?)
+            })?((key.as_str(), path.as_str(), position))?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Remove a project from a managed workspace. The id is unchanged.
+    pub async fn remove_project(
+        &self,
+        workspace_id: ManagedWorkspaceId,
+        path: PathBuf,
+    ) -> Result<()> {
+        let key = workspace_id.to_key_string();
+        let path = path.to_string_lossy().into_owned();
+        self.write(move |connection| -> Result<()> {
+            connection.exec_bound::<(&str, &str)>(sql! {
+                DELETE FROM managed_workspace_projects
+                WHERE workspace_id = ? AND path = ?
+            })?((key.as_str(), path.as_str()))?;
+            Ok(())
+        })
+        .await
+    }
 }
 
 fn parse_timestamp(text: &str) -> DateTime<Utc> {
