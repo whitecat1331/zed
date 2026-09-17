@@ -18,21 +18,20 @@ pub enum CdpError {
 /// Maximum number of buffered events kept in memory before older ones drop.
 const MAX_BUFFERED_EVENTS: usize = 500;
 
-/// A minimal CDP client over a single websocket connection.
+/// A minimal CDP client over a single browser-level websocket connection.
 ///
 /// Commands are sent serially; events received while awaiting a response are
 /// buffered (bounded) and can be inspected with [`CdpClient::recent_events`]
-/// or drained with [`CdpClient::take_events`]. An optional `session_id` scopes
-/// commands to a flattened target session.
+/// or drained with [`CdpClient::take_events`]. A command can be scoped to a
+/// flattened target session via its `session_id`.
 pub struct CdpClient {
     socket: WebSocketStream<TcpStream>,
     next_id: u64,
-    session_id: Option<String>,
     events: Vec<Value>,
 }
 
 impl CdpClient {
-    /// Connect to a CDP websocket endpoint (e.g. a Chromium page target).
+    /// Connect to a CDP websocket endpoint (the browser-level endpoint).
     pub async fn connect(endpoint: &str) -> Result<Self> {
         let url = Url::parse(endpoint).context("invalid CDP websocket url")?;
         let host = url.host_str().context("CDP websocket url has no host")?;
@@ -44,22 +43,27 @@ impl CdpClient {
         Ok(Self {
             socket,
             next_id: 0,
-            session_id: None,
             events: Vec::new(),
         })
     }
 
-    /// Scope subsequent commands to a flattened target session.
-    pub fn set_session_id(&mut self, session_id: Option<String>) {
-        self.session_id = session_id;
+    /// Send a browser-level command (not scoped to a flattened target session).
+    pub async fn send_command(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.send_command_with_session(None, method, params).await
     }
 
-    /// Send a command and await its response, buffering any events in between.
-    pub async fn send_command(&mut self, method: &str, params: Value) -> Result<Value> {
+    /// Send a command scoped to a flattened target session, or to the browser
+    /// when `session_id` is `None`.
+    pub async fn send_command_with_session(
+        &mut self,
+        session_id: Option<&str>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
         let mut request = json!({ "id": id, "method": method, "params": params });
-        if let Some(session_id) = &self.session_id {
+        if let Some(session_id) = session_id {
             request["sessionId"] = json!(session_id);
         }
         self.socket
@@ -107,10 +111,6 @@ impl CdpClient {
     }
 
     /// Drain buffered events (console, network, etc.) since the last drain.
-    pub fn take_events(&mut self) -> Vec<Value> {
-        std::mem::take(&mut self.events)
-    }
-}
     pub fn take_events(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.events)
     }
