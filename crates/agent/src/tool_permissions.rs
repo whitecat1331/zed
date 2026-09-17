@@ -610,6 +610,7 @@ mod tests {
             show_merge_conflict_indicator: true,
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
+            browser_chromium_path: None,
         }
     }
 
