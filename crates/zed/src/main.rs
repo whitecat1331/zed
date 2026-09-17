@@ -14,6 +14,7 @@ const _: () = assert!(
      Forks: update APP_NAME in crates/paths/src/paths.rs when renaming the binary.",
 );
 
+use agent_client_protocol::schema::v1 as acp;
 use agent_ui::AgentPanel;
 use anyhow::{Context as _, Result};
 use clap::Parser;
@@ -1147,6 +1148,43 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                                 log::warn!(
                                     "zed://agent received but the AgentPanel is not registered \
                                      (is `disable_ai` enabled?)"
+                                );
+                            }
+                        });
+                    })
+                })
+                .detach_and_log_err(cx);
+            }
+            OpenRequestKind::OpenAgentThread { session_id, name } => {
+                cx.spawn(async move |cx| {
+                    let multi_workspace =
+                        workspace::get_any_active_multi_workspace(app_state, cx.clone()).await?;
+
+                    let panels_task = multi_workspace.update(cx, |multi_workspace, _, cx| {
+                        multi_workspace
+                            .workspace()
+                            .update(cx, |workspace, _| workspace.take_panels_task())
+                    })?;
+                    if let Some(task) = panels_task {
+                        task.await.log_err();
+                    }
+
+                    multi_workspace.update(cx, |multi_workspace, window, cx| {
+                        multi_workspace.workspace().update(cx, |workspace, cx| {
+                            if let Some(panel) = workspace.focus_panel::<AgentPanel>(window, cx) {
+                                panel.update(cx, |panel, cx| {
+                                    panel.open_thread(
+                                        acp::SessionId::new(session_id.clone()),
+                                        None,
+                                        Some(name.clone().into()),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            } else {
+                                log::warn!(
+                                    "zed:///agent/thread received but the AgentPanel is not \
+                                     registered (is `disable_ai` enabled?)"
                                 );
                             }
                         });

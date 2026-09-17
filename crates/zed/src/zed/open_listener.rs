@@ -80,6 +80,10 @@ pub enum OpenRequestKind {
     GitCommit {
         sha: String,
     },
+    OpenAgentThread {
+        session_id: String,
+        name: String,
+    },
 }
 
 impl std::fmt::Debug for OpenRequestKind {
@@ -118,6 +122,11 @@ impl std::fmt::Debug for OpenRequestKind {
                 .field("repo_url", repo_url)
                 .finish(),
             Self::GitCommit { sha } => f.debug_struct("GitCommit").field("sha", sha).finish(),
+            Self::OpenAgentThread { session_id, name } => f
+                .debug_struct("OpenAgentThread")
+                .field("session_id", session_id)
+                .field("name", name)
+                .finish(),
         }
     }
 }
@@ -176,6 +185,8 @@ impl OpenRequest {
                 this.parse_skill_install_url(&url)?
             } else if let Some(agent_path) = url.strip_prefix("zed://agent") {
                 this.parse_agent_url(agent_path)
+            } else if let Some(thread_path) = url.strip_prefix("zed:///agent/thread/") {
+                this.parse_agent_thread_url(thread_path)?
             } else if url == "zed://" || url == "zed://open" || url == "zed://open/" {
                 this.kind = Some(OpenRequestKind::FocusApp);
             } else if let Some(schema_path) = url.strip_prefix("zed://schemas/") {
@@ -231,6 +242,28 @@ impl OpenRequest {
         self.kind = Some(OpenRequestKind::AgentPanel {
             external_source_prompt,
         });
+    }
+
+    fn parse_agent_thread_url(&mut self, thread_path: &str) -> Result<()> {
+        // Format: <session-id>?name=<title>
+        let (session_id, query) = thread_path
+            .split_once('?')
+            .unwrap_or((thread_path, ""));
+        anyhow::ensure!(
+            !session_id.is_empty(),
+            "invalid agent thread url: missing session id"
+        );
+
+        let name = url::form_urlencoded::parse(query.as_bytes())
+            .find_map(|(key, value)| (key == "name").then_some(value))
+            .unwrap_or_default()
+            .to_string();
+
+        self.kind = Some(OpenRequestKind::OpenAgentThread {
+            session_id: session_id.to_string(),
+            name,
+        });
+        Ok(())
     }
 
     fn parse_skill_install_url(&mut self, url: &str) -> Result<()> {
@@ -1491,6 +1524,32 @@ mod tests {
                 assert_eq!(external_source_prompt, None);
             }
             _ => panic!("Expected AgentPanel kind"),
+        }
+    }
+
+    #[gpui::test]
+    fn test_parse_agent_thread_url(cx: &mut TestAppContext) {
+        let _app_state = init_test(cx);
+
+        let request = cx.update(|cx| {
+            OpenRequest::parse(
+                RawOpenRequest {
+                    urls: vec![
+                        "zed:///agent/thread/e89ad017-54d7-4c5e-84f2-6b1c37768f9a?name=Browser+preview+plan+open+questions".into(),
+                    ],
+                    ..Default::default()
+                },
+                cx,
+            )
+            .unwrap()
+        });
+
+        match request.kind {
+            Some(OpenRequestKind::OpenAgentThread { session_id, name }) => {
+                assert_eq!(session_id, "e89ad017-54d7-4c5e-84f2-6b1c37768f9a");
+                assert_eq!(name, "Browser preview plan open questions");
+            }
+            _ => panic!("Expected OpenAgentThread kind"),
         }
     }
 
