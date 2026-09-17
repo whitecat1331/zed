@@ -48,7 +48,7 @@ use node_runtime::{NodeBinaryOptions, NodeRuntime};
 use parking_lot::Mutex;
 use project::{project_settings::ProjectSettings, trusted_worktrees};
 use recent_projects::{RemoteSettings, open_remote_project};
-use release_channel::{AppCommitSha, AppVersion};
+use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use session::{AppSession, Session};
 use settings::{BaseKeymap, Settings, SettingsStore, watch_config_file};
 use smol::future::poll_once;
@@ -354,7 +354,16 @@ fn main() {
 
     let (open_listener, mut open_rx) = OpenListener::new();
 
-    let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS {
+    // Dev builds forward only `zed://` deep links to the running instance; a
+    // plain launch (no URL) opens a fresh instance so a newly built exe can be
+    // opened alongside the running one.
+    let should_forward = *release_channel::RELEASE_CHANNEL != ReleaseChannel::Dev
+        || args
+            .paths_or_urls
+            .iter()
+            .any(|path| path.starts_with("zed://"));
+
+    let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS || !should_forward {
         false
     } else {
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
