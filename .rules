@@ -135,6 +135,12 @@ Other entities can then register a callback to handle these events by doing `cx.
 ## Build guidelines
 
 - Use `./script/clippy` instead of `cargo clippy`
+- Never compile or verify Zed on the laptop. Any `cargo build`, `cargo check`,
+  `cargo clippy`, `cargo test`, or `./script/clippy` for Zed goes to the remote
+  compiler VMs: load the `remote-compiler` skill (and run `zed-verify` first for
+  the check gate), then execute on `compiler` (Linux check/clippy/test) or
+  `zed-win-build` (Windows `.exe`). This includes verification the agent starts
+  on its own mid-task, not only when the user says "build"/"check".
 
 # Debugger tool
 
