@@ -111,3 +111,7 @@ impl CdpClient {
         std::mem::take(&mut self.events)
     }
 }
+    pub fn take_events(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.events)
+    }
+}

@@ -424,3 +424,186 @@ fn filter_events(events: &[Value], predicate: fn(&Value) -> bool, max: usize) ->
     out.reverse();
     out
 }
+    Ok(BrowserTarget {
+        target_id,
+        session_id,
+        target_type,
+        url: url.to_string(),
+    })
+}
+
+async fn read_devtools_endpoint(stderr: smol::process::ChildStderr) -> Result<String> {
+    let mut lines = futures::io::BufReader::new(stderr).lines();
+    while let Some(line) = lines.next().await {
+        let line = line.context("failed to read Chromium stderr")?;
+        if let Some(endpoint) = parse_devtools_endpoint(&line) {
+            return Ok(endpoint);
+        }
+    }
+    Err(anyhow!(
+        "Chromium exited before exposing a DevTools endpoint"
+    ))
+}
+
+fn parse_devtools_endpoint(line: &str) -> Option<String> {
+    let marker = "DevTools listening on ";
+    let start = line.find(marker)? + marker.len();
+    Some(line[start..].trim().to_string())
+}
+
+fn discover_chromium() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("ZED_BROWSER_CHROMIUM_PATH") {
+        return Some(PathBuf::from(path));
+    }
+    let candidates = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ];
+    for candidate in candidates {
+        let path = Path::new(candidate);
+        if path.exists() {
+            return Some(path.to_path_buf());
+        }
+    }
+    None
+}
+
+const SNAPSHOT_EXPRESSION: &str = r#"(function() {
+  var body = document.body ? document.body.innerText.slice(0, 10000) : '';
+  var elements = [];
+  var all = document.querySelectorAll('a, button, input, textarea, select, [role="button"], [role="link"], [role="textbox"], summary');
+  var seen = 0;
+  for (var i = 0; i < all.length; i++) {
+    if (seen >= 100) break;
+    var el = all[i];
+    var rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) continue;
+    var label = (el.getAttribute('aria-label') || el.innerText || el.value || el.getAttribute('placeholder') || el.getAttribute('name') || '').toString().trim().slice(0, 200);
+    elements.push({
+      tag: el.tagName.toLowerCase(),
+      id: el.id || null,
+      type: el.getAttribute('type') || null,
+      label: label,
+      selector: cssPath(el),
+    });
+    seen += 1;
+  }
+  return { url: location.href, title: document.title, text: body, elements: elements };
+
+  function cssPath(el) {
+    if (el.id) return '#' + CSS.escape(el.id);
+    var parts = [];
+    var node = el;
+    while (node && node.nodeType === 1 && node !== document.body) {
+      var name = node.tagName.toLowerCase();
+      var nth = 1;
+      var sibling = node;
+      while ((sibling = sibling.previousElementSibling)) {
+        if (sibling.tagName.toLowerCase() === name) nth += 1;
+      }
+      parts.unshift(name + ':nth-of-type(' + nth + ')');
+      node = node.parentElement;
+    }
+    return parts.join(' > ');
+  }
+})()"#;
+
+async fn evaluate_value(
+    client: &mut CdpClient,
+    session_id: Option<&str>,
+    expression: &str,
+) -> Result<Value> {
+    let result = client
+        .send_command_with_session(
+            session_id,
+            "Runtime.evaluate",
+            json!({
+                "expression": expression,
+                "returnByValue": true,
+                "awaitPromise": true,
+            }),
+        )
+        .await?;
+    Ok(result
+        .get("result")
+        .and_then(|value| value.get("value"))
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
+async fn wait_for_page_load(
+    client: &mut CdpClient,
+    session_id: Option<&str>,
+    url: &str,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let state = evaluate_value(
+            client,
+            session_id,
+            "(function() { return { href: location.href, ready: document.readyState }; })()",
+        )
+        .await;
+        let loaded = state
+            .as_ref()
+            .map(|value| {
+                value
+                    .get("href")
+                    .and_then(Value::as_str)
+                    .map(|href| href != "about:blank")
+                    .unwrap_or(false)
+                    && value.get("ready").and_then(Value::as_str) == Some("complete")
+            })
+            .unwrap_or(false);
+        if loaded {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow!("timed out waiting for {url} to load"));
+        }
+        smol::Timer::after(Duration::from_millis(100)).await;
+    }
+}
+
+fn is_console_event(event: &Value) -> bool {
+    event
+        .get("method")
+        .and_then(Value::as_str)
+        .map(|method| method == "Runtime.consoleAPICalled")
+        .unwrap_or(false)
+}
+
+fn is_network_event(event: &Value) -> bool {
+    event
+        .get("method")
+        .and_then(Value::as_str)
+        .map(|method| method.starts_with("Network."))
+        .unwrap_or(false)
+}
+
+fn filter_events(
+    events: &[Value],
+    predicate: fn(&Value) -> bool,
+    session_id: Option<&str>,
+    max: usize,
+) -> Vec<Value> {
+    let mut out = Vec::new();
+    for event in events.iter().rev() {
+        if predicate(event) && session_id_matches(event, session_id) {
+            out.push(event.clone());
+            if out.len() >= max {
+                break;
+            }
+        }
+    }
+    out.reverse();
+    out
+}
+
+fn session_id_matches(event: &Value, session_id: Option<&str>) -> bool {
+    match session_id {
+        Some(session_id) => event.get("sessionId").and_then(Value::as_str) == Some(session_id),
+        None => true,
+    }
+}

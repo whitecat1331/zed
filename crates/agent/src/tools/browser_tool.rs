@@ -15,33 +15,40 @@ use crate::{AgentTool, Thread, ToolCallEventStream, ToolInput, ToolPermissionCon
 /// Interact with a browser the agent controls. Read-only operations such as
 /// `list_sessions`, `snapshot`, `read_console`, and `read_network` are available
 /// in Ask mode. Operations that start sessions, navigate, click, type, evaluate
-/// JavaScript, or stop sessions require Write mode and user permission.
+/// JavaScript, manage targets, or stop sessions require Write mode and user
+/// permission.
 ///
 /// The observation surface is text-first: `snapshot` returns the page URL,
-/// title, body text, and recent console/network events. Screenshots are not a
+/// title, body text, and interactive elements. Screenshots are not a
 /// requirement; text-only models get full interactive control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserOperation {
-    /// List active browser sessions.
+    /// List active browser sessions and their targets.
     #[default]
     ListSessions,
     /// Launch a browser (Chromium over CDP) with a target URL.
     StartSession,
-    /// Navigate a browser session to a URL.
+    /// Navigate a target to a URL.
     Navigate,
-    /// Capture a bounded text snapshot of the current page.
+    /// Capture a bounded text snapshot of a target.
     Snapshot,
-    /// Click an element in the current page.
+    /// Click an element in a target.
     Click,
-    /// Type text into the current page.
+    /// Type text into a target.
     Type,
-    /// Evaluate a JavaScript expression in the current page.
+    /// Evaluate a JavaScript expression in a target.
     Evaluate,
-    /// Read recent console events.
+    /// Read recent console events for a target.
     ReadConsole,
-    /// Read recent network events.
+    /// Read recent network events for a target.
     ReadNetwork,
+    /// Open a new target (tab) in a session.
+    OpenTarget,
+    /// Close a target in a session.
+    CloseTarget,
+    /// Set the active target in a session.
+    ActivateTarget,
     /// Stop a browser session.
     StopSession,
 }
@@ -59,7 +66,11 @@ pub struct BrowserToolInput {
     /// Browser session id, used by most operations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<u64>,
-    /// URL, used by `start_session` and `navigate`.
+    /// Target id within a session, used to scope an operation to a specific
+    /// tab. When omitted, the session's active target is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    /// URL, used by `start_session`, `navigate`, and `open_target`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// Element selector or ref, used by `click` and `type`.
@@ -164,7 +175,8 @@ impl BrowserTool {
                 let session_id = input
                     .session_id
                     .context("session_id is required for browser snapshot")?;
-                let snapshot = self.api.snapshot(session_id).await?;
+                let target_id = input.target_id.as_deref();
+                let snapshot = self.api.snapshot(session_id, target_id).await?;
                 Ok(success(operation, "captured browser snapshot", snapshot))
             }
             BrowserOperation::StartSession => {
@@ -192,6 +204,7 @@ impl BrowserTool {
                 let session_id = input
                     .session_id
                     .context("session_id is required for browser navigate")?;
+                let target_id = input.target_id.as_deref();
                 let url = input.url.context("url is required for browser navigate")?;
                 authorize_browser_operation(
                     &event_stream,
@@ -200,7 +213,7 @@ impl BrowserTool {
                     cx,
                 )
                 .await?;
-                self.api.navigate(session_id, &url).await?;
+                self.api.navigate(session_id, target_id, &url).await?;
                 Ok(success(operation, "navigated", json!({})))
             }
             BrowserOperation::StopSession => {
@@ -224,6 +237,7 @@ impl BrowserTool {
                 let session_id = input
                     .session_id
                     .context("session_id is required for browser click")?;
+                let target_id = input.target_id.as_deref();
                 let selector = input
                     .selector
                     .context("selector is required for browser click")?;
@@ -237,7 +251,7 @@ impl BrowserTool {
                     cx,
                 )
                 .await?;
-                let result = self.api.click(session_id, &selector).await?;
+                let result = self.api.click(session_id, target_id, &selector).await?;
                 Ok(success(operation, "clicked element", result))
             }
             BrowserOperation::Type => {
@@ -245,6 +259,7 @@ impl BrowserTool {
                 let session_id = input
                     .session_id
                     .context("session_id is required for browser type")?;
+                let target_id = input.target_id.as_deref();
                 let selector = input
                     .selector
                     .context("selector is required for browser type")?;
@@ -261,7 +276,10 @@ impl BrowserTool {
                     cx,
                 )
                 .await?;
-                let result = self.api.type_text(session_id, &selector, &text).await?;
+                let result = self
+                    .api
+                    .type_text(session_id, target_id, &selector, &text)
+                    .await?;
                 Ok(success(operation, "typed text", result))
             }
             BrowserOperation::Evaluate => {
@@ -269,6 +287,7 @@ impl BrowserTool {
                 let session_id = input
                     .session_id
                     .context("session_id is required for browser evaluate")?;
+                let target_id = input.target_id.as_deref();
                 let expression = input
                     .expression
                     .context("expression is required for browser evaluate")?;
@@ -282,22 +301,87 @@ impl BrowserTool {
                     cx,
                 )
                 .await?;
-                let result = self.api.evaluate(session_id, &expression).await?;
+                let result = self
+                    .api
+                    .evaluate(session_id, target_id, &expression)
+                    .await?;
                 Ok(success(operation, "evaluated expression", result))
             }
             BrowserOperation::ReadConsole => {
                 let session_id = input
                     .session_id
                     .context("session_id is required for browser read_console")?;
-                let result = self.api.read_console(session_id).await?;
+                let target_id = input.target_id.as_deref();
+                let result = self.api.read_console(session_id, target_id).await?;
                 Ok(success(operation, "read console events", result))
             }
             BrowserOperation::ReadNetwork => {
                 let session_id = input
                     .session_id
                     .context("session_id is required for browser read_network")?;
-                let result = self.api.read_network(session_id).await?;
+                let target_id = input.target_id.as_deref();
+                let result = self.api.read_network(session_id, target_id).await?;
                 Ok(success(operation, "read network events", result))
+            }
+            BrowserOperation::OpenTarget => {
+                self.ensure_write_mode(&operation, cx)?;
+                let session_id = input
+                    .session_id
+                    .context("session_id is required for browser open_target")?;
+                let url = input
+                    .url
+                    .context("url is required for browser open_target")?;
+                authorize_browser_operation(
+                    &event_stream,
+                    "Open browser target",
+                    permission_inputs(&operation, [format!("session_id:{session_id} url:{url}")]),
+                    cx,
+                )
+                .await?;
+                let target = self.api.open_target(session_id, &url).await?;
+                Ok(success(operation, "opened browser target", target))
+            }
+            BrowserOperation::CloseTarget => {
+                self.ensure_write_mode(&operation, cx)?;
+                let session_id = input
+                    .session_id
+                    .context("session_id is required for browser close_target")?;
+                let target_id = input
+                    .target_id
+                    .context("target_id is required for browser close_target")?;
+                authorize_browser_operation(
+                    &event_stream,
+                    "Close browser target",
+                    permission_inputs(
+                        &operation,
+                        [format!("session_id:{session_id} target_id:{target_id}")],
+                    ),
+                    cx,
+                )
+                .await?;
+                self.api.close_target(session_id, &target_id).await?;
+                Ok(success(operation, "closed browser target", json!({})))
+            }
+            BrowserOperation::ActivateTarget => {
+                self.ensure_write_mode(&operation, cx)?;
+                let session_id = input
+                    .session_id
+                    .context("session_id is required for browser activate_target")?;
+                let target_id = input
+                    .target_id
+                    .context("target_id is required for browser activate_target")?;
+                authorize_browser_operation(
+                    &event_stream,
+                    "Activate browser target",
+                    permission_inputs(
+                        &operation,
+                        [format!("session_id:{session_id} target_id:{target_id}")],
+                    ),
+                    cx,
+                )
+                .await?;
+                self.api.activate_target(session_id, &target_id).await?;
+                Ok(success(operation, "activated browser target", json!({})))
             }
         }
     }
@@ -405,6 +489,9 @@ fn operation_name(input: &BrowserToolInput) -> &'static str {
         BrowserOperation::Evaluate => "evaluate",
         BrowserOperation::ReadConsole => "read_console",
         BrowserOperation::ReadNetwork => "read_network",
+        BrowserOperation::OpenTarget => "open_target",
+        BrowserOperation::CloseTarget => "close_target",
+        BrowserOperation::ActivateTarget => "activate_target",
         BrowserOperation::StopSession => "stop_session",
     }
 }
