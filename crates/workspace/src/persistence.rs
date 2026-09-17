@@ -1078,6 +1078,28 @@ impl Domain for WorkspaceDb {
                 PRIMARY KEY (workspace_id, path)
             ) STRICT;
         ),
+        // Stable workspace identity for the layout `workspaces` table. The
+        // `workspace_id` INTEGER PRIMARY KEY remains the internal cascade key
+        // for panes/items/breakpoints/toolchains; `workspace_uuid` is the stable
+        // key that survives membership (path-set) changes.
+        sql!(
+            ALTER TABLE workspaces ADD COLUMN workspace_uuid TEXT;
+
+            UPDATE workspaces
+            SET workspace_uuid =
+                lower(hex(randomblob(4))) || '-' ||
+                lower(hex(randomblob(2))) || '-' ||
+                lower(hex(randomblob(2))) || '-' ||
+                lower(hex(randomblob(2))) || '-' ||
+                lower(hex(randomblob(6)));
+        ),
+        sql!(
+            DROP INDEX ix_workspaces_location;
+
+            CREATE UNIQUE INDEX ix_workspaces_uuid
+            ON workspaces(workspace_uuid)
+            WHERE workspace_uuid IS NOT NULL;
+        ),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly
@@ -1338,6 +1360,36 @@ impl WorkspaceDb {
         })
     }
 
+    /// Returns the workspace with the given stable uuid, loading all associated
+    /// data. This is the identity-keyed restore path: it matches by uuid rather
+    /// than by the (mutable) path set.
+    pub(crate) fn workspace_for_uuid(&self, workspace_uuid: Uuid) -> Option<SerializedWorkspace> {
+        let key = workspace_uuid.hyphenated().to_string();
+        let workspace_id = self
+            .select_row_bound::<&str, WorkspaceId>(sql! {
+                SELECT workspace_id FROM workspaces WHERE workspace_uuid = ?
+            })
+            .and_then(|mut prepared_statement| prepared_statement(key.as_str()))
+            .context("Looking up workspace by uuid")
+            .warn_on_err()
+            .flatten()?;
+        self.workspace_for_id(workspace_id)
+    }
+
+    /// The stable uuid of the layout row with the given i64 cascade key, if one
+    /// has been minted.
+    pub(crate) fn workspace_uuid_for_id(&self, workspace_id: WorkspaceId) -> Option<Uuid> {
+        let key = self
+            .select_row_bound::<WorkspaceId, String>(sql! {
+                SELECT workspace_uuid FROM workspaces WHERE workspace_id = ?
+            })
+            .and_then(|mut prepared_statement| prepared_statement(workspace_id))
+            .context("Looking up workspace uuid")
+            .warn_on_err()
+            .flatten()?;
+        Uuid::parse_str(&key).ok()
+    }
+
     fn recent_navigation_history(&self, workspace_id: WorkspaceId) -> Vec<PathBuf> {
         self.select_bound(sql!(
             SELECT path
@@ -1523,6 +1575,23 @@ impl WorkspaceDb {
                     }
                 };
 
+                // Resolve the stable workspace uuid. Once minted it is reused for
+                // the lifetime of the layout row (matched by the i64 cascade key),
+                // so a workspace's identity survives membership changes.
+                let workspace_uuid = {
+                    let existing = conn
+                        .select_row_bound::<WorkspaceId, String>(sql! {
+                            SELECT workspace_uuid FROM workspaces WHERE workspace_id = ?
+                        })
+                        .and_then(|mut prepared_statement| prepared_statement(workspace.id))
+                        .context("Looking up workspace uuid")?;
+                    match existing {
+                        Some(key) => Uuid::parse_str(&key).context("Parsing workspace uuid")?,
+                        None => Uuid::new_v4(),
+                    }
+                };
+                let workspace_uuid_key = workspace_uuid.hyphenated().to_string();
+
                 // Clear out panes and pane_groups
                 conn.exec_bound(sql!(
                     DELETE FROM pane_groups WHERE workspace_id = ?1;
@@ -1600,25 +1669,6 @@ impl WorkspaceDb {
                     }
                 }
 
-                // Clear out old workspaces with the same paths.
-                // Skip this for empty workspaces - they are identified by workspace_id, not paths.
-                // Multiple empty workspaces with different content should coexist.
-                if !paths.paths.is_empty() {
-                    conn.exec_bound(sql!(
-                        DELETE
-                        FROM workspaces
-                        WHERE
-                            workspace_id != ?1 AND
-                            paths IS ?2 AND
-                            remote_connection_id IS ?3
-                    ))?((
-                        workspace.id,
-                        paths.paths.clone(),
-                        remote_connection_id,
-                    ))
-                    .context("clearing out old locations")?;
-                }
-
                 // Upsert
                 let query = sql!(
                     INSERT INTO workspaces(
@@ -1639,9 +1689,10 @@ impl WorkspaceDb {
                         bottom_dock_zoom,
                         session_id,
                         window_id,
+                        workspace_uuid,
                         timestamp
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, CURRENT_TIMESTAMP)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, CURRENT_TIMESTAMP)
                     ON CONFLICT DO
                     UPDATE SET
                         paths = ?2,
@@ -1660,6 +1711,7 @@ impl WorkspaceDb {
                         bottom_dock_zoom = ?15,
                         session_id = ?16,
                         window_id = ?17,
+                        workspace_uuid = ?18,
                         timestamp = CURRENT_TIMESTAMP
                 );
                 let mut prepared_query = conn.exec_bound(query)?;
@@ -1673,6 +1725,7 @@ impl WorkspaceDb {
                     workspace.docks,
                     workspace.session_id,
                     workspace.window_id,
+                    workspace_uuid_key,
                 );
 
                 prepared_query(args).context("Updating workspace")?;
@@ -3497,14 +3550,12 @@ mod tests {
         assert_eq!(db.workspace_for_roots(&["/tmp"]).unwrap(), workspace_2);
         assert_eq!(db.workspace_for_roots(&["/tmp3", "/tmp2", "/tmp4"]), None);
 
-        // Test 'mutate' case of updating a pre-existing id
+        // Mutating a workspace's paths updates the existing row in place: the
+        // i64 cascade key (and therefore its panes/items) is unchanged.
         workspace_2.paths = PathList::new(&["/tmp", "/tmp2"]);
 
         db.save_workspace(workspace_2.clone()).await;
-        assert_eq!(
-            db.workspace_for_roots(&["/tmp", "/tmp2"]).unwrap(),
-            workspace_2
-        );
+        assert_eq!(db.workspace_for_id(WorkspaceId(2)).unwrap(), workspace_2);
 
         // Test other mechanism for mutating
         let mut workspace_3 = SerializedWorkspace {
@@ -3526,20 +3577,64 @@ mod tests {
         };
 
         db.save_workspace(workspace_3.clone()).await;
-        assert_eq!(
-            db.workspace_for_roots(&["/tmp", "/tmp2"]).unwrap(),
-            workspace_3
-        );
+        assert_eq!(db.workspace_for_id(WorkspaceId(3)).unwrap(), workspace_3);
 
-        // Make sure that updating paths differently also works
+        // Mutating to a fresh path set still round-trips through the legacy
+        // path-based lookup.
         workspace_3.paths = PathList::new(&["/tmp3", "/tmp4", "/tmp2"]);
         db.save_workspace(workspace_3.clone()).await;
-        assert_eq!(db.workspace_for_roots(&["/tmp2", "tmp"]), None);
         assert_eq!(
             db.workspace_for_roots(&["/tmp2", "/tmp3", "/tmp4"])
                 .unwrap(),
             workspace_3
         );
+    }
+
+    #[gpui::test]
+    async fn test_workspace_uuid_stability() {
+        zlog::init_test();
+
+        let db = WorkspaceDb::open_test_db("test_workspace_uuid_stability").await;
+
+        let center_group = pane_with_items(&[1, 2]);
+
+        let mut workspace = SerializedWorkspace {
+            id: WorkspaceId(1),
+            paths: PathList::new(&["/tmp", "/tmp2"]),
+            identity_paths: None,
+            location: SerializedWorkspaceLocation::Local,
+            center_group,
+            window_bounds: Default::default(),
+            display: Default::default(),
+            docks: Default::default(),
+            centered_layout: false,
+            bookmarks: Default::default(),
+            breakpoints: Default::default(),
+            session_id: None,
+            window_id: None,
+            user_toolchains: Default::default(),
+            recent_navigation_history: Default::default(),
+        };
+
+        db.save_workspace(workspace.clone()).await;
+
+        // The first save mints a stable uuid for the layout row.
+        let uuid = db
+            .workspace_uuid_for_id(WorkspaceId(1))
+            .expect("first save should mint a uuid");
+
+        // Adding a project (mutating the path set) must not mint a new uuid nor
+        // a new layout row: the i64 cascade key and uuid stay put.
+        workspace.paths = PathList::new(&["/tmp", "/tmp2", "/tmp3"]);
+        db.save_workspace(workspace.clone()).await;
+
+        assert_eq!(db.workspace_uuid_for_id(WorkspaceId(1)), Some(uuid));
+
+        // Restoring by uuid yields the mutated workspace with its layout intact.
+        let restored = db.workspace_for_uuid(uuid).unwrap();
+        assert_eq!(restored.id, WorkspaceId(1));
+        assert_eq!(restored.paths, PathList::new(&["/tmp", "/tmp2", "/tmp3"]));
+        assert_eq!(restored.center_group, workspace.center_group);
     }
 
     #[gpui::test]
