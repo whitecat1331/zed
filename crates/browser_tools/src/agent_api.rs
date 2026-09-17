@@ -62,7 +62,7 @@ impl AgentBrowserApi {
 
         let mut client = CdpClient::connect(&endpoint).await?;
         let create_result = client
-            .send_command("Target.createTarget", json!({ "url": url }))
+            .send_command("Target.createTarget", json!({ "url": "about:blank" }))
             .await?;
         let target_id = create_result
             .get("targetId")
@@ -86,6 +86,10 @@ impl AgentBrowserApi {
         client.send_command("Page.enable", json!({})).await?;
         client.send_command("Runtime.enable", json!({})).await?;
         client.send_command("Network.enable", json!({})).await?;
+        client
+            .send_command("Page.navigate", json!({ "url": url }))
+            .await?;
+        wait_for_page_load(&mut client, url).await?;
 
         let id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
         self.sessions.lock().await.insert(
@@ -352,6 +356,35 @@ async fn evaluate_value(client: &mut CdpClient, expression: &str) -> Result<Valu
         .and_then(|value| value.get("value"))
         .cloned()
         .unwrap_or(Value::Null))
+}
+
+async fn wait_for_page_load(client: &mut CdpClient, url: &str) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let state = evaluate_value(
+            client,
+            "(function() { return { href: location.href, ready: document.readyState }; })()",
+        )
+        .await;
+        let loaded = state
+            .as_ref()
+            .map(|value| {
+                value
+                    .get("href")
+                    .and_then(Value::as_str)
+                    .map(|href| href != "about:blank")
+                    .unwrap_or(false)
+                    && value.get("ready").and_then(Value::as_str) == Some("complete")
+            })
+            .unwrap_or(false);
+        if loaded {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow!("timed out waiting for {url} to load"));
+        }
+        smol::Timer::after(Duration::from_millis(100)).await;
+    }
 }
 
 fn is_console_event(event: &Value) -> bool {
