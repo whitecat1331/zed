@@ -195,16 +195,34 @@ impl BrowserTool {
                     .context("session_id is required for browser screenshot")?;
                 let target_id = input.target_id.as_deref();
                 let data = self.api.screenshot(session_id, target_id).await?;
-                let image = cx
-                    .background_spawn(async move {
-                        LanguageModelImage::from_base64_image(&data, "image/png")
-                    })
-                    .await
-                    .context("failed to convert browser screenshot")?
-                    .context(
-                        "browser screenshot could not be converted for language model input",
-                    )?;
-                Ok(BrowserToolOutput::Screenshot { operation, image })
+                let supports_images = cx.update(|cx| {
+                    self.thread
+                        .read_with(cx, |thread, _| {
+                            thread.model().is_some_and(|model| model.supports_images())
+                        })
+                        .unwrap_or(false)
+                });
+                if supports_images {
+                    let image = cx
+                        .background_spawn(async move {
+                            LanguageModelImage::from_base64_image(&data, "image/png")
+                        })
+                        .await
+                        .context("failed to convert browser screenshot")?
+                        .context(
+                            "browser screenshot could not be converted for language model input",
+                        )?;
+                    Ok(BrowserToolOutput::Screenshot { operation, image })
+                } else {
+                    Ok(success(
+                        operation,
+                        "captured screenshot, but the current model cannot accept image input",
+                        json!({
+                            "captured": true,
+                            "base64_bytes": data.len(),
+                        }),
+                    ))
+                }
             }
             BrowserOperation::StartSession => {
                 self.ensure_write_mode(&operation, cx)?;
