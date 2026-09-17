@@ -248,6 +248,7 @@ dependencies = [
  "anyhow",
  "async-channel 2.5.0",
  "async-io",
+ "browser_tools",
  "chrono",
  "client",
  "clock",
@@ -2397,6 +2398,20 @@ dependencies = [
  "gpui",
  "ui",
  "workspace",
+]
+
+[[package]]
+name = "browser_tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-tungstenite",
+ "futures 0.3.32",
+ "serde",
+ "serde_json",
+ "smol",
+ "thiserror 2.0.17",
+ "url",
 ]
 
 [[package]]
