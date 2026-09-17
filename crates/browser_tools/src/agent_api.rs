@@ -126,7 +126,6 @@ impl AgentBrowserApi {
             .context("unknown browser session")?;
 
         let page = evaluate_value(&mut session.client, SNAPSHOT_EXPRESSION).await?;
-        let events = session.client.recent_events();
 
         Ok(json!({
             "url": page
@@ -139,8 +138,6 @@ impl AgentBrowserApi {
                 .get("elements")
                 .cloned()
                 .unwrap_or_else(|| Value::Array(vec![])),
-            "console": filter_events(events, is_console_event, 100),
-            "network": filter_events(events, is_network_event, 100),
         }))
     }
 
