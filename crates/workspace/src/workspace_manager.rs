@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -214,6 +214,18 @@ impl WorkspaceManager {
         Ok(None)
     }
 
+    /// Managed workspaces whose membership includes the given project path —
+    /// the disambiguation set for the open-folder ask.
+    pub fn workspaces_for_path(&self, path: &Path) -> Result<Vec<ManagedWorkspaceId>> {
+        let key = path.to_string_lossy().into_owned();
+        let rows = self.select_bound::<&str, String>(sql! {
+            SELECT workspace_id FROM managed_workspace_projects WHERE path = ?
+        })?(key.as_str())?;
+        rows.into_iter()
+            .map(|id| ManagedWorkspaceId::from_key_string(&id))
+            .collect()
+    }
+
     /// Resolve a workspace by its hyphenated id or its user-giveable name.
     pub fn resolve(&self, id_or_name: &str) -> Result<Option<ManagedWorkspaceId>> {
         if let Ok(id) = ManagedWorkspaceId::from_key_string(id_or_name)
@@ -239,6 +251,13 @@ impl WorkspaceManager {
             .into_iter()
             .map(|project| project.path)
             .collect())
+    }
+
+    /// The project paths to open for a workspace, in position order — the
+    /// UI-facing "open by id" entry point. Callers feed the result to
+    /// [`crate::open_paths`] to actually open the workspace.
+    pub fn open(&self, workspace_id: ManagedWorkspaceId) -> Result<Vec<PathBuf>> {
+        self.project_paths(workspace_id)
     }
 
     /// The full managed-workspace list, ordered by name — backing for the home
