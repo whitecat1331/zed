@@ -1,4 +1,5 @@
 use agent_client_protocol::schema::v1 as acp;
+use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result};
 use browser_tools::AgentBrowserApi;
 use gpui::{App, SharedString, Task, WeakEntity};
@@ -6,6 +7,7 @@ use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use settings::Settings;
 use std::sync::Arc;
 
 use crate::{AgentTool, Thread, ToolCallEventStream, ToolInput, ToolPermissionContext};
@@ -119,9 +121,10 @@ pub struct BrowserTool {
 }
 
 impl BrowserTool {
-    pub fn new(thread: WeakEntity<Thread>) -> Self {
+    pub fn new(thread: WeakEntity<Thread>, cx: &App) -> Self {
+        let chromium_path = AgentSettings::get_global(cx).browser_chromium_path.clone();
         Self {
-            api: AgentBrowserApi::new(None),
+            api: AgentBrowserApi::new(chromium_path),
             thread,
         }
     }
@@ -402,9 +405,6 @@ fn operation_name(input: &BrowserToolInput) -> &'static str {
         BrowserOperation::Evaluate => "evaluate",
         BrowserOperation::ReadConsole => "read_console",
         BrowserOperation::ReadNetwork => "read_network",
-        BrowserOperation::StopSession => "stop_session",
-    }
-}
         BrowserOperation::StopSession => "stop_session",
     }
 }

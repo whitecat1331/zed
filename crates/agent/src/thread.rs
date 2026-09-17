@@ -2210,7 +2210,7 @@ impl Thread {
             environment.clone(),
             cx.weak_entity(),
         ));
-        self.add_tool(BrowserTool::new(cx.weak_entity()));
+        self.add_tool(BrowserTool::new(cx.weak_entity(), cx));
         self.add_tool(EditFileTool::new(
             self.project.clone(),
             cx.weak_entity(),

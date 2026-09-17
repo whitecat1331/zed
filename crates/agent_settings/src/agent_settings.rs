@@ -3,7 +3,7 @@ mod user_agents_md;
 
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::fmt;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
 use anyhow::Context as _;
@@ -243,6 +243,7 @@ pub struct AgentSettings {
     pub show_merge_conflict_indicator: bool,
     pub tool_permissions: ToolPermissions,
     pub sandbox_permissions: SandboxPermissions,
+    pub browser_chromium_path: Option<PathBuf>,
 }
 
 impl AgentSettings {
@@ -2002,5 +2003,4 @@ mod tests {
             assert_eq!(user_layout.project_panel_dock, Some(DockSide::Right));
         });
     }
-}
 }
