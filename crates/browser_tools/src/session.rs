@@ -1,20 +1,20 @@
 use crate::cdp::CdpClient;
+use std::collections::HashMap;
 
-/// A running browser session: one page target flattened onto a browser websocket.
+/// A running browser session: a browser-level connection plus its targets.
 pub struct BrowserSession {
     /// Opaque session id used by the agent tool.
     pub id: u64,
-    /// The browser-level websocket connection this session is flattened onto.
+    /// The browser-level websocket connection.
     pub client: CdpClient,
-    /// Flattened CDP session id for the page target.
-    pub session_id: String,
-    /// CDP target id, used to close the target on teardown.
-    pub target_id: String,
-    /// Most recently navigated URL (best-effort).
-    pub url: String,
+    /// Flattened targets (tabs, workers, etc.) keyed by CDP target id.
+    pub targets: HashMap<String, BrowserTarget>,
+    /// The target operations default to when none is specified.
+    pub active_target_id: Option<String>,
     /// Handle to the Chromium process, so teardown can close the browser.
     pub child: smol::process::Child,
 }
+
 /// A single flattened target (page, worker, service worker, ...).
 pub struct BrowserTarget {
     /// CDP target id, used to close/attach the target.

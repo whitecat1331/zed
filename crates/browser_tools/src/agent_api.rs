@@ -1,5 +1,5 @@
 use crate::cdp::CdpClient;
-use crate::session::BrowserSession;
+use crate::session::{BrowserSession, BrowserTarget};
 use anyhow::{Context, Result, anyhow};
 use futures::{AsyncBufReadExt, StreamExt};
 use serde_json::{Value, json};
@@ -34,7 +34,13 @@ impl AgentBrowserApi {
         let sessions = self.sessions.lock().await;
         sessions
             .values()
-            .map(|session| json!({ "session_id": session.id, "url": session.url }))
+            .map(|session| {
+                json!({
+                    "session_id": session.id,
+                    "active_target_id": session.active_target_id,
+                    "targets": session.targets.values().map(target_to_json).collect::<Vec<_>>(),
+                })
+            })
             .collect()
     }
 
@@ -66,77 +72,108 @@ impl AgentBrowserApi {
         .await?;
 
         let mut client = CdpClient::connect(&endpoint).await?;
-        let create_result = client
-            .send_command("Target.createTarget", json!({ "url": "about:blank" }))
-            .await?;
-        let target_id = create_result
-            .get("targetId")
-            .and_then(Value::as_str)
-            .context("Target.createTarget returned no targetId")?
-            .to_string();
-
-        let attach_result = client
-            .send_command(
-                "Target.attachToTarget",
-                json!({ "targetId": target_id, "flatten": true }),
-            )
-            .await?;
-        let session_id = attach_result
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .context("Target.attachToTarget returned no sessionId")?
-            .to_string();
-        client.set_session_id(Some(session_id.clone()));
-
-        client.send_command("Page.enable", json!({})).await?;
-        client.send_command("Runtime.enable", json!({})).await?;
-        client.send_command("Network.enable", json!({})).await?;
-        client
-            .send_command("Page.navigate", json!({ "url": url }))
-            .await?;
-        wait_for_page_load(&mut client, url).await?;
+        let target = create_target(&mut client, url).await?;
 
         let id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
+        let mut targets = HashMap::new();
+        let active_target_id = target.target_id.clone();
+        targets.insert(target.target_id.clone(), target);
         self.sessions.lock().await.insert(
             id,
             BrowserSession {
                 id,
                 client,
-                session_id,
-                target_id,
-                url: url.to_string(),
+                targets,
+                active_target_id: Some(active_target_id),
                 child,
             },
         );
         Ok(id)
     }
 
-    pub async fn navigate(&self, session_id: u64, url: &str) -> Result<()> {
+    pub async fn open_target(&self, session_id: u64, url: &str) -> Result<Value> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions
             .get_mut(&session_id)
             .context("unknown browser session")?;
+        let target = create_target(&mut session.client, url).await?;
+        let target_json = target_to_json(&target);
+        session.active_target_id = Some(target.target_id.clone());
+        session.targets.insert(target.target_id, target);
+        Ok(target_json)
+    }
+
+    pub async fn close_target(&self, session_id: u64, target_id: &str) -> Result<()> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target = session
+            .targets
+            .remove(target_id)
+            .context("unknown browser target")?;
         session
             .client
-            .send_command("Page.navigate", json!({ "url": url }))
+            .send_command("Target.closeTarget", json!({ "targetId": target.target_id }))
             .await?;
-        session.url = url.to_string();
+        if session.active_target_id.as_deref() == Some(target_id) {
+            session.active_target_id = session.targets.keys().next().cloned();
+        }
         Ok(())
     }
 
-    pub async fn snapshot(&self, session_id: u64) -> Result<Value> {
+    pub async fn activate_target(&self, session_id: u64, target_id: &str) -> Result<()> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions
             .get_mut(&session_id)
             .context("unknown browser session")?;
+        if !session.targets.contains_key(target_id) {
+            anyhow::bail!("unknown browser target");
+        }
+        session.active_target_id = Some(target_id.to_string());
+        Ok(())
+    }
 
-        let page = evaluate_value(&mut session.client, SNAPSHOT_EXPRESSION).await?;
+    pub async fn navigate(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        url: &str,
+    ) -> Result<()> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        session
+            .client
+            .send_command_with_session(
+                Some(&target_session_id),
+                "Page.navigate",
+                json!({ "url": url }),
+            )
+            .await?;
+        update_target_url(session, target_id, url);
+        Ok(())
+    }
+
+    pub async fn snapshot(&self, session_id: u64, target_id: Option<&str>) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let page =
+            evaluate_value(&mut session.client, Some(&target_session_id), SNAPSHOT_EXPRESSION)
+                .await?;
+        let target = get_target(session, target_id)?;
 
         Ok(json!({
+            "target_id": target.target_id,
             "url": page
                 .get("url")
                 .cloned()
-                .unwrap_or_else(|| Value::String(session.url.clone())),
+                .unwrap_or_else(|| Value::String(target.url.clone())),
             "title": page.get("title").cloned().unwrap_or(Value::Null),
             "text": page.get("text").cloned().unwrap_or(Value::Null),
             "elements": page
@@ -146,15 +183,21 @@ impl AgentBrowserApi {
         }))
     }
 
-    pub async fn evaluate(&self, session_id: u64, expression: &str) -> Result<Value> {
+    pub async fn evaluate(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        expression: &str,
+    ) -> Result<Value> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions
             .get_mut(&session_id)
             .context("unknown browser session")?;
-
+        let target_session_id = resolve_target_session_id(session, target_id)?;
         let result = session
             .client
-            .send_command(
+            .send_command_with_session(
+                Some(&target_session_id),
                 "Runtime.evaluate",
                 json!({
                     "expression": expression,
@@ -178,31 +221,44 @@ impl AgentBrowserApi {
         }))
     }
 
-    pub async fn click(&self, session_id: u64, selector: &str) -> Result<Value> {
+    pub async fn click(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        selector: &str,
+    ) -> Result<Value> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions
             .get_mut(&session_id)
             .context("unknown browser session")?;
-
+        let target_session_id = resolve_target_session_id(session, target_id)?;
         let expression = format!(
             "(() => {{ const el = document.querySelector({selector}); if (!el) return {{ clicked: false, reason: 'no element matches selector' }}; el.click(); return {{ clicked: true, tag: el.tagName.toLowerCase(), text: (el.innerText || el.value || '').toString().slice(0, 500) }}; }})()",
             selector = serde_json::to_string(selector)?,
         );
-        let value = evaluate_value(&mut session.client, &expression).await?;
+        let value =
+            evaluate_value(&mut session.client, Some(&target_session_id), &expression).await?;
         Ok(json!({ "clicked": value }))
     }
 
-    pub async fn type_text(&self, session_id: u64, selector: &str, text: &str) -> Result<Value> {
+    pub async fn type_text(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        selector: &str,
+        text: &str,
+    ) -> Result<Value> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions
             .get_mut(&session_id)
             .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
 
         let focus = format!(
             "(() => {{ const el = document.querySelector({selector}); if (!el) return {{ focused: false, reason: 'no element matches selector' }}; el.focus(); return {{ focused: true, tag: el.tagName.toLowerCase() }}; }})()",
             selector = serde_json::to_string(selector)?,
         );
-        let focused = evaluate_value(&mut session.client, &focus).await?;
+        let focused = evaluate_value(&mut session.client, Some(&target_session_id), &focus).await?;
         if focused.get("focused").and_then(Value::as_bool) != Some(true) {
             return Ok(json!({
                 "typed": false,
@@ -215,27 +271,37 @@ impl AgentBrowserApi {
 
         session
             .client
-            .send_command("Input.insertText", json!({ "text": text }))
+            .send_command_with_session(
+                Some(&target_session_id),
+                "Input.insertText",
+                json!({ "text": text }),
+            )
             .await?;
         Ok(json!({ "typed": true, "selector": selector, "text": text }))
     }
 
-    pub async fn read_console(&self, session_id: u64) -> Result<Value> {
+    pub async fn read_console(&self, session_id: u64, target_id: Option<&str>) -> Result<Value> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions
             .get_mut(&session_id)
             .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
         let events = session.client.recent_events();
-        Ok(json!({ "console": filter_events(events, is_console_event, 100) }))
+        Ok(json!({
+            "console": filter_events(events, is_console_event, Some(&target_session_id), 100),
+        }))
     }
 
-    pub async fn read_network(&self, session_id: u64) -> Result<Value> {
+    pub async fn read_network(&self, session_id: u64, target_id: Option<&str>) -> Result<Value> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions
             .get_mut(&session_id)
             .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
         let events = session.client.recent_events();
-        Ok(json!({ "network": filter_events(events, is_network_event, 100) }))
+        Ok(json!({
+            "network": filter_events(events, is_network_event, Some(&target_session_id), 100),
+        }))
     }
 
     pub async fn stop_session(&self, session_id: u64, keep_open: bool) -> Result<()> {
@@ -248,14 +314,17 @@ impl AgentBrowserApi {
 
         let mut client = session.client;
         let mut child = session.child;
-        let target_id = session.target_id;
 
         if keep_open {
-            // Close only the page target, leaving the browser process running.
-            client.set_session_id(None);
-            client
-                .send_command("Target.closeTarget", json!({ "targetId": target_id }))
-                .await?;
+            // Close every target but leave the browser process running.
+            for target in session.targets.values() {
+                client
+                    .send_command(
+                        "Target.closeTarget",
+                        json!({ "targetId": target.target_id }),
+                    )
+                    .await?;
+            }
         } else {
             // Default teardown: terminate the whole Chromium process.
             child.kill().context("failed to close Chromium")?;
@@ -267,163 +336,106 @@ impl AgentBrowserApi {
         if let Some(path) = &self.chromium_path {
             return Ok(path.clone());
         }
-        discover_chromium().context("no Chromium binary found; set --chromium-path")
+        discover_chromium().context("no Chromium binary found; set browser_chromium_path")
     }
 }
 
-async fn read_devtools_endpoint(stderr: smol::process::ChildStderr) -> Result<String> {
-    let mut lines = futures::io::BufReader::new(stderr).lines();
-    while let Some(line) = lines.next().await {
-        let line = line.context("failed to read Chromium stderr")?;
-        if let Some(endpoint) = parse_devtools_endpoint(&line) {
-            return Ok(endpoint);
+fn target_to_json(target: &BrowserTarget) -> Value {
+    json!({
+        "target_id": target.target_id,
+        "target_type": target.target_type,
+        "url": target.url,
+    })
+}
+
+fn resolve_target_session_id(session: &BrowserSession, target_id: Option<&str>) -> Result<String> {
+    let resolved = match target_id {
+        Some(target_id) => target_id.to_string(),
+        None => session
+            .active_target_id
+            .clone()
+            .context("no active browser target")?,
+    };
+    session
+        .targets
+        .get(&resolved)
+        .map(|target| target.session_id.clone())
+        .context("unknown browser target")
+}
+
+fn get_target<'a>(
+    session: &'a BrowserSession,
+    target_id: Option<&str>,
+) -> Result<&'a BrowserTarget> {
+    let resolved = match target_id {
+        Some(target_id) => target_id.to_string(),
+        None => session
+            .active_target_id
+            .clone()
+            .context("no active browser target")?,
+    };
+    session
+        .targets
+        .get(&resolved)
+        .context("unknown browser target")
+}
+
+fn update_target_url(session: &mut BrowserSession, target_id: Option<&str>, url: &str) {
+    let resolved = target_id
+        .map(str::to_string)
+        .or_else(|| session.active_target_id.clone());
+    if let Some(resolved) = resolved {
+        if let Some(target) = session.targets.get_mut(&resolved) {
+            target.url = url.to_string();
         }
     }
-    Err(anyhow!(
-        "Chromium exited before exposing a DevTools endpoint"
-    ))
 }
 
-fn parse_devtools_endpoint(line: &str) -> Option<String> {
-    let marker = "DevTools listening on ";
-    let start = line.find(marker)? + marker.len();
-    Some(line[start..].trim().to_string())
-}
+async fn create_target(client: &mut CdpClient, url: &str) -> Result<BrowserTarget> {
+    let create_result = client
+        .send_command("Target.createTarget", json!({ "url": "about:blank" }))
+        .await?;
+    let target_id = create_result
+        .get("targetId")
+        .and_then(Value::as_str)
+        .context("Target.createTarget returned no targetId")?
+        .to_string();
+    let target_type = create_result
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("page")
+        .to_string();
 
-fn discover_chromium() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("ZED_BROWSER_CHROMIUM_PATH") {
-        return Some(PathBuf::from(path));
-    }
-    let candidates = [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    ];
-    for candidate in candidates {
-        let path = Path::new(candidate);
-        if path.exists() {
-            return Some(path.to_path_buf());
-        }
-    }
-    None
-}
-
-const SNAPSHOT_EXPRESSION: &str = r#"(function() {
-  var body = document.body ? document.body.innerText.slice(0, 10000) : '';
-  var elements = [];
-  var all = document.querySelectorAll('a, button, input, textarea, select, [role="button"], [role="link"], [role="textbox"], summary');
-  var seen = 0;
-  for (var i = 0; i < all.length; i++) {
-    if (seen >= 100) break;
-    var el = all[i];
-    var rect = el.getBoundingClientRect();
-    if (rect.width === 0 && rect.height === 0) continue;
-    var label = (el.getAttribute('aria-label') || el.innerText || el.value || el.getAttribute('placeholder') || el.getAttribute('name') || '').toString().trim().slice(0, 200);
-    elements.push({
-      tag: el.tagName.toLowerCase(),
-      id: el.id || null,
-      type: el.getAttribute('type') || null,
-      label: label,
-      selector: cssPath(el),
-    });
-    seen += 1;
-  }
-  return { url: location.href, title: document.title, text: body, elements: elements };
-
-  function cssPath(el) {
-    if (el.id) return '#' + CSS.escape(el.id);
-    var parts = [];
-    var node = el;
-    while (node && node.nodeType === 1 && node !== document.body) {
-      var name = node.tagName.toLowerCase();
-      var nth = 1;
-      var sibling = node;
-      while ((sibling = sibling.previousElementSibling)) {
-        if (sibling.tagName.toLowerCase() === name) nth += 1;
-      }
-      parts.unshift(name + ':nth-of-type(' + nth + ')');
-      node = node.parentElement;
-    }
-    return parts.join(' > ');
-  }
-})()"#;
-
-async fn evaluate_value(client: &mut CdpClient, expression: &str) -> Result<Value> {
-    let result = client
+    let attach_result = client
         .send_command(
-            "Runtime.evaluate",
-            json!({
-                "expression": expression,
-                "returnByValue": true,
-                "awaitPromise": true,
-            }),
+            "Target.attachToTarget",
+            json!({ "targetId": target_id, "flatten": true }),
         )
         .await?;
-    Ok(result
-        .get("result")
-        .and_then(|value| value.get("value"))
-        .cloned()
-        .unwrap_or(Value::Null))
-}
+    let session_id = attach_result
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .context("Target.attachToTarget returned no sessionId")?
+        .to_string();
 
-async fn wait_for_page_load(client: &mut CdpClient, url: &str) -> Result<()> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        let state = evaluate_value(
-            client,
-            "(function() { return { href: location.href, ready: document.readyState }; })()",
+    client
+        .send_command_with_session(Some(&session_id), "Page.enable", json!({}))
+        .await?;
+    client
+        .send_command_with_session(Some(&session_id), "Runtime.enable", json!({}))
+        .await?;
+    client
+        .send_command_with_session(Some(&session_id), "Network.enable", json!({}))
+        .await?;
+    client
+        .send_command_with_session(
+            Some(&session_id),
+            "Page.navigate",
+            json!({ "url": url }),
         )
-        .await;
-        let loaded = state
-            .as_ref()
-            .map(|value| {
-                value
-                    .get("href")
-                    .and_then(Value::as_str)
-                    .map(|href| href != "about:blank")
-                    .unwrap_or(false)
-                    && value.get("ready").and_then(Value::as_str) == Some("complete")
-            })
-            .unwrap_or(false);
-        if loaded {
-            return Ok(());
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(anyhow!("timed out waiting for {url} to load"));
-        }
-        smol::Timer::after(Duration::from_millis(100)).await;
-    }
-}
+        .await?;
+    wait_for_page_load(client, Some(&session_id), url).await?;
 
-fn is_console_event(event: &Value) -> bool {
-    event
-        .get("method")
-        .and_then(Value::as_str)
-        .map(|method| method == "Runtime.consoleAPICalled")
-        .unwrap_or(false)
-}
-
-fn is_network_event(event: &Value) -> bool {
-    event
-        .get("method")
-        .and_then(Value::as_str)
-        .map(|method| method.starts_with("Network."))
-        .unwrap_or(false)
-}
-
-fn filter_events(events: &[Value], predicate: fn(&Value) -> bool, max: usize) -> Vec<Value> {
-    let mut out = Vec::new();
-    for event in events.iter().rev() {
-        if predicate(event) {
-            out.push(event.clone());
-            if out.len() >= max {
-                break;
-            }
-        }
-    }
-    out.reverse();
-    out
-}
     Ok(BrowserTarget {
         target_id,
         session_id,
