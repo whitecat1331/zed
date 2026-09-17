@@ -71,6 +71,10 @@ pub struct BrowserToolInput {
     /// JavaScript expression to evaluate, used by `evaluate`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expression: Option<String>,
+    /// Keep the browser process running after stopping the session. Defaults to
+    /// false, which closes the browser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_open: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +200,7 @@ impl BrowserTool {
                 let session_id = input
                     .session_id
                     .context("session_id is required for browser stop_session")?;
+                let keep_open = input.keep_open.unwrap_or(false);
                 authorize_browser_operation(
                     &event_stream,
                     "Stop browser session",
@@ -203,7 +208,7 @@ impl BrowserTool {
                     cx,
                 )
                 .await?;
-                self.api.stop_session(session_id).await?;
+                self.api.stop_session(session_id, keep_open).await?;
                 Ok(success(operation, "stopped browser session", json!({})))
             }
             BrowserOperation::Click => {

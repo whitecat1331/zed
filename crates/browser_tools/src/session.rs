@@ -12,4 +12,6 @@ pub struct BrowserSession {
     pub target_id: String,
     /// Most recently navigated URL (best-effort).
     pub url: String,
+    /// Handle to the Chromium process, so teardown can close the browser.
+    pub child: smol::process::Child,
 }

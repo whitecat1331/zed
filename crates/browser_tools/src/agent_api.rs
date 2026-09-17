@@ -100,6 +100,7 @@ impl AgentBrowserApi {
                 session_id,
                 target_id,
                 url: url.to_string(),
+                child,
             },
         );
         Ok(id)
@@ -235,23 +236,28 @@ impl AgentBrowserApi {
         Ok(json!({ "network": filter_events(events, is_network_event, 100) }))
     }
 
-    pub async fn stop_session(&self, session_id: u64) -> Result<()> {
+    pub async fn stop_session(&self, session_id: u64, keep_open: bool) -> Result<()> {
         let session = self
             .sessions
             .lock()
             .await
             .remove(&session_id)
             .context("unknown browser session")?;
-        // Best-effort target teardown; the browser process keeps running but the
-        // target is closed.
+
         let mut client = session.client;
-        client.set_session_id(None);
-        client
-            .send_command(
-                "Target.closeTarget",
-                json!({ "targetId": session.target_id }),
-            )
-            .await?;
+        let mut child = session.child;
+        let target_id = session.target_id;
+
+        if keep_open {
+            // Close only the page target, leaving the browser process running.
+            client.set_session_id(None);
+            client
+                .send_command("Target.closeTarget", json!({ "targetId": target_id }))
+                .await?;
+        } else {
+            // Default teardown: terminate the whole Chromium process.
+            child.kill().context("failed to close Chromium")?;
+        }
         Ok(())
     }
 
