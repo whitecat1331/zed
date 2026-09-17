@@ -123,7 +123,7 @@ async fn fetch_chromium_metadata(
         .await
         .context("fetching Chrome for Testing versions")?;
     let mut bytes = Vec::new();
-    let mut body = response.body_mut();
+    let body = response.body_mut();
     body.read_to_end(&mut bytes)
         .await
         .context("reading Chrome for Testing versions")?;
