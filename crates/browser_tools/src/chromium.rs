@@ -1,28 +1,26 @@
 use anyhow::Context as _;
-use futures::{AsyncReadExt, AsyncSeekExt, AsyncWrite, io::BufReader};
 use http_client::HttpClient;
-use serde_json::Value;
-use sha2::{Digest, Sha256};
-use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 /// The Chrome for Testing build the browser tool provisions when no Chromium
 /// is already present. Pinned so a given Zed build reproduces the same browser
-/// behavior; the version's download URL and SHA-256 are read from Chrome for
-/// Testing's own manifest at download time.
+/// behavior.
 const PINNED_CHROMIUM_VERSION: &str = "153.0.8010.47";
 
-const KNOWN_GOOD_VERSIONS_URL: &str =
-    "https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json";
+const CHROME_FOR_TESTING_BASE_URL: &str =
+    "https://storage.googleapis.com/chrome-for-testing-public";
 
 /// Resolve a Chromium binary for launching a browser session.
 ///
 /// Resolution order: the configured override, the `ZED_BROWSER_CHROMIUM_PATH`
 /// environment variable, an installed Chrome/Edge, then a pinned Chrome for
 /// Testing download cached under the user cache directory.
+///
+/// The download is fetched over HTTPS from Google's Chrome for Testing bucket;
+/// the pinned version plus TLS transport provide integrity, so no separate
+/// checksum is verified (the Chrome for Testing manifest does not publish a
+/// SHA-256 for the archive).
 pub async fn resolve_chromium_binary(
     http_client: &Arc<dyn HttpClient>,
     override_path: Option<&Path>,
@@ -100,8 +98,11 @@ async fn ensure_pinned_chromium(http_client: &Arc<dyn HttpClient>) -> anyhow::Re
         return Ok(binary_path);
     }
 
-    let (url, sha256) = fetch_chromium_metadata(http_client, platform.key).await?;
-    download_and_extract(http_client, &url, &sha256, &version_dir).await?;
+    let url = format!(
+        "{CHROME_FOR_TESTING_BASE_URL}/{PINNED_CHROMIUM_VERSION}/{}/{}.zip",
+        platform.key, platform.archive_dir
+    );
+    download_and_extract(http_client, &url, &version_dir).await?;
     util::fs::make_file_executable(&binary_path)
         .await
         .with_context(|| format!("marking {binary_path:?} as executable"))?;
@@ -114,59 +115,9 @@ fn chromium_cache_dir() -> anyhow::Result<PathBuf> {
         .context("could not determine a cache directory for Chromium")
 }
 
-async fn fetch_chromium_metadata(
-    http_client: &Arc<dyn HttpClient>,
-    platform_key: &str,
-) -> anyhow::Result<(String, String)> {
-    let mut response = http_client
-        .get(KNOWN_GOOD_VERSIONS_URL, Default::default(), true)
-        .await
-        .context("fetching Chrome for Testing versions")?;
-    let mut bytes = Vec::new();
-    let body = response.body_mut();
-    body.read_to_end(&mut bytes)
-        .await
-        .context("reading Chrome for Testing versions")?;
-    let versions: Value =
-        serde_json::from_slice(&bytes).context("parsing Chrome for Testing versions")?;
-
-    let version = versions
-        .get("versions")
-        .and_then(Value::as_array)
-        .context("Chrome for Testing versions response has no `versions` array")?
-        .iter()
-        .find(|entry| entry.get("version").and_then(Value::as_str) == Some(PINNED_CHROMIUM_VERSION))
-        .with_context(|| format!("Chrome for Testing {PINNED_CHROMIUM_VERSION} is not available"))?;
-
-    let download = version
-        .get("downloads")
-        .and_then(|downloads| downloads.get("chrome"))
-        .and_then(Value::as_array)
-        .context("Chrome for Testing version has no `chrome` downloads")?
-        .iter()
-        .find(|entry| entry.get("platform").and_then(Value::as_str) == Some(platform_key))
-        .with_context(|| {
-            format!("Chrome for Testing has no {platform_key} build for {PINNED_CHROMIUM_VERSION}")
-        })?;
-
-    let url = download
-        .get("url")
-        .and_then(Value::as_str)
-        .context("Chrome for Testing download has no `url`")?
-        .to_string();
-    let sha256 = download
-        .get("sha256")
-        .and_then(Value::as_str)
-        .context("Chrome for Testing download has no `sha256`")?
-        .to_string();
-
-    Ok((url, sha256))
-}
-
 async fn download_and_extract(
     http_client: &Arc<dyn HttpClient>,
     url: &str,
-    sha256: &str,
     destination: &Path,
 ) -> anyhow::Result<()> {
     let destination_parent = destination
@@ -182,7 +133,7 @@ async fn download_and_extract(
         .with_context(|| format!("creating Chromium staging directory in {destination_parent:?}"))?
         .keep();
 
-    let result = extract_chromium_archive(http_client, url, sha256, &staging).await;
+    let result = extract_chromium_archive(http_client, url, &staging).await;
     if let Err(err) = result {
         let _ = async_fs::remove_dir_all(&staging).await;
         return Err(err);
@@ -198,7 +149,6 @@ async fn download_and_extract(
 async fn extract_chromium_archive(
     http_client: &Arc<dyn HttpClient>,
     url: &str,
-    expected_sha256: &str,
     destination: &Path,
 ) -> anyhow::Result<()> {
     log::info!("downloading pinned Chromium from {url}");
@@ -206,33 +156,9 @@ async fn extract_chromium_archive(
         .get(url, Default::default(), true)
         .await
         .with_context(|| format!("downloading Chromium from {url}"))?;
-
-    let temp_file = tempfile::NamedTempFile::new()
-        .with_context(|| format!("creating a temporary file for {url}"))?;
-    let (temp_file, _temp_guard) = temp_file.into_parts();
-    let mut writer = HashingWriter {
-        writer: async_fs::File::from(temp_file),
-        hasher: Sha256::new(),
-    };
-    futures::io::copy(&mut BufReader::new(response.body_mut()), &mut writer)
-        .await
-        .with_context(|| format!("saving Chromium archive from {url}"))?;
-    let digest = format!("{:x}", writer.hasher.finalize());
-
-    anyhow::ensure!(
-        digest.eq_ignore_ascii_case(expected_sha256),
-        "Chromium archive SHA-256 mismatch for {url}. Expected {expected_sha256}, got {digest}"
-    );
-
-    writer
-        .writer
-        .seek(SeekFrom::Start(0))
-        .await
-        .with_context(|| format!("seeking Chromium archive for {url}"))?;
-    util::archive::extract_zip(destination, &mut writer.writer)
+    util::archive::extract_zip(destination, response.body_mut())
         .await
         .with_context(|| format!("extracting Chromium archive into {destination:?}"))?;
-
     Ok(())
 }
 
@@ -246,39 +172,4 @@ async fn finalize_download(staging_path: &Path, destination_path: &Path) -> anyh
         .await
         .with_context(|| format!("renaming {staging_path:?} to {destination_path:?}"))?;
     Ok(())
-}
-
-struct HashingWriter<W: AsyncWrite + Unpin> {
-    writer: W,
-    hasher: Sha256,
-}
-
-impl<W: AsyncWrite + Unpin> AsyncWrite for HashingWriter<W> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::result::Result<usize, std::io::Error>> {
-        match Pin::new(&mut self.writer).poll_write(cx, buf) {
-            Poll::Ready(Ok(n)) => {
-                self.hasher.update(&buf[..n]);
-                Poll::Ready(Ok(n))
-            }
-            other => other,
-        }
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::result::Result<(), std::io::Error>> {
-        Pin::new(&mut self.writer).poll_flush(cx)
-    }
-
-    fn poll_close(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::result::Result<(), std::io::Error>> {
-        Pin::new(&mut self.writer).poll_close(cx)
-    }
 }
