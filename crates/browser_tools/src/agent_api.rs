@@ -2,10 +2,11 @@ use crate::cdp::CdpClient;
 use crate::session::{BrowserSession, BrowserTarget};
 use anyhow::{Context, Result, anyhow};
 use futures::{AsyncBufReadExt, StreamExt};
+use http_client::HttpClient;
 use serde_json::{Value, json};
 use smol::process::Command;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -19,14 +20,16 @@ pub struct AgentBrowserApi {
     sessions: Arc<smol::lock::Mutex<HashMap<u64, BrowserSession>>>,
     next_session_id: Arc<AtomicU64>,
     chromium_path: Option<PathBuf>,
+    http_client: Arc<dyn HttpClient>,
 }
 
 impl AgentBrowserApi {
-    pub fn new(chromium_path: Option<PathBuf>) -> Self {
+    pub fn new(chromium_path: Option<PathBuf>, http_client: Arc<dyn HttpClient>) -> Self {
         Self {
             sessions: Arc::new(smol::lock::Mutex::new(HashMap::new())),
             next_session_id: Arc::new(AtomicU64::new(0)),
             chromium_path,
+            http_client,
         }
     }
 
@@ -45,7 +48,7 @@ impl AgentBrowserApi {
     }
 
     pub async fn start_session(&self, url: &str, headless: bool) -> Result<u64> {
-        let chromium = self.chromium_binary()?;
+        let chromium = crate::chromium::resolve_chromium_binary(&self.http_client, self.chromium_path.as_deref()).await?;
         let profile_dir = std::env::temp_dir().join(format!("zed-browser-{}", std::process::id()));
 
         let mut command = Command::new(&chromium);
@@ -332,13 +335,6 @@ impl AgentBrowserApi {
         }
         Ok(())
     }
-
-    fn chromium_binary(&self) -> Result<PathBuf> {
-        if let Some(path) = &self.chromium_path {
-            return Ok(path.clone());
-        }
-        discover_chromium().context("no Chromium binary found; set browser_chromium_path")
-    }
 }
 
 fn target_to_json(target: &BrowserTarget) -> Value {
@@ -462,24 +458,6 @@ fn parse_devtools_endpoint(line: &str) -> Option<String> {
     let marker = "DevTools listening on ";
     let start = line.find(marker)? + marker.len();
     Some(line[start..].trim().to_string())
-}
-
-fn discover_chromium() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("ZED_BROWSER_CHROMIUM_PATH") {
-        return Some(PathBuf::from(path));
-    }
-    let candidates = [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    ];
-    for candidate in candidates {
-        let path = Path::new(candidate);
-        if path.exists() {
-            return Some(path.to_path_buf());
-        }
-    }
-    None
 }
 
 const SNAPSHOT_EXPRESSION: &str = r#"(function() {

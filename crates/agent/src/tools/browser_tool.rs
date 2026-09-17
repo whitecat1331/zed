@@ -3,6 +3,7 @@ use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result};
 use browser_tools::AgentBrowserApi;
 use gpui::{App, SharedString, Task, WeakEntity};
+use http_client::HttpClient;
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -132,10 +133,14 @@ pub struct BrowserTool {
 }
 
 impl BrowserTool {
-    pub fn new(thread: WeakEntity<Thread>, cx: &App) -> Self {
+    pub fn new(
+        thread: WeakEntity<Thread>,
+        http_client: Arc<dyn HttpClient>,
+        cx: &App,
+    ) -> Self {
         let chromium_path = AgentSettings::get_global(cx).browser_chromium_path.clone();
         Self {
-            api: AgentBrowserApi::new(chromium_path),
+            api: AgentBrowserApi::new(chromium_path, http_client),
             thread,
         }
     }

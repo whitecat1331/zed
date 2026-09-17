@@ -1,5 +1,6 @@
 mod agent_api;
 mod cdp;
+mod chromium;
 mod session;
 
 pub use agent_api::*;
