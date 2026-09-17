@@ -497,6 +497,13 @@ impl ThreadsDatabase {
             }
         }
 
+        if let Ok(mut s) = connection.exec(indoc! {"
+            ALTER TABLE threads ADD COLUMN dedup_key TEXT
+        "})
+        {
+            s().ok();
+        }
+
         let db = Self {
             executor,
             connection: Arc::new(Mutex::new(connection)),
@@ -529,6 +536,7 @@ impl ThreadsDatabase {
             .subagent_context
             .as_ref()
             .map(|ctx| ctx.parent_thread_id.0.clone());
+        let dedup_key = thread_dedup_key(workspace_id.as_deref(), folder_paths, &thread.messages);
         let serialized_folder_paths = folder_paths.serialize();
         let (folder_paths_str, folder_paths_order_str): (Option<String>, Option<String>) =
             if folder_paths.is_empty() {
@@ -555,9 +563,9 @@ impl ThreadsDatabase {
         // created, not when it was saved to the database.
         let created_at = updated_at.clone();
 
-        let mut insert = connection.exec_bound::<(Arc<str>, Option<Arc<str>>, Option<String>, Option<String>, Option<String>, String, String, DataType, Vec<u8>, String)>(indoc! {"
-            INSERT INTO threads (id, parent_id, folder_paths, folder_paths_order, workspace_id, summary, updated_at, data_type, data, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        let mut insert = connection.exec_bound::<(Arc<str>, Option<Arc<str>>, Option<String>, Option<String>, Option<String>, String, String, DataType, Vec<u8>, String, Option<String>)>(indoc! {"
+            INSERT INTO threads (id, parent_id, folder_paths, folder_paths_order, workspace_id, summary, updated_at, data_type, data, created_at, dedup_key)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             ON CONFLICT(id) DO UPDATE SET
                 parent_id = excluded.parent_id,
                 folder_paths = excluded.folder_paths,
@@ -566,7 +574,8 @@ impl ThreadsDatabase {
                 summary = excluded.summary,
                 updated_at = excluded.updated_at,
                 data_type = excluded.data_type,
-                data = excluded.data
+                data = excluded.data,
+                dedup_key = excluded.dedup_key
         "})?;
 
         insert((
@@ -580,6 +589,7 @@ impl ThreadsDatabase {
             data_type,
             data,
             created_at,
+            dedup_key,
         ))?;
 
         Ok(())
@@ -816,6 +826,67 @@ impl ThreadsDatabase {
     }
 }
 
+/// Returns the concatenated text of the first user message in a thread, so a
+/// dedup key can be derived from "what the user first asked" rather than the
+/// mutable title. Mentions contribute their text; images do not.
+fn first_user_message_text(messages: &[Arc<DbMessage>]) -> String {
+    for message in messages {
+        if let crate::Message::User(user) = message.as_ref() {
+            let mut text = String::new();
+            for block in user.content.iter() {
+                match block {
+                    UserMessageContent::Text(t) => text.push_str(t),
+                    UserMessageContent::Mention { content, .. } => {
+                        text.push(' ');
+                        text.push_str(content);
+                    }
+                    UserMessageContent::Image(_) => {}
+                }
+            }
+            return text;
+        }
+    }
+    String::new()
+}
+
+/// Stable, dependency-free 64-bit FNV-1a. Used for thread dedup only: it is not
+/// a cryptographic hash, and a collision merely over-merges two threads, which
+/// the reconcile pass keeps reversible via archive + link.
+fn fnv1a_64(input: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in input.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Derives a stable dedup key for a thread from its workspace identity and its
+/// first user message. Two records with the same key are the same logical thread.
+fn thread_dedup_key(
+    workspace_id: Option<&str>,
+    folder_paths: &PathList,
+    messages: &[Arc<DbMessage>],
+) -> Option<String> {
+    let folder_paths_key = {
+        let serialized = folder_paths.serialize();
+        if serialized.paths.is_empty() {
+            String::new()
+        } else {
+            serialized.paths
+        }
+    };
+    let group_key = workspace_id.unwrap_or(folder_paths_key.as_str());
+    let first_user_text = first_user_message_text(messages);
+    if group_key.is_empty() && first_user_text.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{:016x}",
+        fnv1a_64(&format!("{}\0{}", group_key, first_user_text))
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,6 +937,45 @@ mod tests {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
         }
+    }
+
+    fn user_message(text: &str) -> Arc<DbMessage> {
+        Arc::new(crate::Message::User(UserMessage {
+            id: ClientUserMessageId::new(),
+            content: Arc::from([UserMessageContent::Text(text.to_string())]),
+        }))
+    }
+
+    #[test]
+    fn test_thread_dedup_key() {
+        let timestamp = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+
+        let mut a = make_thread("thread a", timestamp);
+        a.messages.push(user_message("hello"));
+        let mut b = make_thread("thread b", timestamp);
+        b.messages.push(user_message("hello"));
+
+        let key_a = thread_dedup_key(Some("ws-1"), &PathList::default(), &a.messages);
+        let key_b = thread_dedup_key(Some("ws-1"), &PathList::default(), &b.messages);
+        assert_eq!(key_a, key_b);
+        assert!(key_a.is_some());
+
+        // Different workspace identity => different key.
+        let key_c = thread_dedup_key(Some("ws-2"), &PathList::default(), &a.messages);
+        assert_ne!(key_a, key_c);
+
+        // Different first message => different key.
+        let mut d = make_thread("thread d", timestamp);
+        d.messages.push(user_message("goodbye"));
+        let key_d = thread_dedup_key(Some("ws-1"), &PathList::default(), &d.messages);
+        assert_ne!(key_a, key_d);
+
+        // No workspace, no folder paths, no messages => no key.
+        let empty = make_thread("empty", timestamp);
+        assert_eq!(
+            thread_dedup_key(None, &PathList::default(), &empty.messages),
+            None
+        );
     }
 
     #[gpui::test]
