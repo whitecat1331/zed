@@ -98,8 +98,9 @@ impl AgentBrowserApi {
             .context("unknown browser session")?;
         let target = create_target(&mut session.client, url).await?;
         let target_json = target_to_json(&target);
-        session.active_target_id = Some(target.target_id.clone());
-        session.targets.insert(target.target_id, target);
+        let target_id = target.target_id.clone();
+        session.active_target_id = Some(target_id.clone());
+        session.targets.insert(target_id, target);
         Ok(target_json)
     }
 
