@@ -1,9 +1,9 @@
 use crate::{
-    ApplyCodeActionTool, AskUserTool, BrowserTool, CodeActionStore, ContextServerRegistry, CopyPathTool,
-    CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DebuggerTool, DeletePathTool,
-    DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
-    GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
-    ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
+    ApplyCodeActionTool, AskUserTool, BrowserTool, CodeActionStore, ContextServerRegistry,
+    CopyPathTool, CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DebuggerTool,
+    DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool,
+    GetCodeActionsTool, GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool,
+    MovePathTool, ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
     SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
     WriteFileTool, decide_permission_from_settings,
 };
@@ -833,11 +833,7 @@ pub trait ThreadEnvironment {
     }
 
     /// Restarts an existing debug session through the host UI, if the environment provides one.
-    fn restart_session(
-        &self,
-        session_id: u64,
-        cx: &mut AsyncApp,
-    ) -> Task<Result<()>> {
+    fn restart_session(&self, session_id: u64, cx: &mut AsyncApp) -> Task<Result<()>> {
         let _ = session_id;
         let _ = cx;
         Task::ready(Err(anyhow::anyhow!(

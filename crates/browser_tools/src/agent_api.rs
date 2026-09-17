@@ -38,15 +38,20 @@ impl AgentBrowserApi {
             .collect()
     }
 
-    pub async fn start_session(&self, url: &str) -> Result<u64> {
+    pub async fn start_session(&self, url: &str, headless: bool) -> Result<u64> {
         let chromium = self.chromium_binary()?;
         let profile_dir = std::env::temp_dir().join(format!("zed-browser-{}", std::process::id()));
 
-        let mut child = Command::new(&chromium)
+        let mut command = Command::new(&chromium);
+        command
             .arg("--remote-debugging-port=0")
             .arg(format!("--user-data-dir={}", profile_dir.display()))
             .arg("--no-first-run")
-            .arg("--no-default-browser-check")
+            .arg("--no-default-browser-check");
+        if headless {
+            command.arg("--headless=new");
+        }
+        let mut child = command
             .arg("about:blank")
             .stdout(smol::process::Stdio::null())
             .stderr(smol::process::Stdio::piped())

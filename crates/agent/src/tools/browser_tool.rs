@@ -8,9 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-use crate::{
-    AgentTool, Thread, ToolCallEventStream, ToolInput, ToolPermissionContext,
-};
+use crate::{AgentTool, Thread, ToolCallEventStream, ToolInput, ToolPermissionContext};
 
 /// Interact with a browser the agent controls. Read-only operations such as
 /// `list_sessions`, `snapshot`, `read_console`, and `read_network` are available
@@ -75,6 +73,9 @@ pub struct BrowserToolInput {
     /// false, which closes the browser.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_open: Option<bool>,
+    /// Launch the browser headless (no visible window). Defaults to false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headless: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,8 +103,7 @@ impl From<BrowserToolOutput> for LanguageModelToolResultContent {
                 let data = serde_json::to_string_pretty(data).unwrap_or_else(|error| {
                     format!("<failed to serialize browser output: {error}>")
                 });
-                format!("Browser `{operation}` succeeded: {message}\n\n```json\n{data}\n```")
-                    .into()
+                format!("Browser `{operation}` succeeded: {message}\n\n```json\n{data}\n```").into()
             }
             BrowserToolOutput::Error { operation, error } => {
                 let operation = operation.as_deref().unwrap_or("unknown");
@@ -151,7 +151,11 @@ impl BrowserTool {
         match input.operation {
             BrowserOperation::ListSessions => {
                 let sessions = self.api.list_sessions().await;
-                Ok(success(operation, "listed browser sessions", Value::Array(sessions)))
+                Ok(success(
+                    operation,
+                    "listed browser sessions",
+                    Value::Array(sessions),
+                ))
             }
             BrowserOperation::Snapshot => {
                 let session_id = input
@@ -165,6 +169,7 @@ impl BrowserTool {
                 let url = input
                     .url
                     .context("url is required for browser start_session")?;
+                let headless = input.headless.unwrap_or(false);
                 authorize_browser_operation(
                     &event_stream,
                     "Start browser session",
@@ -172,7 +177,7 @@ impl BrowserTool {
                     cx,
                 )
                 .await?;
-                let session_id = self.api.start_session(&url).await?;
+                let session_id = self.api.start_session(&url, headless).await?;
                 Ok(success(
                     operation,
                     "started browser session",
@@ -222,7 +227,10 @@ impl BrowserTool {
                 authorize_browser_operation(
                     &event_stream,
                     "Click browser element",
-                    permission_inputs(&operation, [format!("session_id:{session_id} selector:{selector}")]),
+                    permission_inputs(
+                        &operation,
+                        [format!("session_id:{session_id} selector:{selector}")],
+                    ),
                     cx,
                 )
                 .await?;
@@ -237,15 +245,15 @@ impl BrowserTool {
                 let selector = input
                     .selector
                     .context("selector is required for browser type")?;
-                let text = input
-                    .text
-                    .context("text is required for browser type")?;
+                let text = input.text.context("text is required for browser type")?;
                 authorize_browser_operation(
                     &event_stream,
                     "Type into browser",
                     permission_inputs(
                         &operation,
-                        [format!("session_id:{session_id} selector:{selector} text:{text}")],
+                        [format!(
+                            "session_id:{session_id} selector:{selector} text:{text}"
+                        )],
                     ),
                     cx,
                 )
@@ -264,7 +272,10 @@ impl BrowserTool {
                 authorize_browser_operation(
                     &event_stream,
                     "Evaluate browser JavaScript",
-                    permission_inputs(&operation, [format!("session_id:{session_id} expression:{expression}")]),
+                    permission_inputs(
+                        &operation,
+                        [format!("session_id:{session_id} expression:{expression}")],
+                    ),
                     cx,
                 )
                 .await?;
@@ -391,6 +402,9 @@ fn operation_name(input: &BrowserToolInput) -> &'static str {
         BrowserOperation::Evaluate => "evaluate",
         BrowserOperation::ReadConsole => "read_console",
         BrowserOperation::ReadNetwork => "read_network",
+        BrowserOperation::StopSession => "stop_session",
+    }
+}
         BrowserOperation::StopSession => "stop_session",
     }
 }
