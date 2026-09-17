@@ -563,9 +563,11 @@ impl ThreadsDatabase {
         // created, not when it was saved to the database.
         let created_at = updated_at.clone();
 
-        let mut insert = connection.exec_bound::<(Arc<str>, Option<Arc<str>>, Option<String>, Option<String>, Option<String>, String, String, DataType, Vec<u8>, String, Option<String>)>(indoc! {"
-            INSERT INTO threads (id, parent_id, folder_paths, folder_paths_order, workspace_id, summary, updated_at, data_type, data, created_at, dedup_key)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        let id_for_dedup = id.0.clone();
+
+        let mut insert = connection.exec_bound::<(Arc<str>, Option<Arc<str>>, Option<String>, Option<String>, Option<String>, String, String, DataType, Vec<u8>, String)>(indoc! {"
+            INSERT INTO threads (id, parent_id, folder_paths, folder_paths_order, workspace_id, summary, updated_at, data_type, data, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             ON CONFLICT(id) DO UPDATE SET
                 parent_id = excluded.parent_id,
                 folder_paths = excluded.folder_paths,
@@ -574,8 +576,7 @@ impl ThreadsDatabase {
                 summary = excluded.summary,
                 updated_at = excluded.updated_at,
                 data_type = excluded.data_type,
-                data = excluded.data,
-                dedup_key = excluded.dedup_key
+                data = excluded.data
         "})?;
 
         insert((
@@ -589,8 +590,12 @@ impl ThreadsDatabase {
             data_type,
             data,
             created_at,
-            dedup_key,
         ))?;
+
+        let mut update_dedup = connection.exec_bound::<(Option<String>, Arc<str>)>(indoc! {"
+            UPDATE threads SET dedup_key = ?1 WHERE id = ?2
+        "})?;
+        update_dedup((dedup_key, id_for_dedup))?;
 
         Ok(())
     }
