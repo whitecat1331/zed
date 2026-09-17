@@ -1,3 +1,4 @@
+use agent_settings::builtin_profiles;
 use anyhow::Result;
 use gpui::SharedString;
 use handlebars::Handlebars;
@@ -67,6 +68,50 @@ impl Template for SystemPromptTemplate<'_> {
     const TEMPLATE_NAME: &'static str = "system_prompt.hbs";
 }
 
+/// Returns a short mode-specific framing fragment for the given profile, or
+/// `None` for profiles without special instructions (custom profiles and
+/// `minimal`).
+///
+/// Kept as a rendered fragment rather than a `system_prompt.hbs` section so the
+/// mode copy lives beside the template without adding a new embedded asset
+/// (new `.hbs` files are silently skipped on incremental rebuilds).
+pub fn mode_framing(profile_id: &str) -> Option<&'static str> {
+    match profile_id {
+        builtin_profiles::READ => Some(
+            "## Agent mode: read\n\n\
+             You have full read access but cannot make changes. You may inspect \
+             the codebase, run the terminal, use the debugger to observe state \
+             (without modifying it), and ask the user questions — but you must \
+             not edit, create, move, or delete any files.",
+        ),
+        builtin_profiles::WRITE => Some(
+            "## Agent mode: write\n\n\
+             You may make changes to the project, but you cannot execute \
+             anything: you have no terminal and no debugger.",
+        ),
+        builtin_profiles::EXECUTE => Some(
+            "## Agent mode: execute\n\n\
+             You have full autonomy: you may edit files, run the terminal, and \
+             use the debugger.",
+        ),
+        builtin_profiles::PLAN => Some(
+            "## Agent mode: plan\n\n\
+             You are read-only, like read mode, but your job is to plan. Always \
+             load the `plan-manager` skill and draft or edit plans in `plans/`. \
+             Do not make code changes.",
+        ),
+        builtin_profiles::DEBUG => Some(
+            "## Agent mode: debug\n\n\
+             Work a tight diagnose-fix-verify loop: scaffold a minimal \
+             reproduction, ask the user to replicate it, apply a fix, then ask \
+             whether the issue is resolved — repeating until it is. For rebuilds \
+             use the `remote-compiler` skill; for debugger-tool acceptance runs \
+             use the `debugger-suite` skill.",
+        ),
+        _ => None,
+    }
+}
+
 /// Handlebars helper for checking if an item is in a list
 fn contains(
     h: &handlebars::Helper,
@@ -95,6 +140,33 @@ fn contains(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_mode_framing() {
+        assert!(
+            mode_framing(builtin_profiles::READ)
+                .unwrap()
+                .contains("cannot make changes")
+        );
+        assert!(
+            mode_framing(builtin_profiles::WRITE)
+                .unwrap()
+                .contains("no terminal")
+        );
+        assert!(
+            mode_framing(builtin_profiles::PLAN)
+                .unwrap()
+                .contains("plan-manager")
+        );
+        assert!(
+            mode_framing(builtin_profiles::DEBUG)
+                .unwrap()
+                .contains("remote-compiler")
+        );
+        assert!(mode_framing(builtin_profiles::EXECUTE).is_some());
+        assert!(mode_framing("custom").is_none());
+        assert!(mode_framing(builtin_profiles::MINIMAL).is_none());
+    }
 
     #[test]
     fn test_system_prompt_template() {

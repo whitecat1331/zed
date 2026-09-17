@@ -39,15 +39,15 @@ pub trait ProfileProvider {
     /// Whether the current workspace is restricted (has untrusted worktrees).
     ///
     /// In a restricted workspace, profiles that enable tools forbidden in
-    /// restricted mode are flagged, and the active built-in `write`/`ask`
-    /// profiles are downgraded to `minimal`.
+    /// restricted mode are flagged, and the active built-in profiles that can
+    /// change files (`write`/`execute`/`debug`) are downgraded to `minimal`.
     fn is_restricted(&self, _cx: &App) -> bool {
         false
     }
 
     /// Whether the active profile has been downgraded to `minimal` because the
-    /// workspace is restricted (i.e. the user selected `write`/`ask`, but those
-    /// profiles aren't honored while restricted).
+    /// workspace is restricted (i.e. the user selected a profile that can change
+    /// files, but it isn't honored while restricted).
     fn profile_downgraded(&self, _cx: &App) -> bool {
         false
     }
@@ -388,9 +388,11 @@ impl ProfilePickerDelegate {
 
     fn documentation(candidate: &ProfileCandidate) -> Option<&'static str> {
         match candidate.id.as_str() {
-            builtin_profiles::WRITE => Some("Get help to write anything."),
-            builtin_profiles::ASK => Some("Chat about your codebase."),
-            builtin_profiles::MINIMAL => Some("Chat about anything with no tools."),
+            builtin_profiles::READ => Some("Inspect the codebase without changing it."),
+            builtin_profiles::WRITE => Some("Make changes to your codebase."),
+            builtin_profiles::EXECUTE => Some("Full autonomy: edit, run, and debug."),
+            builtin_profiles::PLAN => Some("Draft and edit plans without changing code."),
+            builtin_profiles::DEBUG => Some("Diagnose and fix issues with the debugger."),
             _ => None,
         }
     }
@@ -917,8 +919,8 @@ mod tests {
                 is_builtin: true,
             },
             ProfileCandidate {
-                id: AgentProfileId("ask".into()),
-                name: SharedString::from("Ask"),
+                id: AgentProfileId("read".into()),
+                name: SharedString::from("Read"),
                 is_builtin: true,
             },
         ];

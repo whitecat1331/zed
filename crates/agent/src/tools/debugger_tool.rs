@@ -1,4 +1,5 @@
 use agent_client_protocol::schema::v1 as acp;
+use agent_settings::builtin_profiles;
 use anyhow::{Context as _, Result, anyhow};
 use dap::{DapRegistry, SteppingGranularity, client::SessionId};
 use gpui::{App, Entity, SharedString, Task, WeakEntity};
@@ -30,9 +31,9 @@ const SESSION_BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Interact with Zed's debugger. Read-only operations such as `snapshot`,
 /// `list_sessions`, `list_breakpoints`, and `list_adapters` are available in
-/// Ask mode. Operations that start sessions, change breakpoints, control
-/// execution, evaluate expressions, or change variables require Write mode and
-/// user permission.
+/// read-only modes (`read` and `plan`). Operations that start sessions, change
+/// breakpoints, control execution, evaluate expressions, or change variables
+/// require a mode that can execute (`execute` or `debug`) and user permission.
 ///
 /// Prefer `snapshot` when inspecting a paused debug session: it returns a
 /// bounded view of threads, stack frames, source context, variables, and recent
@@ -40,7 +41,7 @@ const SESSION_BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 /// sessions.
 ///
 /// <guidelines>
-/// - In Ask mode, only use read-only operations.
+/// - In read-only modes, only use read-only operations.
 /// - Before controlling execution, inspect `list_sessions` or `snapshot` and use
 ///   explicit `session_id` and `thread_id` when possible.
 /// - `continue`, `step`, `pause`, and `run_to_line` wait for the debugger to
@@ -416,9 +417,11 @@ impl DebuggerTool {
         AgentDebuggerApi::new(project.dap_store(), project.breakpoint_store())
     }
 
-    fn is_ask_profile(&self, cx: &App) -> bool {
+    fn is_read_only_profile(&self, cx: &App) -> bool {
         self.thread
-            .read_with(cx, |thread, _| thread.profile().as_str() == "ask")
+            .read_with(cx, |thread, _| {
+                builtin_profiles::is_read_only(thread.profile())
+            })
             .unwrap_or(false)
     }
 }
@@ -1071,9 +1074,9 @@ impl DebuggerTool {
     }
 
     fn ensure_write_mode(&self, operation: &str, cx: &gpui::AsyncApp) -> Result<()> {
-        if cx.update(|cx| self.is_ask_profile(cx)) {
+        if cx.update(|cx| self.is_read_only_profile(cx)) {
             anyhow::bail!(
-                "debugger.{operation} is not available in Ask mode. Switch to Write mode to start sessions, change breakpoints, or control execution."
+                "debugger.{operation} is not available in read-only modes. Switch to Execute or Debug mode to start sessions, change breakpoints, or control execution."
             );
         }
         Ok(())

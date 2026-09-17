@@ -51,6 +51,11 @@ impl Mode {
         let mut custom_profiles = Vec::new();
 
         for (profile_id, profile) in settings.profiles.iter() {
+            // `minimal` is the internal restricted-workspace fallback, not a
+            // user-selectable mode.
+            if profile_id.as_str() == builtin_profiles::MINIMAL {
+                continue;
+            }
             let entry = ProfileEntry {
                 id: profile_id.clone(),
                 name: profile.name.clone(),
@@ -691,7 +696,10 @@ impl ManageProfilesModal {
 
         let icon = match mode.profile_id.as_str() {
             "write" => IconName::Pencil,
-            "ask" => IconName::Chat,
+            "read" => IconName::Reader,
+            "execute" => IconName::Terminal,
+            "plan" => IconName::ListTodo,
+            "debug" => IconName::Debug,
             _ => IconName::UserRoundPen,
         };
 

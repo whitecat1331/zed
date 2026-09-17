@@ -20,6 +20,7 @@ mod go_to_definition_tool;
 mod grep_tool;
 mod list_agents_and_models_tool;
 mod list_directory_tool;
+mod memory_tool;
 mod move_path_tool;
 mod read_file_tool;
 mod rename_tool;
@@ -91,6 +92,7 @@ pub use go_to_definition_tool::*;
 pub use grep_tool::*;
 pub use list_agents_and_models_tool::*;
 pub use list_directory_tool::*;
+pub use memory_tool::*;
 pub use move_path_tool::*;
 pub use read_file_tool::*;
 pub use rename_tool::*;
@@ -189,8 +191,8 @@ macro_rules! tools {
 // not enough to make the model actually receive it. Three further gates will
 // silently drop the tool rather than fail to compile:
 //
-// 1. `assets/settings/default.json`: the `write` and `ask` agent profiles each
-//    carry an explicit `tools` allowlist. `Thread::enabled_tools` filters out
+// 1. `assets/settings/default.json`: the built-in agent profiles each carry
+//    an explicit `tools` allowlist. `Thread::enabled_tools` filters out
 //    any tool not present there with value `true`, so it never reaches the
 //    model.
 // 2. `test_all_tools_are_in_tool_info_or_excluded` in
@@ -218,6 +220,7 @@ tools! {
     GrepTool,
     ListAgentsAndModelsTool,
     ListDirectoryTool,
+    MemoryTool,
     MovePathTool,
     ReadFileTool,
     RenameTool,

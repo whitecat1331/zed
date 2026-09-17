@@ -1421,6 +1421,9 @@ mod tests {
             "grep",
             "list_agents_and_models",
             "list_directory",
+            // Persistent key → value facts in the user data dir; no project or
+            // command access, so no permission checks.
+            "memory",
             "open",
             "read_file",
             "rename_symbol",

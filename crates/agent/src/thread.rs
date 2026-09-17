@@ -3,9 +3,9 @@ use crate::{
     CopyPathTool, CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DebuggerTool,
     DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool,
     GetCodeActionsTool, GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool,
-    MovePathTool, ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
-    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
-    WriteFileTool, decide_permission_from_settings,
+    MemoryStore, MemoryTool, MovePathTool, ProjectSnapshot, ReadFileTool, RenameTool,
+    SandboxedTerminalTool, SpawnAgentTool, SystemPromptTemplate, Template, Templates, TerminalTool,
+    ToolPermissionDecision, WebSearchTool, WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
@@ -2210,7 +2210,11 @@ impl Thread {
             environment.clone(),
             cx.weak_entity(),
         ));
-        self.add_tool(BrowserTool::new(cx.weak_entity(), self.project.read(cx).client().http_client(), cx));
+        self.add_tool(BrowserTool::new(
+            cx.weak_entity(),
+            self.project.read(cx).client().http_client(),
+            cx,
+        ));
         self.add_tool(EditFileTool::new(
             self.project.clone(),
             cx.weak_entity(),
@@ -2243,6 +2247,8 @@ impl Thread {
         self.add_tool(WebSearchTool);
 
         self.add_tool(AskUserTool);
+
+        self.add_tool(MemoryTool);
 
         self.add_tool(DiagnosticsTool::new(self.project.clone()));
 
@@ -2297,10 +2303,11 @@ impl Thread {
     }
 
     /// Computes the profile a thread should start with, given the user's chosen
-    /// profile. In a restricted workspace, the built-in `write`/`ask` profiles
-    /// are downgraded to `minimal` — but only when both the chosen profile and
-    /// `minimal` are unmodified, shipped defaults, so we never override a user's
-    /// custom or customized profiles.
+    /// profile. In a restricted workspace, the built-in profiles that can
+    /// change files (`write`/`execute`/`debug`) are downgraded to `minimal` —
+    /// but only when both the chosen profile and `minimal` are unmodified,
+    /// shipped defaults, so we never override a user's custom or customized
+    /// profiles.
     ///
     /// Returns the (possibly downgraded) profile and whether a downgrade
     /// happened.
@@ -2309,10 +2316,8 @@ impl Thread {
         project: &Entity<Project>,
         cx: &App,
     ) -> (AgentProfileId, bool) {
-        let is_write_or_ask = profile_id.as_str() == builtin_profiles::WRITE
-            || profile_id.as_str() == builtin_profiles::ASK;
         let minimal = AgentProfileId(builtin_profiles::MINIMAL.into());
-        if is_write_or_ask
+        if builtin_profiles::can_change_files(&profile_id)
             && TrustedWorktrees::has_restricted_worktrees(&project.read(cx).worktree_store(), cx)
             && AgentProfileSettings::is_unmodified_default(&profile_id, cx)
             && AgentProfileSettings::is_unmodified_default(&minimal, cx)
@@ -4380,7 +4385,10 @@ impl Thread {
         log::trace!("Building request messages from {} thread messages", end_ix);
 
         let user_agents_md = UserAgentsMd::global(cx).and_then(|s| s.content().cloned());
-        let system_prompt = SystemPromptTemplate {
+        let memory_index = MemoryStore::load(MemoryStore::default_path())
+            .map(|store| store.index_prompt())
+            .unwrap_or_default();
+        let mut system_prompt = SystemPromptTemplate {
             project: self.project_context.read(cx),
             available_tools,
             model_name: self.model().map(|m| m.name().0.to_string()),
@@ -4396,6 +4404,16 @@ impl Thread {
         .render(&self.templates)
         .context("failed to build system prompt")
         .expect("Invalid template");
+        if let Some(framing) = crate::mode_framing(self.profile_id.as_str()) {
+            system_prompt = format!("{framing}\n\n{system_prompt}");
+        }
+        if !memory_index.is_empty() {
+            system_prompt.push_str("\n## Persistent Memory\n\n");
+            system_prompt.push_str(
+                "The following fact keys are stored in your persistent memory. Use the `memory` tool with `operation: \"recall\"` to read a value on demand.\n\n",
+            );
+            system_prompt.push_str(&memory_index);
+        }
         let mut messages = vec![LanguageModelRequestMessage {
             role: Role::System,
             content: vec![system_prompt.into()],

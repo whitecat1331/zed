@@ -1,5 +1,6 @@
 mod db;
 mod legacy_thread;
+mod memory;
 mod native_agent_server;
 pub mod outline;
 mod pattern_extraction;
@@ -15,6 +16,7 @@ mod tools;
 use context_server::ContextServerId;
 pub use db::*;
 use itertools::Itertools;
+pub use memory::*;
 pub use native_agent_server::NativeAgentServer;
 use parking_lot::Mutex;
 pub use pattern_extraction::*;
@@ -447,11 +449,7 @@ pub trait DebuggerHost {
         cx: &mut AsyncApp,
     ) -> Task<Result<DebugSessionInfo>>;
 
-    fn restart_session(
-        &self,
-        session_id: u64,
-        cx: &mut AsyncApp,
-    ) -> Task<Result<()>>;
+    fn restart_session(&self, session_id: u64, cx: &mut AsyncApp) -> Task<Result<()>>;
 }
 
 pub struct NativeAgent {
@@ -1978,16 +1976,18 @@ impl NativeAgent {
             };
             // All quit observers share `gpui::SHUTDOWN_TIMEOUT`, so run the
             // saves concurrently instead of one at a time.
-            future::join_all(saves.into_iter().map(|(id, folder_paths, workspace_id, db_thread)| {
-                let database = database.clone();
-                async move {
-                    let db_thread = db_thread.await;
-                    database
-                        .save_thread(id, db_thread, folder_paths, workspace_id)
-                        .await
-                        .log_err();
-                }
-            }))
+            future::join_all(saves.into_iter().map(
+                |(id, folder_paths, workspace_id, db_thread)| {
+                    let database = database.clone();
+                    async move {
+                        let db_thread = db_thread.await;
+                        database
+                            .save_thread(id, db_thread, folder_paths, workspace_id)
+                            .await
+                            .log_err();
+                    }
+                },
+            ))
             .await;
         }
     }
@@ -3541,11 +3541,7 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         host.start_debug_session(request, cx)
     }
 
-    fn restart_session(
-        &self,
-        session_id: u64,
-        cx: &mut AsyncApp,
-    ) -> Task<Result<()>> {
+    fn restart_session(&self, session_id: u64, cx: &mut AsyncApp) -> Task<Result<()>> {
         let host = match self.agent.read_with(cx, |agent, _| agent.debugger_host()) {
             Ok(Some(host)) => host,
             Ok(None) => {

@@ -1,5 +1,5 @@
 use agent_client_protocol::schema::v1 as acp;
-use agent_settings::AgentSettings;
+use agent_settings::{AgentSettings, builtin_profiles};
 use anyhow::{Context as _, Result};
 use browser_tools::AgentBrowserApi;
 use gpui::{App, AppContext as _, SharedString, Task, WeakEntity};
@@ -15,9 +15,9 @@ use crate::{AgentTool, Thread, ToolCallEventStream, ToolInput, ToolPermissionCon
 
 /// Interact with a browser the agent controls. Read-only operations such as
 /// `list_sessions`, `snapshot`, `screenshot`, `read_console`, and `read_network` are available
-/// in Ask mode. Operations that start sessions, navigate, click, type, evaluate
-/// JavaScript, manage targets, or stop sessions require Write mode and user
-/// permission.
+/// in read-only modes (`read` and `plan`). Operations that start sessions, navigate, click, type,
+/// evaluate JavaScript, manage targets, or stop sessions require a mode that can
+/// change things (`write` or `execute`) and user permission.
 ///
 /// The observation surface is text-first: `snapshot` returns the page URL,
 /// title, body text, and interactive elements. Screenshots are not a
@@ -150,16 +150,18 @@ impl BrowserTool {
         }
     }
 
-    fn is_ask_profile(&self, cx: &App) -> bool {
+    fn is_read_only_profile(&self, cx: &App) -> bool {
         self.thread
-            .read_with(cx, |thread, _| thread.profile().as_str() == "ask")
+            .read_with(cx, |thread, _| {
+                builtin_profiles::is_read_only(thread.profile())
+            })
             .unwrap_or(false)
     }
 
     fn ensure_write_mode(&self, operation: &str, cx: &gpui::AsyncApp) -> Result<()> {
-        if cx.update(|cx| self.is_ask_profile(cx)) {
+        if cx.update(|cx| self.is_read_only_profile(cx)) {
             anyhow::bail!(
-                "browser.{operation} is not available in Ask mode. Switch to Write mode to start sessions, navigate, or interact with the browser."
+                "browser.{operation} is not available in read-only modes. Switch to Write or Execute mode to start sessions, navigate, or interact with the browser."
             );
         }
         Ok(())

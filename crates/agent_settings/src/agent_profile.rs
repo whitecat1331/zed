@@ -16,12 +16,30 @@ use crate::{AgentProfileId, AgentSettings};
 pub mod builtin_profiles {
     use super::AgentProfileId;
 
+    pub const READ: &str = "read";
     pub const WRITE: &str = "write";
-    pub const ASK: &str = "ask";
+    pub const EXECUTE: &str = "execute";
+    pub const PLAN: &str = "plan";
+    pub const DEBUG: &str = "debug";
     pub const MINIMAL: &str = "minimal";
 
     pub fn is_builtin(profile_id: &AgentProfileId) -> bool {
-        profile_id.as_str() == WRITE || profile_id.as_str() == ASK || profile_id.as_str() == MINIMAL
+        matches!(
+            profile_id.as_str(),
+            READ | WRITE | EXECUTE | PLAN | DEBUG | MINIMAL
+        )
+    }
+
+    /// Whether a profile's tool matrix can mutate the project. In a restricted
+    /// workspace these profiles are downgraded to `minimal`.
+    pub fn can_change_files(profile_id: &AgentProfileId) -> bool {
+        matches!(profile_id.as_str(), WRITE | EXECUTE | DEBUG)
+    }
+
+    /// Whether a profile can inspect the project and run read-only tooling but
+    /// cannot mutate the project or execute arbitrary operations.
+    pub fn is_read_only(profile_id: &AgentProfileId) -> bool {
+        matches!(profile_id.as_str(), READ | PLAN)
     }
 }
 
@@ -93,6 +111,11 @@ impl AgentProfile {
     pub fn available_profiles(cx: &App) -> AvailableProfiles {
         let mut profiles = AvailableProfiles::default();
         for (id, profile) in AgentSettings::get_global(cx).profiles.iter() {
+            // `minimal` is the internal restricted-workspace fallback, not a
+            // user-selectable mode, so it stays out of the picker.
+            if id.as_str() == builtin_profiles::MINIMAL {
+                continue;
+            }
             profiles.insert(id.clone(), profile.name.clone());
         }
         profiles
@@ -305,5 +328,49 @@ mod tests {
 
         assert!(!AgentProfileSettings::is_unmodified_default(&write, cx));
         assert!(AgentProfileSettings::is_unmodified_default(&minimal, cx));
+    }
+
+    #[test]
+    fn builtin_profile_classification() {
+        for id in [
+            builtin_profiles::READ,
+            builtin_profiles::WRITE,
+            builtin_profiles::EXECUTE,
+            builtin_profiles::PLAN,
+            builtin_profiles::DEBUG,
+            builtin_profiles::MINIMAL,
+        ] {
+            assert!(builtin_profiles::is_builtin(&AgentProfileId(id.into())));
+        }
+        assert!(!builtin_profiles::is_builtin(&AgentProfileId("custom".into())));
+
+        for (id, can_change_files) in [
+            (builtin_profiles::WRITE, true),
+            (builtin_profiles::EXECUTE, true),
+            (builtin_profiles::DEBUG, true),
+            (builtin_profiles::READ, false),
+            (builtin_profiles::PLAN, false),
+            (builtin_profiles::MINIMAL, false),
+        ] {
+            assert_eq!(
+                builtin_profiles::can_change_files(&AgentProfileId(id.into())),
+                can_change_files,
+                "can_change_files({id})"
+            );
+        }
+
+        for (id, read_only) in [
+            (builtin_profiles::READ, true),
+            (builtin_profiles::PLAN, true),
+            (builtin_profiles::WRITE, false),
+            (builtin_profiles::EXECUTE, false),
+            (builtin_profiles::DEBUG, false),
+        ] {
+            assert_eq!(
+                builtin_profiles::is_read_only(&AgentProfileId(id.into())),
+                read_only,
+                "is_read_only({id})"
+            );
+        }
     }
 }

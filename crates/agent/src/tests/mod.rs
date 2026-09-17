@@ -1052,20 +1052,21 @@ async fn test_tool_authorization(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_debugger_tool_ask_mode_gating(cx: &mut TestAppContext) {
+async fn test_debugger_tool_read_mode_gating(cx: &mut TestAppContext) {
     let ThreadTest {
         model, thread, fs, ..
     } = setup(cx, TestModel::Fake).await;
     let fake_model = model.as_fake();
 
-    // Enable the debugger tool in an "ask" profile and a write-capable profile.
+    // Enable the debugger tool in a read-only profile and an execute-capable
+    // profile.
     fs.insert_file(
         paths::settings_file(),
         json!({
             "agent": {
                 "profiles": {
-                    "ask": {
-                        "name": "Ask",
+                    "read": {
+                        "name": "Read",
                         "tools": { DebuggerTool::NAME: true }
                     },
                     "test-write": {
@@ -1090,7 +1091,7 @@ async fn test_debugger_tool_ask_mode_gating(cx: &mut TestAppContext) {
         let project = thread.project().clone();
         let environment = Rc::new(FakeThreadEnvironment::default());
         thread.add_tool(DebuggerTool::new(project, environment, cx.weak_entity()));
-        thread.set_profile(AgentProfileId("ask".into()), cx);
+        thread.set_profile(AgentProfileId("read".into()), cx);
     });
 
     let mut events = thread
@@ -1100,7 +1101,8 @@ async fn test_debugger_tool_ask_mode_gating(cx: &mut TestAppContext) {
         .unwrap();
     cx.run_until_parked();
 
-    // Read-only operations are available in Ask mode without a permission prompt.
+    // Read-only operations are available in read-only mode without a permission
+    // prompt.
     let list_breakpoints_input = json!({ "operation": "list_breakpoints" });
     fake_model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(
         LanguageModelToolUse {
@@ -1119,11 +1121,12 @@ async fn test_debugger_tool_ask_mode_gating(cx: &mut TestAppContext) {
     let result = debugger_tool_result(&completion, "debugger_1");
     assert!(
         !result.is_error,
-        "read-only debugger operation should succeed in ask mode: {:?}",
+        "read-only debugger operation should succeed in read mode: {:?}",
         result.content
     );
 
-    // Mutating operations are rejected in Ask mode before requesting permission.
+    // Mutating operations are rejected in read-only mode before requesting
+    // permission.
     let set_breakpoints_input = json!({
         "operation": "set_breakpoints",
         "breakpoints": [{ "path": path!("/test/main.js"), "line": 1 }]
@@ -1143,15 +1146,15 @@ async fn test_debugger_tool_ask_mode_gating(cx: &mut TestAppContext) {
 
     let completion = fake_model.pending_completions().pop().unwrap();
     let result = debugger_tool_result(&completion, "debugger_2");
-    assert!(result.is_error, "write operation should fail in ask mode");
+    assert!(result.is_error, "write operation should fail in read mode");
     let text = result
         .content
         .first()
         .and_then(|content| content.to_str())
         .unwrap_or_default();
     assert!(
-        text.contains("Ask mode"),
-        "expected ask-mode rejection, got: {text}"
+        text.contains("read-only"),
+        "expected read-only-mode rejection, got: {text}"
     );
 
     // In a write-capable profile the same operation runs once the user grants
