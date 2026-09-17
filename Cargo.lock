@@ -2405,13 +2405,19 @@ name = "browser_tools"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-fs",
  "async-tungstenite",
+ "dirs",
  "futures 0.3.32",
+ "http_client",
+ "log",
  "serde",
  "serde_json",
  "smol",
+ "tempfile",
  "thiserror 2.0.17",
  "url",
+ "util",
 ]
 
 [[package]]
