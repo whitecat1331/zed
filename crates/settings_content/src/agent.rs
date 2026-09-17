@@ -361,6 +361,10 @@ pub struct AgentSettingsContent {
     /// These are populated when choosing "Allow always" from a sandbox
     /// escalation prompt.
     pub sandbox_permissions: Option<SandboxPermissionsContent>,
+
+    /// Path to the Chromium binary used by the browser tool. When unset, the
+    /// tool discovers Chrome/Edge from common install locations.
+    pub browser_chromium_path: Option<PathBuf>,
 }
 
 impl AgentSettingsContent {
