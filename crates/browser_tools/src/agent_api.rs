@@ -48,7 +48,11 @@ impl AgentBrowserApi {
     }
 
     pub async fn start_session(&self, url: &str, headless: bool) -> Result<u64> {
-        let chromium = crate::chromium::resolve_chromium_binary(&self.http_client, self.chromium_path.as_deref()).await?;
+        let chromium = crate::chromium::resolve_chromium_binary(
+            &self.http_client,
+            self.chromium_path.as_deref(),
+        )
+        .await?;
         let profile_dir = std::env::temp_dir().join(format!("zed-browser-{}", std::process::id()));
 
         let mut command = Command::new(&chromium);
@@ -118,7 +122,10 @@ impl AgentBrowserApi {
             .context("unknown browser target")?;
         session
             .client
-            .send_command("Target.closeTarget", json!({ "targetId": target.target_id }))
+            .send_command(
+                "Target.closeTarget",
+                json!({ "targetId": target.target_id }),
+            )
             .await?;
         if session.active_target_id.as_deref() == Some(target_id) {
             session.active_target_id = session.targets.keys().next().cloned();
@@ -167,9 +174,12 @@ impl AgentBrowserApi {
             .get_mut(&session_id)
             .context("unknown browser session")?;
         let target_session_id = resolve_target_session_id(session, target_id)?;
-        let page =
-            evaluate_value(&mut session.client, Some(&target_session_id), SNAPSHOT_EXPRESSION)
-                .await?;
+        let page = evaluate_value(
+            &mut session.client,
+            Some(&target_session_id),
+            SNAPSHOT_EXPRESSION,
+        )
+        .await?;
         let target = get_target(session, target_id)?;
 
         Ok(json!({
@@ -185,6 +195,27 @@ impl AgentBrowserApi {
                 .cloned()
                 .unwrap_or_else(|| Value::Array(vec![])),
         }))
+    }
+
+    pub async fn screenshot(&self, session_id: u64, target_id: Option<&str>) -> Result<String> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let result = session
+            .client
+            .send_command_with_session(
+                Some(&target_session_id),
+                "Page.captureScreenshot",
+                json!({ "format": "png", "fromSurface": true }),
+            )
+            .await?;
+        let data = result
+            .get("data")
+            .and_then(Value::as_str)
+            .context("Page.captureScreenshot returned no image data")?;
+        Ok(data.to_string())
     }
 
     pub async fn evaluate(
@@ -425,11 +456,7 @@ async fn create_target(client: &mut CdpClient, url: &str) -> Result<BrowserTarge
         .send_command_with_session(Some(&session_id), "Network.enable", json!({}))
         .await?;
     client
-        .send_command_with_session(
-            Some(&session_id),
-            "Page.navigate",
-            json!({ "url": url }),
-        )
+        .send_command_with_session(Some(&session_id), "Page.navigate", json!({ "url": url }))
         .await?;
     wait_for_page_load(client, Some(&session_id), url).await?;
 

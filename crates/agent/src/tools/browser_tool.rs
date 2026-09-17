@@ -4,7 +4,7 @@ use anyhow::{Context as _, Result};
 use browser_tools::AgentBrowserApi;
 use gpui::{App, SharedString, Task, WeakEntity};
 use http_client::HttpClient;
-use language_model::LanguageModelToolResultContent;
+use language_model::{LanguageModelImage, LanguageModelImageExt, LanguageModelToolResultContent};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -14,7 +14,7 @@ use std::sync::Arc;
 use crate::{AgentTool, Thread, ToolCallEventStream, ToolInput, ToolPermissionContext};
 
 /// Interact with a browser the agent controls. Read-only operations such as
-/// `list_sessions`, `snapshot`, `read_console`, and `read_network` are available
+/// `list_sessions`, `snapshot`, `screenshot`, `read_console`, and `read_network` are available
 /// in Ask mode. Operations that start sessions, navigate, click, type, evaluate
 /// JavaScript, manage targets, or stop sessions require Write mode and user
 /// permission.
@@ -34,6 +34,8 @@ pub enum BrowserOperation {
     Navigate,
     /// Capture a bounded text snapshot of a target.
     Snapshot,
+    /// Capture a screenshot of a target as an image.
+    Screenshot,
     /// Click an element in a target.
     Click,
     /// Type text into a target.
@@ -100,6 +102,10 @@ pub enum BrowserToolOutput {
         message: String,
         data: Value,
     },
+    Screenshot {
+        operation: String,
+        image: LanguageModelImage,
+    },
     Error {
         operation: Option<String>,
         error: String,
@@ -108,16 +114,19 @@ pub enum BrowserToolOutput {
 
 impl From<BrowserToolOutput> for LanguageModelToolResultContent {
     fn from(output: BrowserToolOutput) -> Self {
-        match &output {
+        match output {
             BrowserToolOutput::Success {
                 operation,
                 message,
                 data,
             } => {
-                let data = serde_json::to_string_pretty(data).unwrap_or_else(|error| {
+                let data = serde_json::to_string_pretty(&data).unwrap_or_else(|error| {
                     format!("<failed to serialize browser output: {error}>")
                 });
                 format!("Browser `{operation}` succeeded: {message}\n\n```json\n{data}\n```").into()
+            }
+            BrowserToolOutput::Screenshot { image, .. } => {
+                LanguageModelToolResultContent::Image(image)
             }
             BrowserToolOutput::Error { operation, error } => {
                 let operation = operation.as_deref().unwrap_or("unknown");
@@ -133,11 +142,7 @@ pub struct BrowserTool {
 }
 
 impl BrowserTool {
-    pub fn new(
-        thread: WeakEntity<Thread>,
-        http_client: Arc<dyn HttpClient>,
-        cx: &App,
-    ) -> Self {
+    pub fn new(thread: WeakEntity<Thread>, http_client: Arc<dyn HttpClient>, cx: &App) -> Self {
         let chromium_path = AgentSettings::get_global(cx).browser_chromium_path.clone();
         Self {
             api: AgentBrowserApi::new(chromium_path, http_client),
@@ -183,6 +188,23 @@ impl BrowserTool {
                 let target_id = input.target_id.as_deref();
                 let snapshot = self.api.snapshot(session_id, target_id).await?;
                 Ok(success(operation, "captured browser snapshot", snapshot))
+            }
+            BrowserOperation::Screenshot => {
+                let session_id = input
+                    .session_id
+                    .context("session_id is required for browser screenshot")?;
+                let target_id = input.target_id.as_deref();
+                let data = self.api.screenshot(session_id, target_id).await?;
+                let image = cx
+                    .background_spawn(async move {
+                        LanguageModelImage::from_base64_image(&data, "image/png")
+                    })
+                    .await
+                    .context("failed to convert browser screenshot")?
+                    .context(
+                        "browser screenshot could not be converted for language model input",
+                    )?;
+                Ok(BrowserToolOutput::Screenshot { operation, image })
             }
             BrowserOperation::StartSession => {
                 self.ensure_write_mode(&operation, cx)?;
@@ -489,6 +511,7 @@ fn operation_name(input: &BrowserToolInput) -> &'static str {
         BrowserOperation::StartSession => "start_session",
         BrowserOperation::Navigate => "navigate",
         BrowserOperation::Snapshot => "snapshot",
+        BrowserOperation::Screenshot => "screenshot",
         BrowserOperation::Click => "click",
         BrowserOperation::Type => "type",
         BrowserOperation::Evaluate => "evaluate",
