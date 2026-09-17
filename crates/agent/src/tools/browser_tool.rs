@@ -2,7 +2,7 @@ use agent_client_protocol::schema::v1 as acp;
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result};
 use browser_tools::AgentBrowserApi;
-use gpui::{App, SharedString, Task, WeakEntity};
+use gpui::{App, AppContext as _, SharedString, Task, WeakEntity};
 use http_client::HttpClient;
 use language_model::{LanguageModelImage, LanguageModelImageExt, LanguageModelToolResultContent};
 use schemars::JsonSchema;
