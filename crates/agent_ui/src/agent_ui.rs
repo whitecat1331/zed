@@ -673,9 +673,51 @@ pub fn init(
              _: &SyncThreads,
              _window: &mut Window,
              cx: &mut Context<Workspace>| {
-                thread_metadata_store::ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-                    let _ = store.reload(cx);
-                });
+                // Reconcile diverged threads in the shared database first, then
+                // refresh both the full thread store and the sidebar so the
+                // merged result is what the user sees.
+                let reconcile = agent::reconcile_threads(cx);
+                cx.spawn(async move |_workspace, cx| {
+                    match reconcile.await {
+                        Ok(summary) => {
+                            if summary.merged_threads > 0 {
+                                log::info!(
+                                    "[SYNC] reconciled {} duplicate threads across {} groups",
+                                    summary.merged_threads,
+                                    summary.duplicate_groups,
+                                );
+                            }
+                            // Archive sidebar rows that point at a merged session
+                            // so the collapsed thread is not shown twice.
+                            if !summary.merged_session_ids.is_empty() {
+                                thread_metadata_store::ThreadMetadataStore::global(cx).update(
+                                    cx,
+                                    |store, cx| {
+                                        for session_id in &summary.merged_session_ids {
+                                            let session_id =
+                                                acp::SessionId::new(session_id.clone());
+                                            let thread_id = store
+                                                .entry_by_session(&session_id)
+                                                .map(|entry| entry.thread_id);
+                                            if let Some(thread_id) = thread_id {
+                                                store.archive(thread_id, None, cx);
+                                            }
+                                        }
+                                        let _ = store.reload(cx);
+                                    },
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            log::warn!("[SYNC] thread reconcile failed: {error:#}");
+                        }
+                    }
+
+                    agent::ThreadStore::global(cx).update(cx, |store, cx| {
+                        store.reload(cx);
+                    });
+                })
+                .detach();
             },
         );
     })
