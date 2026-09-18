@@ -54,7 +54,9 @@ use update_version::UpdateVersion;
 use util::ResultExt;
 use workspace::{
     AccessibleMode, MultiWorkspace, OpenOptions, ToggleWorktreeSecurity, Workspace,
-    WorkspaceManager, notifications::{NotifyResultExt, NotifyTaskExt as _}, open_paths,
+    WorkspaceManager,
+    notifications::{NotifyResultExt, NotifyTaskExt as _},
+    open_paths,
 };
 
 use zed_actions::{OpenRemote, workspace::NewManagedWorkspace};
@@ -889,7 +891,11 @@ impl TitleBar {
         let trigger = ButtonLike::new("workspace-switcher")
             .aria_label("Switch Workspace")
             .tab_index(0isize)
-            .child(Icon::new(IconName::ChevronUpDown).size(IconSize::Small).color(Color::Muted));
+            .child(
+                Icon::new(IconName::ChevronUpDown)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            );
 
         Some(
             PopoverMenu::new("workspace-switcher-menu")
@@ -911,17 +917,17 @@ impl TitleBar {
                                     return;
                                 };
                                 let app_state = workspace.read(cx).app_state().clone();
-                                open_paths(&paths, app_state, OpenOptions::default(), cx)
-                                    .detach_and_log_err(cx);
+                                let options = OpenOptions {
+                                    skip_managed_workspace_ask: true,
+                                    ..Default::default()
+                                };
+                                open_paths(&paths, app_state, options, cx).detach_and_log_err(cx);
                             });
                         }
-                        menu.separator().entry(
-                            "New Workspace…",
-                            None,
-                            move |window, cx| {
+                        menu.separator()
+                            .entry("New Workspace…", None, move |window, cx| {
                                 window.dispatch_action(NewManagedWorkspace.boxed_clone(), cx);
-                            },
-                        )
+                            })
                     }))
                 })
                 .anchor(gpui::Anchor::TopLeft)

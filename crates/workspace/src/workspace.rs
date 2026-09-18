@@ -44,8 +44,7 @@ pub use remote::{
 };
 pub use toast_layer::{ToastAction, ToastLayer, ToastView};
 pub use workspace_manager::{
-    AskCandidate, ManagedWorkspace, ManagedWorkspaceId, ManagedWorkspaceProject,
-    WorkspaceManager,
+    AskCandidate, ManagedWorkspace, ManagedWorkspaceId, ManagedWorkspaceProject, WorkspaceManager,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -10931,6 +10930,10 @@ pub struct OpenOptions {
     pub open_mode: OpenMode,
     pub env: Option<HashMap<String, String>>,
     pub open_in_dev_container: bool,
+    /// Skip the managed-workspace disambiguation ask. Set on opens that were
+    /// already resolved through the WorkspaceManager (the ask's own buttons,
+    /// the workspace switcher, pickers), so they never re-prompt.
+    pub skip_managed_workspace_ask: bool,
 }
 
 impl Default for OpenOptions {
@@ -10945,6 +10948,7 @@ impl Default for OpenOptions {
             open_mode: OpenMode::default(),
             env: None,
             open_in_dev_container: false,
+            skip_managed_workspace_ask: false,
         }
     }
 }
@@ -11109,7 +11113,11 @@ impl ManagedWorkspaceAsk {
     fn open(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let app_state = self.app_state.clone();
         cx.defer(move |cx| {
-            open_paths(&paths, app_state, OpenOptions::default(), cx).detach_and_log_err(cx);
+            let options = OpenOptions {
+                skip_managed_workspace_ask: true,
+                ..Default::default()
+            };
+            open_paths(&paths, app_state, options, cx).detach_and_log_err(cx);
         });
         cx.emit(DismissEvent);
     }
@@ -11128,14 +11136,25 @@ impl Focusable for ManagedWorkspaceAsk {
 impl Render for ManagedWorkspaceAsk {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let folder = self.folder.clone();
+        let folder_name = folder
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| folder.display().to_string());
         let candidates = self.candidates.clone();
         v_flex()
+            .key_context("ManagedWorkspaceAsk")
+            .elevation_3(cx)
+            .w(rems(34.))
+            .p_3()
             .gap_2()
-            .p_2()
-            .child(ui::Label::new(format!(
-                "\"{}\" is already part of a workspace.",
-                folder.display()
-            )))
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|_this, _: &menu::Cancel, _window, cx| {
+                cx.emit(DismissEvent);
+            }))
+            .child(
+                ui::Label::new(format!("\"{folder_name}\" is already part of a workspace."))
+                    .truncate(),
+            )
             .children(candidates.iter().map(|candidate| {
                 let workspace_id = candidate.workspace_id;
                 let name = candidate.name.clone();
@@ -11144,9 +11163,10 @@ impl Render for ManagedWorkspaceAsk {
                     format!("open-workspace-{}", workspace_id.to_key_string()),
                     format!("Open workspace \"{name}\" ({project_count} projects)"),
                 )
+                .full_width()
+                .truncate(true)
                 .on_click(cx.listener(move |this, _event, _window, cx| {
-                    let Some(paths) =
-                        WorkspaceManager::global(cx).open(workspace_id).log_err()
+                    let Some(paths) = WorkspaceManager::global(cx).open(workspace_id).log_err()
                     else {
                         return;
                     };
@@ -11154,11 +11174,11 @@ impl Render for ManagedWorkspaceAsk {
                 }))
             }))
             .child(
-                ui::Button::new("open-folder-alone", "Open just this folder").on_click(
-                    cx.listener(move |this, _event, _window, cx| {
+                ui::Button::new("open-folder-alone", "Open just this folder")
+                    .full_width()
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
                         this.open(vec![folder.clone()], cx);
-                    }),
-                ),
+                    })),
             )
     }
 }
@@ -11178,7 +11198,7 @@ pub fn open_paths(
     cx.spawn(async move |cx| {
         // Open-folder ask: a single directory that is a member of a managed
         // workspace prompts for disambiguation before opening.
-        if abs_paths.len() == 1 {
+        if !open_options.skip_managed_workspace_ask && abs_paths.len() == 1 {
             let is_dir = app_state
                 .fs
                 .metadata(&abs_paths[0])

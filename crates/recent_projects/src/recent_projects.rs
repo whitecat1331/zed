@@ -45,12 +45,12 @@ use ui::{
 };
 use util::{ResultExt, paths::PathExt};
 use workspace::{
-    HistoryManager, ManagedWorkspace, ModalView, MultiWorkspace, OpenMode, OpenOptions, OpenVisible,
-    RecentWorkspace, SerializedWorkspaceLocation, Workspace, WorkspaceDb, WorkspaceId,
+    HistoryManager, ManagedWorkspace, ModalView, MultiWorkspace, OpenMode, OpenOptions,
+    OpenVisible, RecentWorkspace, SerializedWorkspaceLocation, Workspace, WorkspaceDb, WorkspaceId,
     WorkspaceManager, notifications::DetachAndPromptErr, open_paths, with_active_or_new_workspace,
 };
-use zed_actions::{OpenDevContainer, OpenRecent, OpenRemote};
 use zed_actions::workspace::{NewManagedWorkspace, OpenManagedWorkspace};
+use zed_actions::{OpenDevContainer, OpenRecent, OpenRemote};
 
 actions!(
     recent_projects,
@@ -287,7 +287,10 @@ pub(crate) fn default_open_in_new_window(cx: &App) -> bool {
 pub fn init(cx: &mut App) {
     cx.on_action(|_: &OpenManagedWorkspace, cx| {
         with_active_or_new_workspace(cx, move |workspace, window, cx| {
-            let managed = WorkspaceManager::global(cx).all().log_err().unwrap_or_default();
+            let managed = WorkspaceManager::global(cx)
+                .all()
+                .log_err()
+                .unwrap_or_default();
             if managed.is_empty() {
                 return;
             }
@@ -323,17 +326,26 @@ pub fn init(cx: &mut App) {
                     return;
                 };
                 let name = WorkspaceManager::derive_name(&paths);
-                if manager.create(name, paths.clone()).await.log_err().is_none() {
+                if manager
+                    .create(name, paths.clone())
+                    .await
+                    .log_err()
+                    .is_none()
+                {
                     return;
                 }
                 if let Some(task) = workspace
-                    .update_in(cx, |workspace, window, cx| {
-                        workspace.open_workspace_for_paths(
-                            OpenMode::NewWindow,
-                            paths,
-                            window,
-                            cx,
-                        )
+                    .update_in(cx, |workspace, _window, cx| {
+                        let app_state = workspace.app_state().clone();
+                        // The workspace was just created through the manager;
+                        // never re-prompt with the membership ask.
+                        let options = OpenOptions {
+                            open_mode: OpenMode::NewWindow,
+                            workspace_matching: workspace::WorkspaceMatching::None,
+                            skip_managed_workspace_ask: true,
+                            ..Default::default()
+                        };
+                        open_paths(&paths, app_state, options, cx)
                     })
                     .log_err()
                 {
@@ -950,29 +962,21 @@ impl PickerDelegate for ManagedWorkspacesDelegate {
         self.matches = self
             .managed
             .iter()
-            .filter(|workspace| {
-                query.is_empty() || workspace.name.to_lowercase().contains(&query)
-            })
+            .filter(|workspace| query.is_empty() || workspace.name.to_lowercase().contains(&query))
             .cloned()
             .collect();
-        self.selected_index = self.selected_index.min(self.matches.len().saturating_sub(1));
+        self.selected_index = self
+            .selected_index
+            .min(self.matches.len().saturating_sub(1));
         Task::ready(())
     }
 
-    fn confirm(
-        &mut self,
-        _secondary: bool,
-        _window: &mut Window,
-        cx: &mut Context<Picker<Self>>,
-    ) {
+    fn confirm(&mut self, _secondary: bool, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
         let Some(workspace) = self.matches.get(self.selected_index) else {
             return;
         };
         let workspace_id = workspace.workspace_id;
-        let Some(paths) = WorkspaceManager::global(cx)
-            .open(workspace_id)
-            .log_err()
-        else {
+        let Some(paths) = WorkspaceManager::global(cx).open(workspace_id).log_err() else {
             return;
         };
         let Some(workspace) = self.workspace.upgrade() else {
@@ -981,7 +985,11 @@ impl PickerDelegate for ManagedWorkspacesDelegate {
         let app_state = workspace.read(cx).app_state().clone();
         cx.emit(DismissEvent);
         cx.defer(move |cx| {
-            open_paths(&paths, app_state, OpenOptions::default(), cx).detach_and_log_err(cx);
+            let options = OpenOptions {
+                skip_managed_workspace_ask: true,
+                ..Default::default()
+            };
+            open_paths(&paths, app_state, options, cx).detach_and_log_err(cx);
         });
     }
 
@@ -1021,7 +1029,8 @@ impl ManagedWorkspacesModal {
             matches: Vec::new(),
             selected_index: 0,
         };
-        let picker = cx.new(|cx| Picker::uniform_list(delegate, window, cx).initial_width(rems(36.)));
+        let picker =
+            cx.new(|cx| Picker::uniform_list(delegate, window, cx).initial_width(rems(36.)));
         Self { picker }
     }
 }

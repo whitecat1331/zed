@@ -1,7 +1,10 @@
 use crate::{
     ManagedWorkspace, NewFile, Open, OpenMode, OpenOptions, PathList, RecentWorkspace,
     SerializedWorkspaceLocation, ToggleWorkspaceSidebar, Workspace, WorkspaceManager,
-    WorkspaceSettings, item::{Item, ItemEvent}, open_paths, persistence::WorkspaceDb,
+    WorkspaceSettings,
+    item::{Item, ItemEvent},
+    open_paths,
+    persistence::WorkspaceDb,
 };
 use agent_settings::AgentSettings;
 use git::Clone as GitClone;
@@ -358,7 +361,11 @@ impl WelcomePage {
         };
         let app_state = workspace.read(cx).app_state().clone();
         cx.defer(move |cx| {
-            open_paths(&paths, app_state, OpenOptions::default(), cx).detach_and_log_err(cx);
+            let options = OpenOptions {
+                skip_managed_workspace_ask: true,
+                ..Default::default()
+            };
+            open_paths(&paths, app_state, options, cx).detach_and_log_err(cx);
         });
     }
 
