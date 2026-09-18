@@ -3,6 +3,7 @@ fn main() {
     // and the `debug-embed` arm). Keep in sync with that `fs_embed!` invocation.
     fs_embed_build::generate(&fs_embed_build::FsEmbed {
         struct_name: "FsEmbedTestAssets",
+        crate_path: "crate::__rust_embed",
         crate_relative: "src",
         includes: &["*.rs"],
         excludes: &["test/**/*"],
