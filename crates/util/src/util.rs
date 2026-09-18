@@ -741,46 +741,12 @@ pub fn __fs_embed_get(
 macro_rules! __fs_embed_embed {
     ($vis:vis struct $name:ident) => {
         $vis struct $name;
-
-        impl $name {
-            pub fn get(
-                file_path: &str,
-            ) -> ::core::option::Option<$crate::__rust_embed::EmbeddedFile> {
-                use $crate::__rust_embed::EmbeddedFile as __FsEmbedFile;
-                use $crate::__rust_embed::Metadata as __FsEmbedMetadata;
-                include!(concat!(
-                    env!("OUT_DIR"),
-                    "/",
-                    stringify!($name),
-                    "_fs_embed_get.rs"
-                ))
-            }
-
-            pub fn iter(
-            ) -> impl ::core::iter::Iterator<Item = ::std::borrow::Cow<'static, str>> + 'static
-            {
-                include!(concat!(
-                    env!("OUT_DIR"),
-                    "/",
-                    stringify!($name),
-                    "_fs_embed_iter.rs"
-                ))
-            }
-        }
-
-        impl $crate::__rust_embed::RustEmbed for $name {
-            fn get(
-                file_path: &str,
-            ) -> ::core::option::Option<$crate::__rust_embed::EmbeddedFile> {
-                <$name>::get(file_path)
-            }
-
-            fn iter(
-            ) -> impl ::core::iter::Iterator<Item = ::std::borrow::Cow<'static, str>> + 'static
-            {
-                <$name>::iter()
-            }
-        }
+        include!(concat!(
+            env!("OUT_DIR"),
+            "/",
+            stringify!($name),
+            "_fs_embed_impl.rs"
+        ));
     };
 }
 

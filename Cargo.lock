@@ -264,6 +264,7 @@ dependencies = [
  "eval_utils",
  "feature_flags",
  "fs",
+ "fs_embed_build",
  "futures 0.3.32",
  "git",
  "gpui",
@@ -937,6 +938,7 @@ name = "assets"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fs_embed_build",
  "gpui",
  "util",
 ]
@@ -5445,6 +5447,7 @@ dependencies = [
  "extension",
  "flate2",
  "fs",
+ "fs_embed_build",
  "futures 0.3.32",
  "gaoya",
  "gpui",
@@ -6761,6 +6764,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs_embed_build"
+version = "0.1.0"
+dependencies = [
+ "rust-embed",
+]
+
+[[package]]
 name = "fs_extra"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7823,6 +7833,7 @@ name = "grammars"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fs_embed_build",
  "language_core",
  "rust-embed",
  "tree-sitter",
@@ -16463,6 +16474,7 @@ dependencies = [
  "collections",
  "ec4rs",
  "fs",
+ "fs_embed_build",
  "futures 0.3.32",
  "gpui",
  "indoc",
@@ -19721,6 +19733,7 @@ dependencies = [
  "command-fds",
  "dirs",
  "dunce",
+ "fs_embed_build",
  "futures 0.3.32",
  "futures-lite 2.6.1",
  "globset",

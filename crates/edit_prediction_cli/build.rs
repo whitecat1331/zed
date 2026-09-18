@@ -16,12 +16,14 @@ fn main() {
     // and `src/filter_languages.rs`.
     fs_embed_build::generate(&fs_embed_build::FsEmbed {
         struct_name: "EmbeddedPrompts",
+        crate_path: "::util::__rust_embed",
         crate_relative: "src/prompts",
         includes: &[],
         excludes: &[],
     });
     fs_embed_build::generate(&fs_embed_build::FsEmbed {
         struct_name: "LanguageConfigs",
+        crate_path: "::util::__rust_embed",
         crate_relative: "../grammars/src/",
         includes: &["*/config.toml"],
         excludes: &[],
