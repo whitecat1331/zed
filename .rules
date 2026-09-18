@@ -142,11 +142,11 @@ Other entities can then register a callback to handle these events by doing `cx.
   `zed-win-build` (Windows `.exe`). This includes verification the agent starts
   on its own mid-task, not only when the user says "build"/"check".
 - Adding a **new** file under an `fs_embed!`-embedded directory (e.g. `assets/themes/`,
-  `crates/agent/src/templates`, `crates/edit_prediction_cli/src/prompts`) is **silently
-  skipped** on rebuild. `rust-embed`'s `RustEmbed` derive snapshots the folder listing at
-  compile time and tracks only the files it already knows (via `include_bytes!`), so it
-  never re-scans for new files. Force a re-scan with `cargo clean -p <crate>` before
-  rebuilding.
+  `crates/agent/src/templates`, `crates/edit_prediction_cli/src/prompts`) is picked up on
+  the next build: each call-site crate's `build.rs` regenerates the embedded file list via
+  the `fs_embed_build` helper, so no `cargo clean -p <crate>` is needed. When you change a
+  `fs_embed!` invocation's `crate_relative`/`include`/`exclude`, keep that crate's `build.rs`
+  in sync.
 
 # Debugger tool
 
