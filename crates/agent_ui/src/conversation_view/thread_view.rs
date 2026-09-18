@@ -7131,7 +7131,15 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) {
         let entries = self.thread.read(cx).entries();
-        let current_ix = self.list_state.logical_scroll_top().item_ix;
+        // When the list is pinned to the bottom, anchor at the end so the
+        // first click lands on the most recent user prompt. Once the user
+        // has scrolled up, anchor at the top of the viewport so each click
+        // walks up to the next-earlier prompt.
+        let current_ix = if self.list_state.is_following_tail() {
+            entries.len()
+        } else {
+            self.list_state.logical_scroll_top().item_ix
+        };
         if let Some(target_ix) = (0..current_ix)
             .rev()
             .find(|&i| matches!(entries.get(i), Some(AgentThreadEntry::UserMessage(_))))
