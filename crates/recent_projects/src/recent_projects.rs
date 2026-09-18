@@ -45,11 +45,11 @@ use ui::{
 };
 use util::{ResultExt, paths::PathExt};
 use workspace::{
-    HistoryManager, ModalView, MultiWorkspace, OpenMode, OpenOptions, OpenVisible, RecentWorkspace,
-    SerializedWorkspaceLocation, Workspace, WorkspaceDb, WorkspaceId,
-    notifications::DetachAndPromptErr, with_active_or_new_workspace,
+    HistoryManager, ManagedWorkspace, ModalView, MultiWorkspace, OpenMode, OpenOptions, OpenVisible,
+    RecentWorkspace, SerializedWorkspaceLocation, Workspace, WorkspaceDb, WorkspaceId,
+    WorkspaceManager, notifications::DetachAndPromptErr, open_paths, with_active_or_new_workspace,
 };
-use zed_actions::{OpenDevContainer, OpenRecent, OpenRemote};
+use zed_actions::{OpenDevContainer, OpenManagedWorkspace, OpenRecent, OpenRemote};
 
 actions!(
     recent_projects,
@@ -284,6 +284,19 @@ pub(crate) fn default_open_in_new_window(cx: &App) -> bool {
 }
 
 pub fn init(cx: &mut App) {
+    cx.on_action(|_: &OpenManagedWorkspace, cx| {
+        with_active_or_new_workspace(cx, move |workspace, window, cx| {
+            let managed = WorkspaceManager::global(cx).all().log_err().unwrap_or_default();
+            if managed.is_empty() {
+                return;
+            }
+            let weak = cx.entity().downgrade();
+            workspace.toggle_modal(window, cx, |window, cx| {
+                ManagedWorkspacesModal::new(weak, managed, window, cx)
+            });
+        });
+    });
+
     #[cfg(target_os = "windows")]
     cx.on_action(|open_wsl: &zed_actions::wsl_actions::OpenFolderInWsl, cx| {
         let create_new_window = open_wsl
@@ -841,6 +854,142 @@ impl Render for RecentProjects {
             .on_action(cx.listener(Self::handle_remove_selected))
             .on_action(cx.listener(Self::handle_add_to_workspace))
             .child(self.picker.clone())
+    }
+}
+
+/// Lists managed workspaces by name and opens the selected one by identity.
+struct ManagedWorkspacesDelegate {
+    workspace: WeakEntity<Workspace>,
+    managed: Vec<ManagedWorkspace>,
+    matches: Vec<ManagedWorkspace>,
+    selected_index: usize,
+}
+
+impl PickerDelegate for ManagedWorkspacesDelegate {
+    type ListItem = ListItem;
+
+    fn name() -> &'static str {
+        "managed workspaces"
+    }
+
+    fn match_count(&self) -> usize {
+        self.matches.len()
+    }
+
+    fn selected_index(&self) -> usize {
+        self.selected_index
+    }
+
+    fn set_selected_index(
+        &mut self,
+        ix: usize,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) {
+        self.selected_index = ix;
+    }
+
+    fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
+        "Open workspace…".into()
+    }
+
+    fn update_matches(
+        &mut self,
+        query: String,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Task<()> {
+        let query = query.trim().to_lowercase();
+        self.matches = self
+            .managed
+            .iter()
+            .filter(|workspace| {
+                query.is_empty() || workspace.name.to_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect();
+        self.selected_index = self.selected_index.min(self.matches.len().saturating_sub(1));
+        Task::ready(())
+    }
+
+    fn confirm(
+        &mut self,
+        _secondary: bool,
+        _window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) {
+        let Some(workspace) = self.matches.get(self.selected_index) else {
+            return;
+        };
+        let workspace_id = workspace.workspace_id;
+        let Some(paths) = WorkspaceManager::global(cx)
+            .open(workspace_id)
+            .log_err()
+        else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let app_state = workspace.read(cx).app_state().clone();
+        cx.emit(DismissEvent);
+        cx.defer(move |cx| {
+            open_paths(&paths, app_state, OpenOptions::default(), cx).detach_and_log_err(cx);
+        });
+    }
+
+    fn dismissed(&mut self, _window: &mut Window, _cx: &mut Context<Picker<Self>>) {}
+
+    fn render_match(
+        &self,
+        ix: usize,
+        selected: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Option<Self::ListItem> {
+        let workspace = self.matches.get(ix)?;
+        Some(
+            ListItem::new(ix)
+                .inset(true)
+                .toggle_state(selected)
+                .child(Label::new(workspace.name.clone())),
+        )
+    }
+}
+
+struct ManagedWorkspacesModal {
+    picker: Entity<Picker<ManagedWorkspacesDelegate>>,
+}
+
+impl ManagedWorkspacesModal {
+    fn new(
+        workspace: WeakEntity<Workspace>,
+        managed: Vec<ManagedWorkspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let delegate = ManagedWorkspacesDelegate {
+            workspace,
+            managed,
+            matches: Vec::new(),
+            selected_index: 0,
+        };
+        let picker = cx.new(|cx| Picker::uniform_list(delegate, window, cx).initial_width(rems(36.)));
+        Self { picker }
+    }
+}
+
+impl ModalView for ManagedWorkspacesModal {}
+
+impl Render for ManagedWorkspacesModal {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex().child(self.picker.clone())
+    }
+}
+
+impl Focusable for ManagedWorkspacesModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.picker.focus_handle(cx)
     }
 }
 
