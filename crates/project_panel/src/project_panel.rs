@@ -3896,9 +3896,9 @@ impl ProjectPanel {
     ) {
         let managed_workspace_id = self
             .workspace
-            .read(cx)
+            .read_with(cx, |workspace, _cx| workspace.managed_workspace_id())
             .ok()
-            .and_then(|workspace| workspace.managed_workspace_id());
+            .flatten();
         for entry in self.effective_entries().iter() {
             let worktree_id = entry.worktree_id;
             if let Some(managed_workspace_id) = managed_workspace_id {
@@ -3909,7 +3909,7 @@ impl ProjectPanel {
                 });
                 if let Some(path) = path {
                     let manager = WorkspaceManager::global(cx);
-                    cx.spawn(async move |cx| {
+                    cx.spawn(async move |_this, cx| {
                         manager
                             .remove_project(managed_workspace_id, path)
                             .await
@@ -3931,12 +3931,13 @@ impl ProjectPanel {
     ) {
         let Some(managed_workspace_id) = self
             .workspace
-            .read(cx)
+            .read_with(cx, |workspace, _cx| workspace.managed_workspace_id())
             .ok()
-            .and_then(|workspace| workspace.managed_workspace_id())
+            .flatten()
         else {
             return;
         };
+        let manager = WorkspaceManager::global(cx);
         let workspace = self.workspace.clone();
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -3945,11 +3946,11 @@ impl ProjectPanel {
             prompt: None,
         });
         cx.spawn_in(window, async move |_this, cx| {
-            let Some(paths) = paths.await.log_err().flatten() else {
+            let Ok(Ok(Some(paths))) = paths.await else {
                 return anyhow::Ok(());
             };
             for path in &paths {
-                WorkspaceManager::global(cx)
+                manager
                     .add_project(managed_workspace_id, path.clone())
                     .await
                     .log_err();

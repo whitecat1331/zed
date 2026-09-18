@@ -331,7 +331,10 @@ pub fn init(cx: &mut App) {
                 let Some(workspace_id) = manager.create(name, paths.clone()).await.log_err() else {
                     return;
                 };
-                open_managed_workspace_paths(&paths, workspace_id, app_state, cx);
+                cx.update(|_window, cx| {
+                    open_managed_workspace_paths(&paths, workspace_id, app_state, cx);
+                })
+                .log_err();
             })
             .detach();
         });
