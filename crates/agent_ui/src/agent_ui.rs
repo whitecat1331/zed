@@ -677,6 +677,8 @@ pub fn init(
                 // refresh both the full thread store and the sidebar so the
                 // merged result is what the user sees.
                 let reconcile = agent::reconcile_threads(cx);
+                let thread_store = agent::ThreadStore::global(cx);
+                let metadata_store = thread_metadata_store::ThreadMetadataStore::global(cx);
                 cx.spawn(async move |_workspace, cx| {
                     match reconcile.await {
                         Ok(summary) => {
@@ -690,22 +692,19 @@ pub fn init(
                             // Archive sidebar rows that point at a merged session
                             // so the collapsed thread is not shown twice.
                             if !summary.merged_session_ids.is_empty() {
-                                thread_metadata_store::ThreadMetadataStore::global(cx).update(
-                                    cx,
-                                    |store, cx| {
-                                        for session_id in &summary.merged_session_ids {
-                                            let session_id =
-                                                acp::SessionId::new(session_id.clone());
-                                            let thread_id = store
-                                                .entry_by_session(&session_id)
-                                                .map(|entry| entry.thread_id);
-                                            if let Some(thread_id) = thread_id {
-                                                store.archive(thread_id, None, cx);
-                                            }
+                                metadata_store.update(cx, |store, cx| {
+                                    for session_id in &summary.merged_session_ids {
+                                        let session_id =
+                                            acp::SessionId::new(session_id.clone());
+                                        let thread_id = store
+                                            .entry_by_session(&session_id)
+                                            .map(|entry| entry.thread_id);
+                                        if let Some(thread_id) = thread_id {
+                                            store.archive(thread_id, None, cx);
                                         }
-                                        let _ = store.reload(cx);
-                                    },
-                                );
+                                    }
+                                    let _ = store.reload(cx);
+                                });
                             }
                         }
                         Err(error) => {
@@ -713,7 +712,7 @@ pub fn init(
                         }
                     }
 
-                    agent::ThreadStore::global(cx).update(cx, |store, cx| {
+                    thread_store.update(cx, |store, cx| {
                         store.reload(cx);
                     });
                 })
