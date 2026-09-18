@@ -670,11 +670,10 @@ impl ThreadsDatabase {
 
         self.executor.spawn(async move {
             let connection = connection.lock();
-            let mut select = connection.select_bound::<Arc<str>, (DataType, Vec<u8>, Option<String>)>(
-                indoc! {"
+            let mut select = connection
+                .select_bound::<Arc<str>, (DataType, Vec<u8>, Option<String>)>(indoc! {"
                     SELECT data_type, data, merged_into FROM threads WHERE id = ? LIMIT 1
-                "},
-            )?;
+                "})?;
 
             // Follow `merged_into` pointers to the canonical thread, so opening
             // a thread that was reconciled into another opens the merged result.
@@ -877,6 +876,46 @@ impl ThreadsDatabase {
         self.executor
             .spawn(async move { reconcile_threads_sync(&connection) })
     }
+
+    /// Reconcile a single thread, identified by its session id, against any
+    /// other thread that shares its dedup key. Only that dedup group is
+    /// touched; unrelated threads are left alone. Used when opening a thread
+    /// so that a duplicate opens the merged result.
+    pub(crate) fn reconcile_thread(
+        &self,
+        id: acp::SessionId,
+    ) -> Task<Result<ThreadReconcileSummary>> {
+        let connection = self.connection.clone();
+        self.executor
+            .spawn(async move { reconcile_thread_sync(&connection, &id.0) })
+    }
+
+    /// Resolve a session id through any `merged_into` pointers to the
+    /// canonical thread it belongs to. Returns the input id unchanged when it
+    /// has not been merged, and `None` when no such thread exists.
+    pub fn resolve_thread_id(&self, id: acp::SessionId) -> Task<Result<Option<acp::SessionId>>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            let mut select = connection.select_bound::<Arc<str>, Option<String>>(indoc! {"
+                    SELECT merged_into FROM threads WHERE id = ? LIMIT 1
+                "})?;
+
+            let mut current_id = id.0;
+            for _ in 0..64 {
+                let rows = select(current_id.clone())?;
+                let Some(merged_into) = rows.into_iter().next() else {
+                    return Ok(None);
+                };
+                match merged_into {
+                    Some(next) => current_id = Arc::from(next.as_str()),
+                    None => return Ok(Some(acp::SessionId::new(current_id))),
+                }
+            }
+
+            Ok(None)
+        })
+    }
 }
 
 /// Returns the concatenated text of the first user message in a thread, so a
@@ -974,8 +1013,73 @@ pub fn reconcile_threads(cx: &mut App) -> Task<Result<ThreadReconcileSummary>> {
     })
 }
 
-fn reconcile_threads_sync(
+/// Reconcile a single thread, identified by its session id, against its
+/// dedup-group peers. See [`ThreadsDatabase::reconcile_thread`].
+pub fn reconcile_thread(cx: &mut App, id: acp::SessionId) -> Task<Result<ThreadReconcileSummary>> {
+    let database_future = ThreadsDatabase::connect(cx);
+    let executor = cx.background_executor().clone();
+    executor.spawn(async move {
+        let database = database_future.await.map_err(|err| anyhow!(err))?;
+        database.reconcile_thread(id).await
+    })
+}
+
+/// Resolve a session id through any `merged_into` pointers to the canonical
+/// thread it belongs to. Returns the input id unchanged when it has not been
+/// merged. See [`ThreadsDatabase::resolve_thread_id`].
+pub fn resolve_thread_id(cx: &mut App, id: acp::SessionId) -> Task<Result<Option<acp::SessionId>>> {
+    let database_future = ThreadsDatabase::connect(cx);
+    let executor = cx.background_executor().clone();
+    executor.spawn(async move {
+        let database = database_future.await.map_err(|err| anyhow!(err))?;
+        database.resolve_thread_id(id).await
+    })
+}
+
+fn reconcile_threads_sync(connection: &Arc<Mutex<Connection>>) -> Result<ThreadReconcileSummary> {
+    reconcile_threads_scoped_sync(connection, None)
+}
+
+/// Reconcile only the dedup group that `id` belongs to, and nothing else.
+fn reconcile_thread_sync(
     connection: &Arc<Mutex<Connection>>,
+    id: &str,
+) -> Result<ThreadReconcileSummary> {
+    // Resolve `id` through any existing `merged_into` pointer first, then scope
+    // the pass to that thread's dedup key.
+    let scope = {
+        let connection = connection.lock();
+        let mut select =
+            connection.select_bound::<Arc<str>, (Option<String>, Option<String>)>(indoc! {"
+                SELECT dedup_key, merged_into FROM threads WHERE id = ? LIMIT 1
+            "})?;
+        let mut current_id: Arc<str> = Arc::<str>::from(id);
+        let mut scope = None;
+        for _ in 0..64 {
+            let rows = select(current_id.clone())?;
+            let Some((dedup_key, merged_into)) = rows.into_iter().next() else {
+                break;
+            };
+            match merged_into {
+                Some(next) => current_id = Arc::from(next.as_str()),
+                None => {
+                    scope = dedup_key;
+                    break;
+                }
+            }
+        }
+        scope
+    };
+
+    match scope {
+        Some(scope) => reconcile_threads_scoped_sync(connection, Some(scope.as_str())),
+        None => Ok(ThreadReconcileSummary::default()),
+    }
+}
+
+fn reconcile_threads_scoped_sync(
+    connection: &Arc<Mutex<Connection>>,
+    scope: Option<&str>,
 ) -> Result<ThreadReconcileSummary> {
     struct ReconcileRow {
         id: String,
@@ -987,10 +1091,14 @@ fn reconcile_threads_sync(
 
     let connection = connection.lock();
     connection.with_savepoint("thread_reconcile", || {
-        let mut select = connection.select_bound::<
-            (),
-            (Arc<str>, Option<String>, Option<String>, String, DataType, Vec<u8>),
-        >(indoc! {"
+        let mut select = connection.select_bound::<(), (
+            Arc<str>,
+            Option<String>,
+            Option<String>,
+            String,
+            DataType,
+            Vec<u8>,
+        )>(indoc! {"
             SELECT id, dedup_key, created_at, updated_at, data_type, data
             FROM threads
             WHERE dedup_key IS NOT NULL AND merged_into IS NULL
@@ -1008,6 +1116,10 @@ fn reconcile_threads_sync(
                 data_type,
                 data,
             });
+        }
+
+        if let Some(scope) = scope {
+            groups.retain(|dedup_key, _| dedup_key.as_str() == scope);
         }
 
         let mut summary = ThreadReconcileSummary::default();
@@ -1063,12 +1175,14 @@ fn reconcile_threads_sync(
                 Arc::from(canonical.id.as_str()),
             ))?;
 
-            let mut archive =
-                connection.exec_bound::<(Arc<str>, Arc<str>)>(indoc! {"
+            let mut archive = connection.exec_bound::<(Arc<str>, Arc<str>)>(indoc! {"
                     UPDATE threads SET merged_into = ?1 WHERE id = ?2
                 "})?;
             for member in members.iter().skip(1) {
-                archive((Arc::from(canonical.id.as_str()), Arc::from(member.id.as_str())))?;
+                archive((
+                    Arc::from(canonical.id.as_str()),
+                    Arc::from(member.id.as_str()),
+                ))?;
                 summary.merged_session_ids.push(member.id.clone());
             }
 
@@ -1092,9 +1206,7 @@ fn message_signature(message: &DbMessage) -> Vec<String> {
             for block in user.content.iter() {
                 match block {
                     UserMessageContent::Text(text) => parts.push(text.clone()),
-                    UserMessageContent::Mention { content, .. } => {
-                        parts.push(content.to_string())
-                    }
+                    UserMessageContent::Mention { content, .. } => parts.push(content.to_string()),
                     UserMessageContent::Image(_) => parts.push("<image>".to_string()),
                 }
             }
@@ -1118,9 +1230,7 @@ fn message_signature(message: &DbMessage) -> Vec<String> {
                 parts.push(format!("result:{}", result.tool_name));
                 for part in &result.content {
                     match part {
-                        LanguageModelToolResultContent::Text(text) => {
-                            parts.push(text.to_string())
-                        }
+                        LanguageModelToolResultContent::Text(text) => parts.push(text.to_string()),
                         LanguageModelToolResultContent::Image(_) => {
                             parts.push("<image>".to_string())
                         }
@@ -1762,7 +1872,11 @@ mod tests {
         assert_eq!(entries[0].id, older_id);
 
         // The canonical kept the superset (the duplicate was a strict prefix).
-        let merged = database.load_thread(older_id.clone()).await.unwrap().unwrap();
+        let merged = database
+            .load_thread(older_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(user_texts(&merged), vec!["hello", "world"]);
 
         // Opening the archived duplicate resolves to the canonical, merged
@@ -1908,5 +2022,127 @@ mod tests {
 
         let entries = database.list_threads().await.unwrap();
         assert_eq!(entries.len(), 2);
+    }
+
+    #[gpui::test]
+    async fn test_reconcile_thread_scopes_to_single_group(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+
+        let group_a_older = session_id("group-a-older");
+        let group_a_newer = session_id("group-a-newer");
+        let group_b_older = session_id("group-b-older");
+        let group_b_newer = session_id("group-b-newer");
+
+        let mut group_a_older_thread = make_thread(
+            "Group A Older",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+        );
+        group_a_older_thread.messages.push(user_message("hello"));
+        group_a_older_thread.messages.push(user_message("alpha"));
+
+        let mut group_a_newer_thread = make_thread(
+            "Group A Newer",
+            Utc.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap(),
+        );
+        group_a_newer_thread.messages.push(user_message("hello"));
+
+        let mut group_b_older_thread = make_thread(
+            "Group B Older",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+        );
+        group_b_older_thread.messages.push(user_message("goodbye"));
+
+        let mut group_b_newer_thread = make_thread(
+            "Group B Newer",
+            Utc.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap(),
+        );
+        group_b_newer_thread.messages.push(user_message("goodbye"));
+
+        for (id, thread) in [
+            (group_a_older.clone(), group_a_older_thread),
+            (group_a_newer.clone(), group_a_newer_thread),
+            (group_b_older.clone(), group_b_older_thread),
+            (group_b_newer.clone(), group_b_newer_thread),
+        ] {
+            database
+                .save_thread(id, thread, PathList::default(), Some("ws-1".into()))
+                .await
+                .unwrap();
+        }
+
+        // Scoped to group A: only its two threads collapse; group B is untouched.
+        let summary = database
+            .reconcile_thread(group_a_newer.clone())
+            .await
+            .unwrap();
+        assert_eq!(summary.merged_threads, 1);
+        assert_eq!(
+            summary.merged_session_ids,
+            vec![group_a_newer.0.to_string()]
+        );
+
+        let entries = database.list_threads().await.unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().any(|entry| entry.id == group_a_older));
+        assert!(entries.iter().any(|entry| entry.id == group_b_older));
+        assert!(entries.iter().any(|entry| entry.id == group_b_newer));
+    }
+
+    #[gpui::test]
+    async fn test_resolve_thread_id_follows_merged_into(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+
+        let older_id = session_id("thread-a");
+        let newer_id = session_id("thread-b");
+
+        let mut older = make_thread(
+            "Thread A",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+        );
+        older.messages.push(user_message("hello"));
+
+        let mut newer = make_thread(
+            "Thread B",
+            Utc.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap(),
+        );
+        newer.messages.push(user_message("hello"));
+
+        database
+            .save_thread(
+                older_id.clone(),
+                older,
+                PathList::default(),
+                Some("ws-1".into()),
+            )
+            .await
+            .unwrap();
+        database
+            .save_thread(
+                newer_id.clone(),
+                newer,
+                PathList::default(),
+                Some("ws-1".into()),
+            )
+            .await
+            .unwrap();
+
+        // Before reconciling, neither id resolves anywhere.
+        assert_eq!(
+            database.resolve_thread_id(newer_id.clone()).await.unwrap(),
+            Some(newer_id.clone()),
+        );
+
+        database.reconcile_threads().await.unwrap();
+
+        // The archived duplicate resolves to the canonical, and the canonical
+        // resolves to itself.
+        assert_eq!(
+            database.resolve_thread_id(newer_id.clone()).await.unwrap(),
+            Some(older_id.clone()),
+        );
+        assert_eq!(
+            database.resolve_thread_id(older_id.clone()).await.unwrap(),
+            Some(older_id),
+        );
     }
 }
