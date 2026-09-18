@@ -47,7 +47,8 @@ use util::{ResultExt, paths::PathExt};
 use workspace::{
     HistoryManager, ManagedWorkspace, ModalView, MultiWorkspace, OpenMode, OpenOptions,
     OpenVisible, RecentWorkspace, SerializedWorkspaceLocation, Workspace, WorkspaceDb, WorkspaceId,
-    WorkspaceManager, notifications::DetachAndPromptErr, open_paths, with_active_or_new_workspace,
+    WorkspaceManager, notifications::DetachAndPromptErr, open_managed_workspace_paths, open_paths,
+    with_active_or_new_workspace,
 };
 use zed_actions::workspace::{NewManagedWorkspace, OpenManagedWorkspace};
 use zed_actions::{OpenDevContainer, OpenRecent, OpenRemote};
@@ -307,6 +308,7 @@ pub fn init(cx: &mut App) {
             use project::DirectoryLister;
 
             let manager = WorkspaceManager::global(cx);
+            let app_state = workspace.app_state().clone();
             let paths = workspace.prompt_for_open_path(
                 PathPromptOptions {
                     files: false,
@@ -321,36 +323,15 @@ pub fn init(cx: &mut App) {
                 window,
                 cx,
             );
-            cx.spawn_in(window, async move |workspace, cx| {
+            cx.spawn_in(window, async move |_workspace, cx| {
                 let Some(paths) = paths.await.log_err().flatten() else {
                     return;
                 };
                 let name = WorkspaceManager::derive_name(&paths);
-                if manager
-                    .create(name, paths.clone())
-                    .await
-                    .log_err()
-                    .is_none()
-                {
+                let Some(workspace_id) = manager.create(name, paths.clone()).await.log_err() else {
                     return;
-                }
-                if let Some(task) = workspace
-                    .update_in(cx, |workspace, _window, cx| {
-                        let app_state = workspace.app_state().clone();
-                        // The workspace was just created through the manager;
-                        // never re-prompt with the membership ask.
-                        let options = OpenOptions {
-                            open_mode: OpenMode::NewWindow,
-                            workspace_matching: workspace::WorkspaceMatching::None,
-                            skip_managed_workspace_ask: true,
-                            ..Default::default()
-                        };
-                        open_paths(&paths, app_state, options, cx)
-                    })
-                    .log_err()
-                {
-                    task.await.log_err();
-                }
+                };
+                open_managed_workspace_paths(&paths, workspace_id, app_state, cx);
             })
             .detach();
         });
@@ -985,11 +966,7 @@ impl PickerDelegate for ManagedWorkspacesDelegate {
         let app_state = workspace.read(cx).app_state().clone();
         cx.emit(DismissEvent);
         cx.defer(move |cx| {
-            let options = OpenOptions {
-                skip_managed_workspace_ask: true,
-                ..Default::default()
-            };
-            open_paths(&paths, app_state, options, cx).detach_and_log_err(cx);
+            open_managed_workspace_paths(&paths, workspace_id, app_state, cx);
         });
     }
 

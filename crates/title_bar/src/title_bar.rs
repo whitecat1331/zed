@@ -53,10 +53,9 @@ use ui::{
 use update_version::UpdateVersion;
 use util::ResultExt;
 use workspace::{
-    AccessibleMode, MultiWorkspace, OpenOptions, ToggleWorktreeSecurity, Workspace,
-    WorkspaceManager,
+    AccessibleMode, MultiWorkspace, ToggleWorktreeSecurity, Workspace, WorkspaceManager,
     notifications::{NotifyResultExt, NotifyTaskExt as _},
-    open_paths,
+    open_managed_workspace_paths,
 };
 
 use zed_actions::{OpenRemote, workspace::NewManagedWorkspace};
@@ -917,11 +916,7 @@ impl TitleBar {
                                     return;
                                 };
                                 let app_state = workspace.read(cx).app_state().clone();
-                                let options = OpenOptions {
-                                    skip_managed_workspace_ask: true,
-                                    ..Default::default()
-                                };
-                                open_paths(&paths, app_state, options, cx).detach_and_log_err(cx);
+                                open_managed_workspace_paths(&paths, workspace_id, app_state, cx);
                             });
                         }
                         menu.separator()

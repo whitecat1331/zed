@@ -1,9 +1,8 @@
 use crate::{
-    ManagedWorkspace, NewFile, Open, OpenMode, OpenOptions, PathList, RecentWorkspace,
+    ManagedWorkspace, NewFile, Open, OpenMode, PathList, RecentWorkspace,
     SerializedWorkspaceLocation, ToggleWorkspaceSidebar, Workspace, WorkspaceManager,
     WorkspaceSettings,
     item::{Item, ItemEvent},
-    open_paths,
     persistence::WorkspaceDb,
 };
 use agent_settings::AgentSettings;
@@ -361,11 +360,7 @@ impl WelcomePage {
         };
         let app_state = workspace.read(cx).app_state().clone();
         cx.defer(move |cx| {
-            let options = OpenOptions {
-                skip_managed_workspace_ask: true,
-                ..Default::default()
-            };
-            open_paths(&paths, app_state, options, cx).detach_and_log_err(cx);
+            open_managed_workspace_paths(&paths, workspace_id, app_state, cx);
         });
     }
 

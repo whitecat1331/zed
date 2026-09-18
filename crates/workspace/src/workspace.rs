@@ -1637,6 +1637,9 @@ pub struct Workspace {
     active_call: Option<(GlobalAnyActiveCall, Vec<Subscription>)>,
     leader_updates_tx: mpsc::UnboundedSender<(PeerId, proto::UpdateFollowers)>,
     database_id: Option<WorkspaceId>,
+    /// The stable id-keyed identity of the workspace this window displays,
+    /// set when the workspace is opened through the WorkspaceManager.
+    managed_workspace_id: Option<ManagedWorkspaceId>,
     app_state: Arc<AppState>,
     dispatching_keystrokes: Rc<RefCell<DispatchingKeystrokes>>,
     _subscriptions: Vec<Subscription>,
@@ -2143,6 +2146,7 @@ impl Workspace {
             dirty_items: Default::default(),
             active_call,
             database_id: workspace_id,
+            managed_workspace_id: None,
             app_state,
             _observe_current_user,
             _apply_leader_updates,
@@ -7528,6 +7532,16 @@ impl Workspace {
         self.database_id
     }
 
+    /// The managed-workspace identity of this workspace, if it was opened
+    /// through the WorkspaceManager.
+    pub fn managed_workspace_id(&self) -> Option<ManagedWorkspaceId> {
+        self.managed_workspace_id
+    }
+
+    pub fn set_managed_workspace_id(&mut self, id: Option<ManagedWorkspaceId>) {
+        self.managed_workspace_id = id;
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_database_id(&mut self, id: WorkspaceId) {
         self.database_id = Some(id);
@@ -11170,7 +11184,9 @@ impl Render for ManagedWorkspaceAsk {
                     else {
                         return;
                     };
-                    this.open(paths, cx);
+                    let app_state = this.app_state.clone();
+                    open_managed_workspace_paths(&paths, workspace_id, app_state, cx);
+                    cx.emit(DismissEvent);
                 }))
             }))
             .child(
@@ -11181,6 +11197,37 @@ impl Render for ManagedWorkspaceAsk {
                     })),
             )
     }
+}
+
+/// Opens a managed workspace's project paths in a new window and tags the
+/// resulting workspace with its managed identity. This is the shared code path
+/// behind every "open workspace" action: new window, no re-ask, and the live
+/// `Workspace` carries its `ManagedWorkspaceId`.
+pub fn open_managed_workspace_paths(
+    paths: &[PathBuf],
+    workspace_id: ManagedWorkspaceId,
+    app_state: Arc<AppState>,
+    cx: &mut App,
+) {
+    let paths = paths.to_vec();
+    let options = OpenOptions {
+        open_mode: OpenMode::NewWindow,
+        skip_managed_workspace_ask: true,
+        ..Default::default()
+    };
+    let open_task = open_paths(&paths, app_state, options, cx);
+    cx.spawn(async move |cx| {
+        if let Ok(open_result) = open_task.await {
+            open_result
+                .workspace
+                .update(cx, |workspace, cx| {
+                    workspace.set_managed_workspace_id(Some(workspace_id));
+                    cx.notify();
+                })
+                .log_err();
+        }
+    })
+    .detach();
 }
 
 pub fn open_paths(
