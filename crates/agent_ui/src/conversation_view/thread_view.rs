@@ -4433,6 +4433,7 @@ impl ThreadView {
                                     .gap_0p5()
                                     .child(self.render_add_context_button(cx))
                                     .child(self.render_follow_toggle(cx))
+                                    .child(self.render_jump_to_previous_prompt_button(cx))
                                     .children(self.render_fast_mode_control(cx))
                                     .children(self.render_thinking_control(cx)),
                             )
@@ -5664,6 +5665,25 @@ impl ThreadView {
                     editor.insert_skill_crease(&skill, window, cx);
                 });
             })
+    }
+
+    fn render_jump_to_previous_prompt_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let focus_handle = self.message_editor.focus_handle(cx);
+
+        IconButton::new("jump-to-previous-prompt", IconName::UserArrowUp)
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Muted)
+            .tooltip(move |_window, cx| {
+                Tooltip::for_action_in(
+                    "Jump to Previous Prompt",
+                    &ScrollOutputToPreviousMessage,
+                    &focus_handle,
+                    cx,
+                )
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.scroll_output_to_previous_message(&ScrollOutputToPreviousMessage, window, cx);
+            }))
     }
 
     fn render_follow_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
