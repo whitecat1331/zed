@@ -96,8 +96,9 @@ use crate::{
     CycleThinkingEffort, EditFirstQueuedMessage, ExpandMessageEditor, Follow, KeepAll, NewThread,
     OpenAddContextMenu, OpenAgentDiff, RejectAll, RejectOnce, RemoveFirstQueuedMessage,
     ScrollOutputLineDown, ScrollOutputLineUp, ScrollOutputPageDown, ScrollOutputPageUp,
-    ScrollOutputToBottom, ScrollOutputToNextMessage, ScrollOutputToPreviousMessage,
-    ScrollOutputToTop, SendImmediately, SendNextQueuedMessage, ToggleFastMode,
+    ScrollOutputToBottom, ScrollOutputToFocusedMessage, ScrollOutputToNextMessage,
+    ScrollOutputToPreviousMessage, ScrollOutputToTop, SendImmediately, SendNextQueuedMessage,
+    ToggleFastMode,
     ToggleProfileSelector, ToggleSteerFirstQueuedMessage, ToggleThinkingEffortMenu,
     ToggleThinkingMode, UndoLastReject,
 };
