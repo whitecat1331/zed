@@ -44,7 +44,8 @@ pub use remote::{
 };
 pub use toast_layer::{ToastAction, ToastLayer, ToastView};
 pub use workspace_manager::{
-    ManagedWorkspace, ManagedWorkspaceId, ManagedWorkspaceProject, WorkspaceManager,
+    AskCandidate, ManagedWorkspace, ManagedWorkspaceId, ManagedWorkspaceProject,
+    WorkspaceManager,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -152,7 +153,7 @@ pub use toolbar::{
     PaneSearchBarCallbacks, Toolbar, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
 };
 pub use ui;
-use ui::{Window, prelude::*};
+use ui::{Clickable, Window, prelude::*};
 use url::Url;
 use util::{
     ResultExt, TryFutureExt,
@@ -11081,6 +11082,87 @@ pub fn open_workspace_by_id(
 }
 
 #[allow(clippy::type_complexity)]
+/// Disambiguation prompt shown when opening a bare folder that is already a
+/// member of one or more managed workspaces.
+struct ManagedWorkspaceAsk {
+    folder: PathBuf,
+    candidates: Vec<AskCandidate>,
+    app_state: Arc<AppState>,
+    focus_handle: FocusHandle,
+}
+
+impl ManagedWorkspaceAsk {
+    fn new(
+        folder: PathBuf,
+        candidates: Vec<AskCandidate>,
+        app_state: Arc<AppState>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            folder,
+            candidates,
+            app_state,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    fn open(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let app_state = self.app_state.clone();
+        cx.defer(move |cx| {
+            open_paths(&paths, app_state, OpenOptions::default(), cx).detach_and_log_err(cx);
+        });
+        cx.emit(DismissEvent);
+    }
+}
+
+impl ModalView for ManagedWorkspaceAsk {}
+
+impl EventEmitter<DismissEvent> for ManagedWorkspaceAsk {}
+
+impl Focusable for ManagedWorkspaceAsk {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for ManagedWorkspaceAsk {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let folder = self.folder.clone();
+        let candidates = self.candidates.clone();
+        v_flex()
+            .gap_2()
+            .p_2()
+            .child(ui::Label::new(format!(
+                "\"{}\" is already part of a workspace.",
+                folder.display()
+            )))
+            .children(candidates.iter().map(|candidate| {
+                let workspace_id = candidate.workspace_id;
+                let name = candidate.name.clone();
+                let project_count = candidate.project_count;
+                ui::Button::new(
+                    format!("open-workspace-{}", workspace_id.to_key_string()),
+                    format!("Open workspace \"{name}\" ({project_count} projects)"),
+                )
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    let Some(paths) =
+                        WorkspaceManager::global(cx).open(workspace_id).log_err()
+                    else {
+                        return;
+                    };
+                    this.open(paths, cx);
+                }))
+            }))
+            .child(
+                ui::Button::new("open-folder-alone", "Open just this folder").on_click(
+                    cx.listener(move |this, _event, _window, cx| {
+                        this.open(vec![folder.clone()], cx);
+                    }),
+                ),
+            )
+    }
+}
+
 pub fn open_paths(
     abs_paths: &[PathBuf],
     app_state: Arc<AppState>,
@@ -11094,6 +11176,59 @@ pub fn open_paths(
         .find_map(|p| util::paths::WslPath::from_path(p));
 
     cx.spawn(async move |cx| {
+        // Open-folder ask: a single directory that is a member of a managed
+        // workspace prompts for disambiguation before opening.
+        if abs_paths.len() == 1 {
+            let is_dir = app_state
+                .fs
+                .metadata(&abs_paths[0])
+                .await
+                .log_err()
+                .flatten()
+                .map(|metadata| metadata.is_dir)
+                .unwrap_or(false);
+            if is_dir {
+                let folder = abs_paths[0].clone();
+                let candidates = cx.update(|cx| {
+                    WorkspaceManager::global(cx)
+                        .ask_candidates(&folder)
+                        .log_err()
+                        .unwrap_or_default()
+                })?;
+                if !candidates.is_empty() {
+                    let shown = cx.update(|cx| {
+                        let Some(window) = cx
+                            .active_window()
+                            .and_then(|window| window.downcast::<MultiWorkspace>())
+                        else {
+                            return false;
+                        };
+                        window
+                            .update(cx, |multi_workspace, window, cx| {
+                                let workspace = multi_workspace.workspace().clone();
+                                workspace.update(cx, |workspace, cx| {
+                                    workspace.toggle_modal(window, cx, |window, cx| {
+                                        ManagedWorkspaceAsk::new(
+                                            folder.clone(),
+                                            candidates.clone(),
+                                            app_state.clone(),
+                                            cx,
+                                        )
+                                    });
+                                });
+                            })
+                            .log_err();
+                        true
+                    })?;
+                    if shown {
+                        return Err(anyhow::anyhow!(
+                            "open deferred to managed-workspace ask"
+                        ));
+                    }
+                }
+            }
+        }
+
         let (mut existing, mut open_visible) = find_existing_workspace(
             &abs_paths,
             &open_options,
