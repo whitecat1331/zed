@@ -11218,13 +11218,10 @@ pub fn open_managed_workspace_paths(
     let open_task = open_paths(&paths, app_state, options, cx);
     cx.spawn(async move |cx| {
         if let Ok(open_result) = open_task.await {
-            open_result
-                .workspace
-                .update(cx, |workspace, cx| {
-                    workspace.set_managed_workspace_id(Some(workspace_id));
-                    cx.notify();
-                })
-                .log_err();
+            open_result.workspace.update(cx, |workspace, cx| {
+                workspace.set_managed_workspace_id(Some(workspace_id));
+                cx.notify();
+            });
         }
     })
     .detach();

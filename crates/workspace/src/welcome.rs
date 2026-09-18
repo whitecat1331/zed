@@ -3,6 +3,7 @@ use crate::{
     SerializedWorkspaceLocation, ToggleWorkspaceSidebar, Workspace, WorkspaceManager,
     WorkspaceSettings,
     item::{Item, ItemEvent},
+    open_managed_workspace_paths,
     persistence::WorkspaceDb,
 };
 use agent_settings::AgentSettings;
