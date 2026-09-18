@@ -66,10 +66,10 @@ use futures::{
 };
 use gpui::{
     Action, AnyEntity, AnyView, AnyWeakView, App, AppContext, AsyncApp, AsyncWindowContext, Axis,
-    Bounds, ClipboardItem, Context, CursorStyle, Decorations, DragMoveEvent, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke,
-    ManagedView, MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size,
-    Stateful, Subscription, SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity,
+    Bounds, ClipboardItem, Context, CursorStyle, Decorations, DismissEvent, DragMoveEvent, Entity,
+    EntityId, EventEmitter, FocusHandle, Focusable, Global, HitboxBehavior, Hsla, KeyContext,
+    Keystroke, ManagedView, MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge,
+    Size, Stateful, Subscription, SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity,
     WindowBounds, WindowHandle, WindowId, WindowOptions, actions, canvas, point, relative, size,
     transparent_black,
 };
@@ -11194,7 +11194,7 @@ pub fn open_paths(
                         .ask_candidates(&folder)
                         .log_err()
                         .unwrap_or_default()
-                })?;
+                });
                 if !candidates.is_empty() {
                     let shown = cx.update(|cx| {
                         let Some(window) = cx
@@ -11207,7 +11207,7 @@ pub fn open_paths(
                             .update(cx, |multi_workspace, window, cx| {
                                 let workspace = multi_workspace.workspace().clone();
                                 workspace.update(cx, |workspace, cx| {
-                                    workspace.toggle_modal(window, cx, |window, cx| {
+                                    workspace.toggle_modal(window, cx, |_window, cx| {
                                         ManagedWorkspaceAsk::new(
                                             folder.clone(),
                                             candidates.clone(),
@@ -11219,7 +11219,7 @@ pub fn open_paths(
                             })
                             .log_err();
                         true
-                    })?;
+                    });
                     if shown {
                         return Err(anyhow::anyhow!(
                             "open deferred to managed-workspace ask"
