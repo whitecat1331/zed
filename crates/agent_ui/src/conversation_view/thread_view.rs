@@ -590,6 +590,7 @@ pub struct ThreadView {
     pub last_token_limit_telemetry: Option<acp_thread::TokenUsageRatio>,
     thread_feedback: ThreadFeedbackState,
     pub list_state: ListState,
+    current_prompt_ix: Option<usize>,
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp::ToolCallId>,
     collapsed_sandbox_authorization_details: HashSet<acp::ToolCallId>,
@@ -999,6 +1000,7 @@ impl ThreadView {
             model_selector,
             profile_selector,
             list_state,
+            current_prompt_ix: None,
             session_capabilities,
             resumed_without_history,
             _subscriptions: subscriptions,
@@ -4434,6 +4436,7 @@ impl ThreadView {
                                     .child(self.render_add_context_button(cx))
                                     .child(self.render_follow_toggle(cx))
                                     .child(self.render_jump_to_previous_prompt_button(cx))
+                                    .child(self.render_jump_to_next_prompt_button(cx))
                                     .children(self.render_fast_mode_control(cx))
                                     .children(self.render_thinking_control(cx)),
                             )
@@ -5683,6 +5686,25 @@ impl ThreadView {
             })
             .on_click(cx.listener(|this, _, window, cx| {
                 this.scroll_output_to_previous_message(&ScrollOutputToPreviousMessage, window, cx);
+            }))
+    }
+
+    fn render_jump_to_next_prompt_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let focus_handle = self.message_editor.focus_handle(cx);
+
+        IconButton::new("jump-to-next-prompt", IconName::ArrowDown)
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Muted)
+            .tooltip(move |_window, cx| {
+                Tooltip::for_action_in(
+                    "Jump to Next Prompt",
+                    &ScrollOutputToNextMessage,
+                    &focus_handle,
+                    cx,
+                )
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.scroll_output_to_next_message(&ScrollOutputToNextMessage, window, cx);
             }))
     }
 
@@ -7130,26 +7152,7 @@ impl ThreadView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let entries = self.thread.read(cx).entries();
-        // When the list is pinned to the bottom, anchor at the end so the
-        // first click lands on the most recent user prompt. Once the user
-        // has scrolled up, anchor at the top of the viewport so each click
-        // walks up to the next-earlier prompt.
-        let current_ix = if self.list_state.is_following_tail() {
-            entries.len()
-        } else {
-            self.list_state.logical_scroll_top().item_ix
-        };
-        if let Some(target_ix) = (0..current_ix)
-            .rev()
-            .find(|&i| matches!(entries.get(i), Some(AgentThreadEntry::UserMessage(_))))
-        {
-            self.list_state.scroll_to(ListOffset {
-                item_ix: target_ix,
-                offset_in_item: px(0.),
-            });
-            cx.notify();
-        }
+        self.jump_to_user_prompt(-1, cx);
     }
 
     fn scroll_output_to_next_message(
@@ -7158,17 +7161,51 @@ impl ThreadView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let entries = self.thread.read(cx).entries();
-        let current_ix = self.list_state.logical_scroll_top().item_ix;
-        if let Some(target_ix) = (current_ix + 1..entries.len())
-            .find(|&i| matches!(entries.get(i), Some(AgentThreadEntry::UserMessage(_))))
-        {
-            self.list_state.scroll_to(ListOffset {
-                item_ix: target_ix,
-                offset_in_item: px(0.),
-            });
-            cx.notify();
+        self.jump_to_user_prompt(1, cx);
+    }
+
+    fn jump_to_user_prompt(&mut self, direction: isize, cx: &mut Context<Self>) {
+        let user_message_indices: Vec<usize> = self
+            .thread
+            .read(cx)
+            .entries()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                matches!(entry, AgentThreadEntry::UserMessage(_)).then_some(index)
+            })
+            .collect();
+
+        let count = user_message_indices.len();
+        if count == 0 {
+            return;
         }
+
+        let next = match self.current_prompt_ix {
+            Some(current) if current < count => {
+                // Wrap around the ends so consecutive jumps keep cycling
+                // through the prompts in order.
+                if direction < 0 {
+                    (current + count - 1) % count
+                } else {
+                    (current + 1) % count
+                }
+            }
+            _ => {
+                if direction < 0 {
+                    count - 1
+                } else {
+                    0
+                }
+            }
+        };
+
+        self.current_prompt_ix = Some(next);
+        self.list_state.scroll_to(ListOffset {
+            item_ix: user_message_indices[next],
+            offset_in_item: px(0.),
+        });
+        cx.notify();
     }
 
     fn refresh_thread_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
