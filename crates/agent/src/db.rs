@@ -1041,15 +1041,16 @@ fn reconcile_threads_sync(
 
             // Surface the merge with the most recent activity so the canonical
             // thread stays ordered where the user expects it.
-            let max_updated_at = members
-                .iter()
-                .map(|member| DateTime::parse_from_rfc3339(&member.updated_at))
-                .collect::<Result<Vec<_>, chrono::ParseError>>()?
-                .into_iter()
-                .map(|updated_at| updated_at.with_timezone(&Utc))
-                .max()
-                .expect("reconcile group is non-empty")
-                .to_rfc3339();
+            let mut max_updated_at =
+                DateTime::parse_from_rfc3339(&canonical.updated_at)?.with_timezone(&Utc);
+            for member in members.iter().skip(1) {
+                let candidate =
+                    DateTime::parse_from_rfc3339(&member.updated_at)?.with_timezone(&Utc);
+                if candidate > max_updated_at {
+                    max_updated_at = candidate;
+                }
+            }
+            let max_updated_at = max_updated_at.to_rfc3339();
 
             let mut update_canonical = connection
                 .exec_bound::<(Vec<u8>, DataType, String, Arc<str>)>(indoc! {"
