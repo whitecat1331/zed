@@ -320,6 +320,8 @@ actions!(
         ScrollOutputToPreviousMessage,
         /// Scroll the output to the next user message.
         ScrollOutputToNextMessage,
+        /// Scroll the output to the focused user message.
+        ScrollOutputToFocusedMessage,
         /// Toggles in-thread search over the current agent thread's contents.
         ToggleSearch,
         /// Import agent threads from other Zed release channels (e.g. Preview, Nightly).

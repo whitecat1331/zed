@@ -4437,6 +4437,7 @@ impl ThreadView {
                                     .child(self.render_follow_toggle(cx))
                                     .child(self.render_jump_to_previous_prompt_button(cx))
                                     .child(self.render_jump_to_next_prompt_button(cx))
+                                    .child(self.render_jump_to_focused_prompt_button(cx))
                                     .children(self.render_fast_mode_control(cx))
                                     .children(self.render_thinking_control(cx)),
                             )
@@ -5692,7 +5693,7 @@ impl ThreadView {
     fn render_jump_to_next_prompt_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let focus_handle = self.message_editor.focus_handle(cx);
 
-        IconButton::new("jump-to-next-prompt", IconName::ArrowDown)
+        IconButton::new("jump-to-next-prompt", IconName::UserArrowDown)
             .icon_size(IconSize::Small)
             .icon_color(Color::Muted)
             .tooltip(move |_window, cx| {
@@ -5705,6 +5706,25 @@ impl ThreadView {
             })
             .on_click(cx.listener(|this, _, window, cx| {
                 this.scroll_output_to_next_message(&ScrollOutputToNextMessage, window, cx);
+            }))
+    }
+
+    fn render_jump_to_focused_prompt_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let focus_handle = self.message_editor.focus_handle(cx);
+
+        IconButton::new("jump-to-focused-prompt", IconName::Eye)
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Muted)
+            .tooltip(move |_window, cx| {
+                Tooltip::for_action_in(
+                    "Jump to Focused Prompt",
+                    &ScrollOutputToFocusedMessage,
+                    &focus_handle,
+                    cx,
+                )
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.scroll_output_to_focused_message(&ScrollOutputToFocusedMessage, window, cx);
             }))
     }
 
@@ -7164,18 +7184,28 @@ impl ThreadView {
         self.jump_to_user_prompt(1, cx);
     }
 
-    fn jump_to_user_prompt(&mut self, direction: isize, cx: &mut Context<Self>) {
-        let user_message_indices: Vec<usize> = self
-            .thread
-            .read(cx)
-            .entries()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| {
-                matches!(entry, AgentThreadEntry::UserMessage(_)).then_some(index)
-            })
-            .collect();
+    fn scroll_output_to_focused_message(
+        &mut self,
+        _: &ScrollOutputToFocusedMessage,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(focused) = self.current_prompt_ix else {
+            return;
+        };
 
+        let user_message_indices = self.user_message_indices(cx);
+        if let Some(&entry_ix) = user_message_indices.get(focused) {
+            self.list_state.scroll_to(ListOffset {
+                item_ix: entry_ix,
+                offset_in_item: px(0.),
+            });
+            cx.notify();
+        }
+    }
+
+    fn jump_to_user_prompt(&mut self, direction: isize, cx: &mut Context<Self>) {
+        let user_message_indices = self.user_message_indices(cx);
         let count = user_message_indices.len();
         if count == 0 {
             return;
@@ -7206,6 +7236,18 @@ impl ThreadView {
             offset_in_item: px(0.),
         });
         cx.notify();
+    }
+
+    fn user_message_indices(&self, cx: &Context<Self>) -> Vec<usize> {
+        self.thread
+            .read(cx)
+            .entries()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                matches!(entry, AgentThreadEntry::UserMessage(_)).then_some(index)
+            })
+            .collect()
     }
 
     fn refresh_thread_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -12333,6 +12375,7 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::scroll_output_to_bottom))
             .on_action(cx.listener(Self::scroll_output_to_previous_message))
             .on_action(cx.listener(Self::scroll_output_to_next_message))
+            .on_action(cx.listener(Self::scroll_output_to_focused_message))
             .on_action(cx.listener(Self::toggle_search))
             .on_action(cx.listener(|this, _: &ToggleFastMode, window, cx| {
                 this.toggle_fast_mode(window, cx);
