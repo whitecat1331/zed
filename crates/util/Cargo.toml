@@ -46,6 +46,9 @@ util_macros = { workspace = true, optional = true }
 gpui_util.workspace = true
 path = { workspace = true, features = ["serde"] }
 
+[build-dependencies]
+fs_embed_build.workspace = true
+
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 smol.workspace = true
 which.workspace = true

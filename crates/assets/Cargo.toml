@@ -15,3 +15,6 @@ workspace = true
 anyhow.workspace = true
 gpui.workspace = true
 util.workspace = true
+
+[build-dependencies]
+fs_embed_build.workspace = true

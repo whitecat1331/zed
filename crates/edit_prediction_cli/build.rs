@@ -11,4 +11,19 @@ fn main() {
         .trim()
         .trim_matches('"');
     println!("cargo:rustc-env=ZED_PKG_VERSION={}", version);
+
+    // Keep in sync with the `fs_embed!` invocations in `src/prompt_assets.rs`
+    // and `src/filter_languages.rs`.
+    fs_embed_build::generate(&fs_embed_build::FsEmbed {
+        struct_name: "EmbeddedPrompts",
+        crate_relative: "src/prompts",
+        includes: &[],
+        excludes: &[],
+    });
+    fs_embed_build::generate(&fs_embed_build::FsEmbed {
+        struct_name: "LanguageConfigs",
+        crate_relative: "../grammars/src/",
+        includes: &["*/config.toml"],
+        excludes: &[],
+    });
 }

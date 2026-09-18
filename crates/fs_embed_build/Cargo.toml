@@ -1,0 +1,9 @@
+[package]
+name = "fs_embed_build"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "GPL-3.0-or-later"
+
+[dependencies]
+rust-embed.workspace = true

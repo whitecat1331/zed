@@ -72,6 +72,9 @@ flate2 = "1.1.8"
 toml.workspace = true
 gaoya = "0.2.0"
 
+[build-dependencies]
+fs_embed_build.workspace = true
+
 # Wasmtime is included as a dependency in order to enable the same
 # features that are enabled in Zed.
 #
