@@ -39,7 +39,13 @@ pub struct FsEmbed {
 /// re-run this script when any directory under the embedded folder changes (so a
 /// new file or directory is picked up).
 pub fn generate(fs_embed: &FsEmbed) {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // `CARGO_MANIFEST_DIR` must be read at runtime, not with `env!`. `env!`
+    // would bake in *this* crate's manifest dir (crates/fs_embed_build), but
+    // `generate` runs inside the *calling* crate's build script, whose
+    // `CARGO_MANIFEST_DIR` is the crate declaring the call site.
+    let manifest_dir = PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"),
+    );
     let folder = manifest_dir.join(fs_embed.crate_relative);
 
     let matcher = rust_embed::utils::PathMatcher::new(fs_embed.includes, fs_embed.excludes);
