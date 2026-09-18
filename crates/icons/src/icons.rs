@@ -287,6 +287,7 @@ pub enum IconName {
     TriangleRight,
     Undo,
     Unpin,
+    UserArrowDown,
     UserArrowUp,
     UserCheck,
     UserGroup,
