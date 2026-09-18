@@ -3909,7 +3909,7 @@ impl ProjectPanel {
                 });
                 if let Some(path) = path {
                     let manager = WorkspaceManager::global(cx);
-                    cx.spawn(async move |_this, cx| {
+                    cx.spawn(async move |_this, _cx| {
                         manager
                             .remove_project(managed_workspace_id, path)
                             .await

@@ -47,7 +47,7 @@ use util::{ResultExt, paths::PathExt};
 use workspace::{
     HistoryManager, ManagedWorkspace, ModalView, MultiWorkspace, OpenMode, OpenOptions,
     OpenVisible, RecentWorkspace, SerializedWorkspaceLocation, Workspace, WorkspaceDb, WorkspaceId,
-    WorkspaceManager, notifications::DetachAndPromptErr, open_managed_workspace_paths, open_paths,
+    WorkspaceManager, notifications::DetachAndPromptErr, open_managed_workspace_paths,
     with_active_or_new_workspace,
 };
 use zed_actions::workspace::{NewManagedWorkspace, OpenManagedWorkspace};
