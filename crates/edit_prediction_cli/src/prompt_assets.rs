@@ -24,15 +24,16 @@ pub fn get_prompt(name: &'static str) -> Cow<'static, str> {
     return Cow::Borrowed(leaked);
 }
 
+// Dev builds read prompts from the checkout at runtime (no baked path).
+#[cfg(not(feature = "dynamic_prompts"))]
+util::fs_embed! {
+    struct EmbeddedPrompts,
+    crate_relative = "src/prompts",
+    root_relative = "crates/edit_prediction_cli/src/prompts",
+}
+
 #[cfg(not(feature = "dynamic_prompts"))]
 pub fn get_prompt(name: &'static str) -> Cow<'static, str> {
-    // Dev builds read prompts from the checkout at runtime (no baked path).
-    util::fs_embed! {
-        struct EmbeddedPrompts,
-        crate_relative = "src/prompts",
-        root_relative = "crates/edit_prediction_cli/src/prompts",
-    }
-
     match EmbeddedPrompts::get(name) {
         Some(file) => match file.data {
             Cow::Borrowed(bytes) => {
