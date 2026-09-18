@@ -35,6 +35,9 @@ tree-sitter-rust = { workspace = true, optional = true }
 tree-sitter-typescript = { workspace = true, optional = true }
 tree-sitter-yaml = { workspace = true, optional = true }
 
+[build-dependencies]
+fs_embed_build.workspace = true
+
 [features]
 load-grammars = [
     "tree-sitter",

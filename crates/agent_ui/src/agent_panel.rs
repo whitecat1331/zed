@@ -4585,6 +4585,48 @@ impl AgentPanel {
         // also seed the message editor with any prompt text the user had
         // typed before closing the window (persisted in the scoped kvp
         // draft-prompt store).
+        //
+        // A sidebar click on a non-draft thread reconciles it first, so a
+        // duplicate opens the merged result instead of a stale copy. Other
+        // sources (restore, deep links, mentions) open immediately: the
+        // restore path in particular relies on the active view being built
+        // synchronously.
+        let session_id = if source == AgentThreadSource::Sidebar {
+            ThreadMetadataStore::try_global(cx).and_then(|store| {
+                store
+                    .read(cx)
+                    .entry(thread_id)
+                    .and_then(|m| m.session_id.clone())
+            })
+        } else {
+            None
+        };
+        if let Some(session_id) = session_id {
+            self.load_agent_thread_reconciled(
+                agent, thread_id, session_id, work_dirs, title, focus, source, window, cx,
+            );
+            return;
+        }
+
+        self.open_fresh_thread(
+            agent, thread_id, work_dirs, title, focus, source, window, cx,
+        );
+    }
+
+    /// Build a fresh [`ConversationView`] for a thread that is not currently in
+    /// memory. For drafts this also seeds the message editor with any prompt
+    /// text persisted in the scoped kvp draft-prompt store.
+    fn open_fresh_thread(
+        &mut self,
+        agent: Agent,
+        thread_id: ThreadId,
+        work_dirs: Option<PathList>,
+        title: Option<SharedString>,
+        focus: bool,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let is_draft = ThreadMetadataStore::try_global(cx)
             .and_then(|store| store.read(cx).entry(thread_id).map(|m| m.is_draft()))
             .unwrap_or(false);
@@ -4607,6 +4649,106 @@ impl AgentPanel {
             window,
             cx,
         );
+    }
+
+    /// Reconcile a thread against its dedup group before opening it, then open
+    /// the canonical result so a duplicate click opens the merged conversation.
+    fn load_agent_thread_reconciled(
+        &mut self,
+        agent: Agent,
+        thread_id: ThreadId,
+        session_id: acp::SessionId,
+        work_dirs: Option<PathList>,
+        title: Option<SharedString>,
+        focus: bool,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let reconcile = agent::reconcile_thread(cx, session_id.clone());
+        let thread_store = agent::ThreadStore::global(cx);
+        let metadata_store = ThreadMetadataStore::global(cx);
+
+        cx.spawn_in(window, async move |this, cx| {
+            let summary = reconcile.await;
+
+            // Resolve the clicked session through any merged_into pointer the
+            // reconcile just wrote, so the reopened thread carries the
+            // canonical session id (a later save must not revive a merged-away
+            // record).
+            let resolve_task = cx
+                .update(|_window, app| agent::resolve_thread_id(app, session_id.clone()))
+                .ok();
+            let canonical_session = match resolve_task {
+                Some(task) => task
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| session_id.clone()),
+                None => session_id.clone(),
+            };
+
+            let reload = metadata_store.update(cx, |store, cx| {
+                let merged: Vec<acp::SessionId> = summary
+                    .as_ref()
+                    .ok()
+                    .map(|summary| {
+                        summary
+                            .merged_session_ids
+                            .iter()
+                            .map(|id| acp::SessionId::new(id.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if merged.is_empty() {
+                    store.reload(cx)
+                } else {
+                    store.archive_merged_sessions_and_reload(&merged, cx)
+                }
+            });
+            reload.await;
+
+            match &summary {
+                Ok(summary) if summary.merged_threads > 0 => {
+                    log::info!(
+                        "[SYNC] reconciled {} duplicate threads across {} groups",
+                        summary.merged_threads,
+                        summary.duplicate_groups,
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    log::warn!("[SYNC] thread reconcile failed: {error:#}");
+                }
+            }
+
+            thread_store.update(cx, |store, cx| {
+                store.reload(cx);
+            });
+
+            this.update_in(cx, |this, window, cx| {
+                let canonical_thread_id = ThreadMetadataStore::try_global(cx)
+                    .and_then(|store| {
+                        store
+                            .read(cx)
+                            .entry_by_session(&canonical_session)
+                            .map(|entry| entry.thread_id)
+                    })
+                    .unwrap_or(thread_id);
+                this.open_fresh_thread(
+                    agent,
+                    canonical_thread_id,
+                    work_dirs,
+                    title,
+                    focus,
+                    source,
+                    window,
+                    cx,
+                );
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub(crate) fn create_agent_thread_with_server(
@@ -5021,11 +5163,7 @@ impl agent::DebuggerHost for AgentPanelDebuggerHost {
         })
     }
 
-    fn restart_session(
-        &self,
-        session_id: u64,
-        cx: &mut gpui::AsyncApp,
-    ) -> Task<Result<()>> {
+    fn restart_session(&self, session_id: u64, cx: &mut gpui::AsyncApp) -> Task<Result<()>> {
         let panel = self.panel.clone();
         let window = self.window;
         cx.spawn(async move |cx| {

@@ -683,15 +683,77 @@ impl ThreadMetadataStore {
                 );
 
                 this.update(cx, |this, cx| {
-                    this.threads.clear();
-                    this.threads_by_paths.clear();
-                    this.threads_by_main_paths.clear();
-                    this.threads_by_session.clear();
+                    this.apply_rows(rows);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .shared();
+        self.reload_task = Some(reload_task.clone());
+        reload_task
+    }
 
-                    for row in rows {
-                        this.cache_thread_metadata(row);
+    /// Replace the in-memory cache with the given rows.
+    fn apply_rows(&mut self, rows: Vec<ThreadMetadata>) {
+        self.threads.clear();
+        self.threads_by_paths.clear();
+        self.threads_by_main_paths.clear();
+        self.threads_by_session.clear();
+
+        for row in rows {
+            self.cache_thread_metadata(row);
+        }
+    }
+
+    /// Archive the sidebar rows for sessions that a reconcile merged into a
+    /// canonical thread, then rebuild the in-memory cache from the database.
+    ///
+    /// Unlike the fire-and-forget [`Self::archive`] path, this awaits the
+    /// database writes before listing, so the collapse is durable and cannot
+    /// be undone by a reload racing the background upsert queue.
+    pub fn archive_merged_sessions_and_reload(
+        &mut self,
+        session_ids: &[acp::SessionId],
+        cx: &mut Context<Self>,
+    ) -> Shared<Task<()>> {
+        let db = self.db.clone();
+        let mut archived_thread_ids = Vec::new();
+        let to_archive: Vec<ThreadMetadata> = session_ids
+            .iter()
+            .filter_map(|session_id| {
+                let metadata = self.entry_by_session(session_id)?.clone();
+                archived_thread_ids.push(metadata.thread_id);
+                Some(ThreadMetadata {
+                    archived: true,
+                    ..metadata
+                })
+            })
+            .collect();
+
+        self.reload_task.take();
+        let reload_task = cx
+            .spawn(async move |this, cx| {
+                let rows = cx
+                    .background_spawn({
+                        let db = db.clone();
+                        async move {
+                            for metadata in to_archive {
+                                db.save(metadata).await.log_err();
+                            }
+                            db.list().context("Failed to fetch sidebar metadata")
+                        }
+                    })
+                    .await
+                    .log_err();
+                let Some(rows) = rows else {
+                    return;
+                };
+
+                this.update(cx, |this, cx| {
+                    this.apply_rows(rows);
+                    for thread_id in &archived_thread_ids {
+                        cx.emit(ThreadMetadataStoreEvent::ThreadArchived(*thread_id));
                     }
-
                     cx.notify();
                 })
                 .ok();
