@@ -49,7 +49,8 @@ use workspace::{
     RecentWorkspace, SerializedWorkspaceLocation, Workspace, WorkspaceDb, WorkspaceId,
     WorkspaceManager, notifications::DetachAndPromptErr, open_paths, with_active_or_new_workspace,
 };
-use zed_actions::{NewManagedWorkspace, OpenDevContainer, OpenManagedWorkspace, OpenRecent, OpenRemote};
+use zed_actions::{OpenDevContainer, OpenRecent, OpenRemote};
+use zed_actions::workspace::{NewManagedWorkspace, OpenManagedWorkspace};
 
 actions!(
     recent_projects,
@@ -1024,6 +1025,8 @@ impl ManagedWorkspacesModal {
         Self { picker }
     }
 }
+
+impl EventEmitter<DismissEvent> for ManagedWorkspacesModal {}
 
 impl ModalView for ManagedWorkspacesModal {}
 
