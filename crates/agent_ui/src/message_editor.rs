@@ -29,6 +29,7 @@ use gpui::{
     TextStyle, WeakEntity,
 };
 use language::{Buffer, language_settings::InlayHintKind};
+use notifications::status_toast::StatusToast;
 use parking_lot::RwLock;
 use project::AgentId;
 use project::{
@@ -317,9 +318,10 @@ async fn resolve_pasted_context_items(
     supports_images: bool,
     entries: Vec<ClipboardEntry>,
     cx: &mut gpui::AsyncWindowContext,
-) -> (Vec<ResolvedPastedContextItem>, Vec<Entity<Worktree>>) {
+) -> (Vec<ResolvedPastedContextItem>, Vec<Entity<Worktree>>, bool) {
     let mut items = Vec::new();
     let mut added_worktrees = Vec::new();
+    let mut dropped_unsupported_images = false;
     let default_image_name: SharedString = "Image".into();
 
     for entry in entries {
@@ -331,6 +333,8 @@ async fn resolve_pasted_context_items(
                         image,
                         default_image_name.clone(),
                     ));
+                } else {
+                    dropped_unsupported_images = true;
                 }
             }
             ClipboardEntry::ExternalPaths(paths) => {
@@ -350,6 +354,8 @@ async fn resolve_pasted_context_items(
                     {
                         if supports_images {
                             items.push(ResolvedPastedContextItem::Image(image, name));
+                        } else {
+                            dropped_unsupported_images = true;
                         }
                         continue;
                     }
@@ -375,7 +381,7 @@ async fn resolve_pasted_context_items(
         }
     }
 
-    (items, added_worktrees)
+    (items, added_worktrees, dropped_unsupported_images)
 }
 
 fn insert_project_path_as_context(
@@ -445,6 +451,18 @@ async fn insert_resolved_pasted_context_items(
 
     join_all(path_mention_tasks).await;
     drop(added_worktrees);
+}
+
+fn show_image_unsupported_toast(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
+    let toast = StatusToast::new("This model doesn't support images.", cx, |this, _cx| {
+        this.icon(
+            Icon::new(IconName::Warning)
+                .size(IconSize::Small)
+                .color(Color::Warning),
+        )
+        .dismiss_button(true)
+    });
+    workspace.toggle_status_toast(toast, cx);
 }
 
 impl MessageEditor {
@@ -1368,6 +1386,13 @@ impl MessageEditor {
         let project_is_local = project.read(cx).is_local();
         let supports_images = self.session_capabilities.read().supports_images();
         if !project_is_local && !supports_images {
+            if clipboard
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, ClipboardEntry::Image(_)))
+            {
+                self.show_image_unsupported_warning(cx);
+            }
             return false;
         }
         let editor = self.editor.clone();
@@ -1377,14 +1402,18 @@ impl MessageEditor {
 
         window
             .spawn(cx, async move |mut cx| {
-                let (items, added_worktrees) = resolve_pasted_context_items(
-                    project,
-                    project_is_local,
-                    supports_images,
-                    entries,
-                    &mut cx,
-                )
-                .await;
+                let (items, added_worktrees, dropped_unsupported_images) =
+                    resolve_pasted_context_items(
+                        project,
+                        project_is_local,
+                        supports_images,
+                        entries,
+                        &mut cx,
+                    )
+                    .await;
+                if dropped_unsupported_images && let Some(workspace) = workspace.upgrade() {
+                    workspace.update(cx, show_image_unsupported_toast);
+                }
                 insert_resolved_pasted_context_items(
                     items,
                     added_worktrees,
@@ -1400,6 +1429,12 @@ impl MessageEditor {
             .detach_and_log_err(cx);
 
         true
+    }
+
+    fn show_image_unsupported_warning(&mut self, cx: &mut Context<Self>) {
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, show_image_unsupported_toast);
+        }
     }
 
     pub fn insert_dragged_files(
