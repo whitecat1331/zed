@@ -4359,3 +4359,45 @@ mod tests {
         });
     }
 }
+            &mut vcx,
+        );
+        vcx.run_until_parked();
+
+        // Transition the project into collab mode (simulates joining as a guest).
+        project.update(cx, |project, _cx| {
+            project.mark_as_collab_for_testing();
+        });
+
+        // Add a second worktree. For a real collab guest this would be one of
+        // the host's worktrees arriving via the collab protocol, but here we
+        // use a local path because the test infrastructure cannot easily produce
+        // a remote worktree with a fully-scanned root entry.
+        //
+        // This fires WorktreeAdded → update_thread_work_dirs. Without an
+        // is_via_collab() guard that call overwrites the stored paths of
+        // retained thread A from {/project-a} to {/project-a, /project-b},
+        // polluting its metadata with a path it never belonged to.
+        project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(Path::new("/project-b"), true, cx)
+            })
+            .await
+            .unwrap();
+        vcx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let entry = store
+                .read(cx)
+                .entry(thread_a_id)
+                .expect("thread A must still exist in the store");
+            assert_eq!(
+                entry.folder_paths().paths(),
+                &[std::path::PathBuf::from("/project-a")],
+                "retained thread A's stored path must not be updated while the project is via collab"
+            );
+        });
+    }
+}
+    }
+}
