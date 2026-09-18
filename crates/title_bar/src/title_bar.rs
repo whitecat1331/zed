@@ -53,11 +53,11 @@ use ui::{
 use update_version::UpdateVersion;
 use util::ResultExt;
 use workspace::{
-    AccessibleMode, MultiWorkspace, ToggleWorktreeSecurity, Workspace,
-    notifications::{NotifyResultExt, NotifyTaskExt as _},
+    AccessibleMode, MultiWorkspace, OpenOptions, ToggleWorktreeSecurity, Workspace,
+    WorkspaceManager, notifications::{NotifyResultExt, NotifyTaskExt as _}, open_paths,
 };
 
-use zed_actions::OpenRemote;
+use zed_actions::{OpenRemote, workspace::NewManagedWorkspace};
 
 pub use onboarding_banner::restore_banner;
 
@@ -334,6 +334,7 @@ impl Render for TitleBar {
                                     title_bar
                                         .children(self.render_project_host(cx))
                                         .child(self.render_project_name(project_name, window, cx))
+                                        .children(self.render_managed_workspaces_popover(cx))
                                 })
                                 .when_some(
                                     repository.filter(|_| is_git_enabled),
@@ -873,6 +874,59 @@ impl TitleBar {
             )
             .anchor(gpui::Anchor::TopLeft)
             .into_any_element()
+    }
+
+    fn render_managed_workspaces_popover(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let managed = WorkspaceManager::global(cx)
+            .all()
+            .log_err()
+            .unwrap_or_default();
+        if managed.is_empty() {
+            return None;
+        }
+        let workspace = self.workspace.clone();
+
+        let trigger = ButtonLike::new("workspace-switcher")
+            .aria_label("Switch Workspace")
+            .tab_index(0isize)
+            .child(Icon::new(IconName::ChevronUpDown).size(IconSize::Small).color(Color::Muted));
+
+        Some(
+            PopoverMenu::new("workspace-switcher-menu")
+                .trigger_with_tooltip(trigger, Tooltip::text("Switch Workspace"))
+                .menu(move |window, cx| {
+                    Some(ContextMenu::build(window, cx, |menu, _window, _cx| {
+                        let mut menu = menu.header("Workspaces");
+                        for managed_workspace in &managed {
+                            let workspace_id = managed_workspace.workspace_id;
+                            let name = managed_workspace.name.clone();
+                            let workspace = workspace.clone();
+                            menu = menu.entry(name, None, move |_window, cx| {
+                                let Some(paths) =
+                                    WorkspaceManager::global(cx).open(workspace_id).log_err()
+                                else {
+                                    return;
+                                };
+                                let Some(workspace) = workspace.upgrade() else {
+                                    return;
+                                };
+                                let app_state = workspace.read(cx).app_state().clone();
+                                open_paths(&paths, app_state, OpenOptions::default(), cx)
+                                    .detach_and_log_err(cx);
+                            });
+                        }
+                        menu.separator().entry(
+                            "New Workspace…",
+                            None,
+                            move |window, cx| {
+                                window.dispatch_action(NewManagedWorkspace.boxed_clone(), cx);
+                            },
+                        )
+                    }))
+                })
+                .anchor(gpui::Anchor::TopLeft)
+                .into_any_element(),
+        )
     }
 
     fn render_recent_projects_popover(
