@@ -49,7 +49,7 @@ use workspace::{
     RecentWorkspace, SerializedWorkspaceLocation, Workspace, WorkspaceDb, WorkspaceId,
     WorkspaceManager, notifications::DetachAndPromptErr, open_paths, with_active_or_new_workspace,
 };
-use zed_actions::{OpenDevContainer, OpenManagedWorkspace, OpenRecent, OpenRemote};
+use zed_actions::{NewManagedWorkspace, OpenDevContainer, OpenManagedWorkspace, OpenRecent, OpenRemote};
 
 actions!(
     recent_projects,
@@ -294,6 +294,52 @@ pub fn init(cx: &mut App) {
             workspace.toggle_modal(window, cx, |window, cx| {
                 ManagedWorkspacesModal::new(weak, managed, window, cx)
             });
+        });
+    });
+
+    cx.on_action(|_: &NewManagedWorkspace, cx| {
+        with_active_or_new_workspace(cx, move |workspace, window, cx| {
+            use gpui::PathPromptOptions;
+            use project::DirectoryLister;
+
+            let manager = WorkspaceManager::global(cx);
+            let paths = workspace.prompt_for_open_path(
+                PathPromptOptions {
+                    files: false,
+                    directories: true,
+                    multiple: false,
+                    prompt: None,
+                },
+                DirectoryLister::Local(
+                    workspace.project().clone(),
+                    workspace.app_state().fs.clone(),
+                ),
+                window,
+                cx,
+            );
+            cx.spawn_in(window, async move |workspace, cx| {
+                let Some(paths) = paths.await.log_err().flatten() else {
+                    return;
+                };
+                let name = WorkspaceManager::derive_name(&paths);
+                if manager.create(name, paths.clone()).await.log_err().is_none() {
+                    return;
+                }
+                if let Some(task) = workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.open_workspace_for_paths(
+                            OpenMode::NewWindow,
+                            paths,
+                            window,
+                            cx,
+                        )
+                    })
+                    .log_err()
+                {
+                    task.await.log_err();
+                }
+            })
+            .detach();
         });
     });
 

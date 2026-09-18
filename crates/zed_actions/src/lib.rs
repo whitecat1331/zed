@@ -295,6 +295,8 @@ pub mod workspace {
             OpenWithSystem,
             /// Opens a managed workspace by identity (list picker).
             OpenManagedWorkspace,
+            /// Creates and opens a new managed workspace (folder prompt).
+            NewManagedWorkspace,
         ]
     );
 }
