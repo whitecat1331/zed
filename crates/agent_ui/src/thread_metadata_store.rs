@@ -26,7 +26,9 @@ use project::{AgentId, linked_worktree_short_name};
 use remote::{RemoteConnectionOptions, same_remote_connection_identity};
 use ui::{App, Context, SharedString, ThreadItemWorktreeInfo, WorktreeKind};
 use util::ResultExt as _;
-use workspace::{PathList, SerializedWorkspaceLocation, WorkspaceDb};
+use workspace::{
+    ManagedWorkspaceId, PathList, SerializedWorkspaceLocation, WorkspaceDb, WorkspaceManager,
+};
 
 use crate::DEFAULT_THREAD_TITLE;
 
@@ -502,6 +504,7 @@ pub struct ThreadMetadataStore {
     threads: HashMap<ThreadId, ThreadMetadata>,
     threads_by_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_main_paths: HashMap<PathList, HashSet<ThreadId>>,
+    threads_by_workspace: HashMap<ManagedWorkspaceId, HashSet<ThreadId>>,
     threads_by_session: HashMap<acp::SessionId, ThreadId>,
     reload_task: Option<Shared<Task<()>>>,
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
@@ -654,6 +657,27 @@ impl ThreadMetadataStore {
             .filter(move |s| s.matches_remote_connection(remote_connection))
     }
 
+    /// Returns non-archived threads whose managed-workspace identity matches
+    /// `workspace_id`. The index is rebuilt on reload by resolving each thread's
+    /// `folder_paths` through the WorkspaceManager, so add/remove-folder keeps
+    /// threads under the same stable id.
+    pub fn entries_for_workspace<'a>(
+        &'a self,
+        workspace_id: ManagedWorkspaceId,
+    ) -> impl Iterator<Item = &'a ThreadMetadata> + 'a {
+        self.threads_by_workspace
+            .get(&workspace_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|thread_id| self.threads.get(thread_id))
+            .filter(|metadata| !metadata.archived)
+    }
+
+    /// The managed-workspace ids that currently have at least one thread.
+    pub fn workspace_ids(&self) -> impl Iterator<Item = &ManagedWorkspaceId> + '_ {
+        self.threads_by_workspace.keys()
+    }
+
     pub fn reload(&mut self, cx: &mut Context<Self>) -> Shared<Task<()>> {
         let db = self.db.clone();
         self.reload_task.take();
@@ -686,10 +710,29 @@ impl ThreadMetadataStore {
                     this.threads.clear();
                     this.threads_by_paths.clear();
                     this.threads_by_main_paths.clear();
+                    this.threads_by_workspace.clear();
                     this.threads_by_session.clear();
 
                     for row in rows {
                         this.cache_thread_metadata(row);
+                    }
+
+                    let workspace_threads: Vec<(ManagedWorkspaceId, ThreadId)> = this
+                        .threads
+                        .iter()
+                        .filter_map(|(thread_id, metadata)| {
+                            WorkspaceManager::global(cx)
+                                .workspace_id_for_paths(metadata.folder_paths())
+                                .log_err()
+                                .flatten()
+                                .map(|workspace_id| (workspace_id, *thread_id))
+                        })
+                        .collect();
+                    for (workspace_id, thread_id) in workspace_threads {
+                        this.threads_by_workspace
+                            .entry(workspace_id)
+                            .or_default()
+                            .insert(thread_id);
                     }
 
                     cx.notify();
@@ -1255,6 +1298,7 @@ impl ThreadMetadataStore {
             threads: HashMap::default(),
             threads_by_paths: HashMap::default(),
             threads_by_main_paths: HashMap::default(),
+            threads_by_workspace: HashMap::default(),
             threads_by_session: HashMap::default(),
             reload_task: None,
             conversation_subscriptions: HashMap::default(),
@@ -4357,47 +4401,5 @@ mod tests {
                 "retained thread A's stored path must not be updated while the project is via collab"
             );
         });
-    }
-}
-            &mut vcx,
-        );
-        vcx.run_until_parked();
-
-        // Transition the project into collab mode (simulates joining as a guest).
-        project.update(cx, |project, _cx| {
-            project.mark_as_collab_for_testing();
-        });
-
-        // Add a second worktree. For a real collab guest this would be one of
-        // the host's worktrees arriving via the collab protocol, but here we
-        // use a local path because the test infrastructure cannot easily produce
-        // a remote worktree with a fully-scanned root entry.
-        //
-        // This fires WorktreeAdded → update_thread_work_dirs. Without an
-        // is_via_collab() guard that call overwrites the stored paths of
-        // retained thread A from {/project-a} to {/project-a, /project-b},
-        // polluting its metadata with a path it never belonged to.
-        project
-            .update(cx, |project, cx| {
-                project.find_or_create_worktree(Path::new("/project-b"), true, cx)
-            })
-            .await
-            .unwrap();
-        vcx.run_until_parked();
-
-        cx.update(|cx| {
-            let store = ThreadMetadataStore::global(cx);
-            let entry = store
-                .read(cx)
-                .entry(thread_a_id)
-                .expect("thread A must still exist in the store");
-            assert_eq!(
-                entry.folder_paths().paths(),
-                &[std::path::PathBuf::from("/project-a")],
-                "retained thread A's stored path must not be updated while the project is via collab"
-            );
-        });
-    }
-}
     }
 }
