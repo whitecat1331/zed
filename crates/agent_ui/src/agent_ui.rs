@@ -690,20 +690,17 @@ pub fn init(
                                 );
                             }
                             // Archive sidebar rows that point at a merged session
-                            // so the collapsed thread is not shown twice.
+                            // so the collapsed thread is not shown twice. The
+                            // archive is awaited before the reload so a racing
+                            // reload cannot resurrect the merged-away rows.
                             if !summary.merged_session_ids.is_empty() {
+                                let merged: Vec<acp::SessionId> = summary
+                                    .merged_session_ids
+                                    .iter()
+                                    .map(|session_id| acp::SessionId::new(session_id.clone()))
+                                    .collect();
                                 metadata_store.update(cx, |store, cx| {
-                                    for session_id in &summary.merged_session_ids {
-                                        let session_id =
-                                            acp::SessionId::new(session_id.clone());
-                                        let thread_id = store
-                                            .entry_by_session(&session_id)
-                                            .map(|entry| entry.thread_id);
-                                        if let Some(thread_id) = thread_id {
-                                            store.archive(thread_id, None, cx);
-                                        }
-                                    }
-                                    let _ = store.reload(cx);
+                                    let _ = store.archive_merged_sessions_and_reload(&merged, cx);
                                 });
                             }
                         }
