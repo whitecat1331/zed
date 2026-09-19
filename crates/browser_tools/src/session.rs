@@ -1,5 +1,5 @@
 use crate::cdp::CdpClient;
-use crate::network::NetworkStore;
+use crate::network::{NetworkControlState, NetworkStore};
 use std::collections::HashMap;
 
 /// A running browser session: a browser-level connection plus its targets.
@@ -16,6 +16,8 @@ pub struct BrowserSession {
     pub child: smol::process::Child,
     /// Typed request store fed from captured `Network.*` events.
     pub network_store: NetworkStore,
+    /// Mutable network control state (throttle, offline, blocking, interception).
+    pub control: NetworkControlState,
 }
 
 /// A single flattened target (page, worker, service worker, ...).

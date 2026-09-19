@@ -1,5 +1,5 @@
 use crate::cdp::CdpClient;
-use crate::network::NetworkStore;
+use crate::network::{InterceptionConfig, InterceptionPattern, NetworkControlState, NetworkStore, ThrottleConditions};
 use crate::session::{BrowserSession, BrowserTarget};
 use anyhow::{Context, Result, anyhow};
 use futures::{AsyncBufReadExt, StreamExt};
@@ -105,6 +105,7 @@ impl AgentBrowserApi {
                 active_target_id: Some(active_target_id),
                 child,
                 network_store: NetworkStore::new(),
+                control: NetworkControlState::default(),
             },
         );
         Ok(id)
@@ -357,6 +358,367 @@ impl AgentBrowserApi {
         Ok(json!({
             "network": filter_events(&events, is_network_event, Some(&target_session_id), 100),
         }))
+    }
+
+    pub async fn set_throttle(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        conditions: ThrottleConditions,
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let result = session
+            .client
+            .send_command_with_session(
+                Some(&target_session_id),
+                "Network.emulateNetworkConditions",
+                conditions.to_cdp_params(),
+            )
+            .await?;
+        session.control.offline = conditions.offline;
+        session.control.throttle = Some(conditions);
+        Ok(result)
+    }
+
+    pub async fn set_offline(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        offline: bool,
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let mut conditions = session.control.throttle.clone().unwrap_or_default();
+        conditions.offline = offline;
+        let result = session
+            .client
+            .send_command_with_session(
+                Some(&target_session_id),
+                "Network.emulateNetworkConditions",
+                conditions.to_cdp_params(),
+            )
+            .await?;
+        session.control.offline = offline;
+        session.control.throttle = Some(conditions);
+        Ok(result)
+    }
+
+    pub async fn set_cache_disabled(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        disabled: bool,
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let result = session
+            .client
+            .send_command_with_session(
+                Some(&target_session_id),
+                "Network.setCacheDisabled",
+                json!({ "cacheDisabled": disabled }),
+            )
+            .await?;
+        session.control.cache_disabled = disabled;
+        Ok(result)
+    }
+
+    pub async fn set_bypass_service_worker(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        bypass: bool,
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let result = session
+            .client
+            .send_command_with_session(
+                Some(&target_session_id),
+                "Network.setBypassServiceWorker",
+                json!({ "bypass": bypass }),
+            )
+            .await?;
+        session.control.bypass_service_worker = bypass;
+        Ok(result)
+    }
+
+    pub async fn set_blocked_urls(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        urls: &[String],
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let result = session
+            .client
+            .send_command_with_session(
+                Some(&target_session_id),
+                "Network.setBlockedURLs",
+                json!({ "urls": urls }),
+            )
+            .await?;
+        session.control.blocked_urls = urls.to_vec();
+        Ok(result)
+    }
+
+    pub async fn clear_browser_cache(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        session
+            .client
+            .send_command_with_session(
+                Some(&target_session_id),
+                "Network.clearBrowserCache",
+                json!({}),
+            )
+            .await
+    }
+
+    pub async fn clear_browser_cookies(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        session
+            .client
+            .send_command_with_session(
+                Some(&target_session_id),
+                "Network.clearBrowserCookies",
+                json!({}),
+            )
+            .await
+    }
+
+    pub async fn set_cookie(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        params: Value,
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        session
+            .client
+            .send_command_with_session(Some(&target_session_id), "Network.setCookie", params)
+            .await
+    }
+
+    pub async fn delete_cookies(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        params: Value,
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        session
+            .client
+            .send_command_with_session(Some(&target_session_id), "Network.deleteCookies", params)
+            .await
+    }
+
+    pub async fn set_extra_http_headers(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        headers: &HashMap<String, String>,
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let result = session
+            .client
+            .send_command_with_session(
+                Some(&target_session_id),
+                "Network.setExtraHTTPHeaders",
+                json!({ "headers": headers }),
+            )
+            .await?;
+        session.control.extra_http_headers = headers.clone();
+        Ok(result)
+    }
+
+    pub async fn set_user_agent(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        user_agent: &str,
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let result = session
+            .client
+            .send_command_with_session(
+                Some(&target_session_id),
+                "Network.setUserAgentOverride",
+                json!({ "userAgent": user_agent }),
+            )
+            .await?;
+        session.control.user_agent = Some(user_agent.to_string());
+        Ok(result)
+    }
+
+    pub async fn set_interception(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        patterns: &[InterceptionPattern],
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let config = InterceptionConfig {
+            patterns: patterns.to_vec(),
+        };
+        let result = session
+            .client
+            .send_command_with_session(
+                Some(&target_session_id),
+                "Fetch.enable",
+                json!({
+                    "patterns": config
+                        .patterns
+                        .iter()
+                        .map(InterceptionPattern::to_cdp_params)
+                        .collect::<Vec<_>>(),
+                }),
+            )
+            .await?;
+        session.control.interception = Some(config);
+        Ok(result)
+    }
+
+    pub async fn continue_request(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        request_id: &str,
+        modifications: Value,
+    ) -> Result<Value> {
+        self.fetch_disposition(session_id, target_id, "Fetch.continueRequest", request_id, modifications)
+            .await
+    }
+
+    pub async fn fulfill_request(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        request_id: &str,
+        response: Value,
+    ) -> Result<Value> {
+        self.fetch_disposition(session_id, target_id, "Fetch.fulfillRequest", request_id, response)
+            .await
+    }
+
+    pub async fn fail_request(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        request_id: &str,
+        error_reason: &str,
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        session
+            .client
+            .send_command_with_session(
+                Some(&target_session_id),
+                "Fetch.failRequest",
+                json!({ "requestId": request_id, "errorReason": error_reason }),
+            )
+            .await
+    }
+
+    pub async fn list_paused_requests(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let events = session.client.recent_events();
+        let paused = filter_events(&events, is_fetch_request_paused, Some(&target_session_id), 100);
+        Ok(json!({ "paused_requests": paused }))
+    }
+
+    pub async fn network_control_state(&self, session_id: u64) -> Result<Value> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(&session_id).context("unknown browser session")?;
+        Ok(control_state_to_json(&session.control))
+    }
+
+    async fn fetch_disposition(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        method: &str,
+        request_id: &str,
+        fields: Value,
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let mut params = json!({ "requestId": request_id });
+        if let Some(object) = fields.as_object() {
+            for (key, value) in object {
+                params[key] = value.clone();
+            }
+        }
+        session
+            .client
+            .send_command_with_session(Some(&target_session_id), method, params)
+            .await
     }
 
     pub async fn stop_session(&self, session_id: u64, keep_open: bool) -> Result<()> {
@@ -660,4 +1022,40 @@ fn session_id_matches(event: &Value, session_id: Option<&str>) -> bool {
         Some(session_id) => event.get("sessionId").and_then(Value::as_str) == Some(session_id),
         None => true,
     }
+}
+
+fn is_fetch_request_paused(event: &Value) -> bool {
+    event
+        .get("method")
+        .and_then(Value::as_str)
+        .map(|method| method == "Fetch.requestPaused")
+        .unwrap_or(false)
+}
+
+fn control_state_to_json(control: &NetworkControlState) -> Value {
+    json!({
+        "offline": control.offline,
+        "throttle": control.throttle.as_ref().map(|conditions| json!({
+            "offline": conditions.offline,
+            "latency_ms": conditions.latency_ms,
+            "download_throughput_bps": conditions.download_throughput_bps,
+            "upload_throughput_bps": conditions.upload_throughput_bps,
+            "connection_type": conditions.connection_type,
+        })),
+        "cache_disabled": control.cache_disabled,
+        "bypass_service_worker": control.bypass_service_worker,
+        "blocked_urls": control.blocked_urls,
+        "extra_http_headers": control.extra_http_headers,
+        "user_agent": control.user_agent,
+        "interception": control.interception.as_ref().map(|config| json!({
+            "patterns": config
+                .patterns
+                .iter()
+                .map(|pattern| json!({
+                    "url_pattern": pattern.url_pattern,
+                    "request_stage": pattern.request_stage,
+                }))
+                .collect::<Vec<_>>(),
+        })),
+    })
 }

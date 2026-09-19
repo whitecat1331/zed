@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 /// A single HTTP/HTTPS request/response reconstructed from CDP `Network.*`
@@ -268,6 +268,152 @@ fn timing_from_value(value: &Value) -> NetworkTiming {
         send_start: f64_field(value, "sendStart"),
         send_end: f64_field(value, "sendEnd"),
         receive_headers_end: f64_field(value, "receiveHeadersEnd"),
+    }
+}
+
+/// Network throttling conditions, mirroring CDP `Network.emulateNetworkConditions`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThrottleConditions {
+    pub offline: bool,
+    pub latency_ms: u32,
+    pub download_throughput_bps: i64,
+    pub upload_throughput_bps: i64,
+    pub connection_type: Option<String>,
+}
+
+impl Default for ThrottleConditions {
+    fn default() -> Self {
+        Self {
+            offline: false,
+            latency_ms: 0,
+            download_throughput_bps: -1,
+            upload_throughput_bps: -1,
+            connection_type: None,
+        }
+    }
+}
+
+impl ThrottleConditions {
+    /// Serialize to CDP `Network.emulateNetworkConditions` params.
+    pub fn to_cdp_params(&self) -> Value {
+        let mut params = json!({
+            "offline": self.offline,
+            "latency": self.latency_ms,
+            "downloadThroughput": self.download_throughput_bps,
+            "uploadThroughput": self.upload_throughput_bps,
+        });
+        if let Some(connection_type) = &self.connection_type {
+            params["connectionType"] = json!(connection_type);
+        }
+        params
+    }
+}
+
+/// Named network-throttle presets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThrottlePreset {
+    Online,
+    Offline,
+    Slow3G,
+    Fast3G,
+}
+
+impl ThrottlePreset {
+    pub fn conditions(self) -> ThrottleConditions {
+        match self {
+            ThrottlePreset::Online => ThrottleConditions::default(),
+            ThrottlePreset::Offline => ThrottleConditions {
+                offline: true,
+                ..ThrottleConditions::default()
+            },
+            ThrottlePreset::Slow3G => ThrottleConditions {
+                latency_ms: 2_000,
+                download_throughput_bps: 50_000,
+                upload_throughput_bps: 50_000,
+                connection_type: Some("cellular3g".to_string()),
+                ..ThrottleConditions::default()
+            },
+            ThrottlePreset::Fast3G => ThrottleConditions {
+                latency_ms: 563,
+                download_throughput_bps: 1_474_560,
+                upload_throughput_bps: 563_200,
+                connection_type: Some("cellular3g".to_string()),
+                ..ThrottleConditions::default()
+            },
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().replace('_', "-").as_str() {
+            "online" | "none" => Some(ThrottlePreset::Online),
+            "offline" => Some(ThrottlePreset::Offline),
+            "slow-3g" => Some(ThrottlePreset::Slow3G),
+            "fast-3g" => Some(ThrottlePreset::Fast3G),
+            _ => None,
+        }
+    }
+}
+
+/// A single CDP `Fetch` request pattern (URL pattern + request stage).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterceptionPattern {
+    pub url_pattern: String,
+    pub request_stage: Option<String>,
+}
+
+impl InterceptionPattern {
+    /// Serialize to a CDP `Fetch.enable` `RequestPattern` entry.
+    pub fn to_cdp_params(&self) -> Value {
+        let mut params = json!({ "urlPattern": self.url_pattern });
+        if let Some(request_stage) = &self.request_stage {
+            params["requestStage"] = json!(request_stage);
+        }
+        params
+    }
+}
+
+/// The active interception scope for a session.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct InterceptionConfig {
+    pub patterns: Vec<InterceptionPattern>,
+}
+
+/// Mutable network control state, tracked per session so the GUI and AIUI can
+/// surface what is currently being perturbed.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkControlState {
+    pub offline: bool,
+    pub throttle: Option<ThrottleConditions>,
+    pub cache_disabled: bool,
+    pub bypass_service_worker: bool,
+    pub blocked_urls: Vec<String>,
+    pub extra_http_headers: HashMap<String, String>,
+    pub user_agent: Option<String>,
+    pub interception: Option<InterceptionConfig>,
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+
+    #[test]
+    fn throttle_preset_parsing_and_conditions() {
+        assert_eq!(ThrottlePreset::parse("slow-3g"), Some(ThrottlePreset::Slow3G));
+        assert_eq!(ThrottlePreset::parse("SLOW_3G"), Some(ThrottlePreset::Slow3G));
+        assert_eq!(ThrottlePreset::parse("offline"), Some(ThrottlePreset::Offline));
+        assert_eq!(ThrottlePreset::parse("bogus"), None);
+        assert!(ThrottlePreset::Offline.conditions().offline);
+        assert_eq!(ThrottlePreset::Slow3G.conditions().latency_ms, 2_000);
+    }
+
+    #[test]
+    fn throttle_conditions_serialize_to_cdp_params() {
+        let params = ThrottlePreset::Fast3G.conditions().to_cdp_params();
+        assert_eq!(params["latency"].as_u64(), Some(563));
+        assert_eq!(params["offline"].as_bool(), Some(false));
+        assert_eq!(params["connectionType"].as_str(), Some("cellular3g"));
+        let online = ThrottleConditions::default().to_cdp_params();
+        assert!(online.get("connectionType").is_none());
     }
 }
 
