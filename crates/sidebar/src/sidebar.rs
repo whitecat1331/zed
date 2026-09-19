@@ -1697,6 +1697,29 @@ impl Sidebar {
                     }
                 }
 
+                // Threads whose stored paths no longer match the group's current
+                // paths (after add/remove-folder) still belong to the same managed
+                // workspace. Pull them in by stable identity so membership changes
+                // keep threads under the same header.
+                for ws in group_workspaces {
+                    let Some(workspace_id) = ws.read(cx).managed_workspace_id() else {
+                        continue;
+                    };
+                    for row in thread_store
+                        .read(cx)
+                        .entries_for_workspace(workspace_id)
+                        .cloned()
+                    {
+                        if !seen_thread_ids.insert(row.thread_id) {
+                            continue;
+                        }
+                        threads.push(make_thread_entry(
+                            row,
+                            ThreadEntryWorkspace::Open(ws.clone()),
+                        ));
+                    }
+                }
+
                 for thread in &mut threads {
                     if thread.draft.is_none() {
                         continue;
