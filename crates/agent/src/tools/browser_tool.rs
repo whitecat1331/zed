@@ -145,7 +145,7 @@ impl BrowserTool {
     pub fn new(thread: WeakEntity<Thread>, http_client: Arc<dyn HttpClient>, cx: &App) -> Self {
         let chromium_path = AgentSettings::get_global(cx).browser_chromium_path.clone();
         Self {
-            api: AgentBrowserApi::new(chromium_path, http_client),
+            api: AgentBrowserApi::new(chromium_path, http_client, cx.background_executor().clone()),
             thread,
         }
     }

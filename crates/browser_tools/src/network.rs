@@ -1,0 +1,357 @@
+use serde_json::Value;
+use std::collections::HashMap;
+
+/// A single HTTP/HTTPS request/response reconstructed from CDP `Network.*`
+/// events, keyed by CDP `requestId`.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkRequest {
+    pub request_id: String,
+    pub url: String,
+    pub method: String,
+    pub status: Option<u32>,
+    pub status_text: Option<String>,
+    pub mime_type: Option<String>,
+    pub resource_type: Option<String>,
+    pub initiator: Option<String>,
+    pub initiator_stack: Option<Value>,
+    pub request_headers: HashMap<String, String>,
+    pub response_headers: HashMap<String, String>,
+    pub post_data: Option<String>,
+    pub timing: Option<NetworkTiming>,
+    pub failure_reason: Option<String>,
+    pub blocked_reason: Option<String>,
+    pub cors_error_status: Option<String>,
+    pub encoded_data_length: Option<f64>,
+    pub from_cache: bool,
+}
+
+/// Timing phases reported by CDP for a single request.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkTiming {
+    pub request_time: Option<f64>,
+    pub proxy_start: Option<f64>,
+    pub proxy_end: Option<f64>,
+    pub dns_start: Option<f64>,
+    pub dns_end: Option<f64>,
+    pub connect_start: Option<f64>,
+    pub connect_end: Option<f64>,
+    pub ssl_start: Option<f64>,
+    pub ssl_end: Option<f64>,
+    pub send_start: Option<f64>,
+    pub send_end: Option<f64>,
+    pub receive_headers_end: Option<f64>,
+}
+
+/// A typed store of requests keyed by CDP `requestId`, fed from `Network.*`
+/// events and importable/exportable as HAR.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkStore {
+    requests: HashMap<String, NetworkRequest>,
+    order: Vec<String>,
+}
+
+impl NetworkStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Update the store from a single CDP event (a `Network.*` event).
+    pub fn ingest(&mut self, event: &Value) {
+        let Some(method) = event.get("method").and_then(Value::as_str) else {
+            return;
+        };
+        let params = event.get("params").cloned().unwrap_or(Value::Null);
+        match method {
+            "Network.requestWillBeSent" => self.ingest_request_will_be_sent(&params),
+            "Network.responseReceived" => self.ingest_response_received(&params),
+            "Network.loadingFinished" => self.ingest_loading_finished(&params),
+            "Network.loadingFailed" => self.ingest_loading_failed(&params),
+            "Network.requestWillBeSentExtraInfo" => self.ingest_request_extra_info(&params),
+            "Network.responseReceivedExtraInfo" => self.ingest_response_extra_info(&params),
+            "Network.requestServedFromCache" => self.ingest_served_from_cache(&params),
+            _ => {}
+        }
+    }
+
+    pub fn request(&self, request_id: &str) -> Option<&NetworkRequest> {
+        self.requests.get(request_id)
+    }
+
+    /// Requests in arrival order.
+    pub fn requests(&self) -> impl Iterator<Item = &NetworkRequest> {
+        self.order.iter().filter_map(|id| self.requests.get(id))
+    }
+
+    pub fn len(&self) -> usize {
+        self.requests.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+
+    fn entry(&mut self, request_id: &str) -> &mut NetworkRequest {
+        let request_id = request_id.to_string();
+        if !self.requests.contains_key(&request_id) {
+            self.order.push(request_id.clone());
+        }
+        let request = self.requests.entry(request_id.clone()).or_default();
+        request.request_id = request_id;
+        request
+    }
+
+    pub(crate) fn insert(&mut self, request: NetworkRequest) {
+        let request_id = request.request_id.clone();
+        if !self.requests.contains_key(&request_id) {
+            self.order.push(request_id.clone());
+        }
+        self.requests.insert(request_id, request);
+    }
+
+    fn ingest_request_will_be_sent(&mut self, params: &Value) {
+        let Some(request_id) = string_field(params, "requestId") else {
+            return;
+        };
+        let request = self.entry(&request_id);
+        let request_data = params.get("request");
+        if let Some(url) = request_data.and_then(|data| string_field(data, "url")) {
+            request.url = url;
+        }
+        if let Some(method) = request_data.and_then(|data| string_field(data, "method")) {
+            request.method = method;
+        }
+        if let Some(headers) = request_data.and_then(|data| data.get("headers")) {
+            request.request_headers = headers_object(headers);
+        }
+        if let Some(post_data) = request_data
+            .and_then(|data| data.get("postData"))
+            .and_then(Value::as_str)
+        {
+            request.post_data = Some(post_data.to_string());
+        }
+        if let Some(resource_type) = string_field(params, "type") {
+            request.resource_type = Some(resource_type);
+        }
+        let initiator = params.get("initiator");
+        if let Some(initiator_type) = initiator.and_then(|data| string_field(data, "type")) {
+            request.initiator = Some(initiator_type);
+        }
+        request.initiator_stack = initiator.and_then(|data| data.get("stack")).cloned();
+    }
+
+    fn ingest_response_received(&mut self, params: &Value) {
+        let Some(request_id) = string_field(params, "requestId") else {
+            return;
+        };
+        let request = self.entry(&request_id);
+        let response = params.get("response");
+        if let Some(status) = response.and_then(|data| u32_field(data, "status")) {
+            request.status = Some(status);
+        }
+        if let Some(status_text) = response.and_then(|data| string_field(data, "statusText")) {
+            request.status_text = Some(status_text);
+        }
+        if let Some(mime_type) = response.and_then(|data| string_field(data, "mimeType")) {
+            request.mime_type = Some(mime_type);
+        }
+        if let Some(headers) = response.and_then(|data| data.get("headers")) {
+            request.response_headers = headers_object(headers);
+        }
+        if let Some(timing) = response.and_then(|data| data.get("timing")) {
+            request.timing = Some(timing_from_value(timing));
+        }
+        if request.url.is_empty() {
+            if let Some(url) = response.and_then(|data| string_field(data, "url")) {
+                request.url = url;
+            }
+        }
+    }
+
+    fn ingest_loading_finished(&mut self, params: &Value) {
+        let Some(request_id) = string_field(params, "requestId") else {
+            return;
+        };
+        let request = self.entry(&request_id);
+        request.encoded_data_length = f64_field(params, "encodedDataLength");
+    }
+
+    fn ingest_loading_failed(&mut self, params: &Value) {
+        let Some(request_id) = string_field(params, "requestId") else {
+            return;
+        };
+        let request = self.entry(&request_id);
+        if let Some(error_text) = string_field(params, "errorText") {
+            request.failure_reason = Some(error_text);
+        }
+        if let Some(blocked_reason) = string_field(params, "blockedReason") {
+            request.blocked_reason = Some(blocked_reason);
+        }
+        if let Some(cors_error_status) = params
+            .get("corsErrorStatus")
+            .and_then(|status| status.get("corsError"))
+            .and_then(Value::as_str)
+        {
+            request.cors_error_status = Some(cors_error_status.to_string());
+        }
+    }
+
+    fn ingest_request_extra_info(&mut self, params: &Value) {
+        let Some(request_id) = string_field(params, "requestId") else {
+            return;
+        };
+        let request = self.entry(&request_id);
+        if let Some(headers) = params.get("headers") {
+            request.request_headers = headers_object(headers);
+        }
+    }
+
+    fn ingest_response_extra_info(&mut self, params: &Value) {
+        let Some(request_id) = string_field(params, "requestId") else {
+            return;
+        };
+        let request = self.entry(&request_id);
+        if let Some(headers) = params.get("headers") {
+            request.response_headers = headers_object(headers);
+        }
+        if let Some(status) = u32_field(params, "statusCode") {
+            request.status = Some(status);
+        }
+    }
+
+    fn ingest_served_from_cache(&mut self, params: &Value) {
+        let Some(request_id) = string_field(params, "requestId") else {
+            return;
+        };
+        let request = self.entry(&request_id);
+        request.from_cache = true;
+    }
+}
+
+fn string_field(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+fn u32_field(value: &Value, key: &str) -> Option<u32> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .map(|value| value as u32)
+}
+
+fn f64_field(value: &Value, key: &str) -> Option<f64> {
+    value.get(key).and_then(Value::as_f64)
+}
+
+fn headers_object(value: &Value) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    if let Some(object) = value.as_object() {
+        for (name, value) in object {
+            if let Some(value) = value.as_str() {
+                headers.insert(name.clone(), value.to_string());
+            }
+        }
+    }
+    headers
+}
+
+fn timing_from_value(value: &Value) -> NetworkTiming {
+    NetworkTiming {
+        request_time: f64_field(value, "requestTime"),
+        proxy_start: f64_field(value, "proxyStart"),
+        proxy_end: f64_field(value, "proxyEnd"),
+        dns_start: f64_field(value, "dnsStart"),
+        dns_end: f64_field(value, "dnsEnd"),
+        connect_start: f64_field(value, "connectStart"),
+        connect_end: f64_field(value, "connectEnd"),
+        ssl_start: f64_field(value, "sslStart"),
+        ssl_end: f64_field(value, "sslEnd"),
+        send_start: f64_field(value, "sendStart"),
+        send_end: f64_field(value, "sendEnd"),
+        receive_headers_end: f64_field(value, "receiveHeadersEnd"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn ingests_request_lifecycle_into_typed_store() {
+        let mut store = NetworkStore::new();
+
+        store.ingest(&json!({
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "1",
+                "documentURL": "https://example.com/page",
+                "type": "XHR",
+                "request": {
+                    "url": "https://example.com/api/items",
+                    "method": "POST",
+                    "headers": { "Content-Type": "application/json" },
+                    "postData": "{\"q\":\"x\"}"
+                },
+                "initiator": { "type": "script" }
+            }
+        }));
+        store.ingest(&json!({
+            "method": "Network.responseReceived",
+            "params": {
+                "requestId": "1",
+                "response": {
+                    "url": "https://example.com/api/items",
+                    "status": 404,
+                    "statusText": "Not Found",
+                    "mimeType": "application/json",
+                    "headers": { "Content-Type": "application/json" },
+                    "timing": { "requestTime": 1.5, "dnsStart": 0.1 }
+                }
+            }
+        }));
+        store.ingest(&json!({
+            "method": "Network.loadingFailed",
+            "params": {
+                "requestId": "1",
+                "errorText": "net::ERR_ABORTED",
+                "blockedReason": "cors"
+            }
+        }));
+
+        assert_eq!(store.len(), 1);
+        let request = store.request("1").expect("request should be tracked");
+        assert_eq!(request.url, "https://example.com/api/items");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.status, Some(404));
+        assert_eq!(request.mime_type.as_deref(), Some("application/json"));
+        assert_eq!(request.resource_type.as_deref(), Some("XHR"));
+        assert_eq!(request.post_data.as_deref(), Some("{\"q\":\"x\"}"));
+        assert_eq!(request.failure_reason.as_deref(), Some("net::ERR_ABORTED"));
+        assert_eq!(request.blocked_reason.as_deref(), Some("cors"));
+        assert_eq!(
+            request
+                .request_headers
+                .get("Content-Type")
+                .map(String::as_str),
+            Some("application/json")
+        );
+        let timing = request.timing.as_ref().expect("timing should be captured");
+        assert_eq!(timing.request_time, Some(1.5));
+    }
+
+    #[test]
+    fn preserves_arrival_order() {
+        let mut store = NetworkStore::new();
+        for id in ["a", "b", "c"] {
+            store.ingest(&json!({
+                "method": "Network.requestWillBeSent",
+                "params": { "requestId": id, "request": { "url": id, "method": "GET" } }
+            }));
+        }
+        let ids: Vec<&str> = store
+            .requests()
+            .map(|request| request.request_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+}

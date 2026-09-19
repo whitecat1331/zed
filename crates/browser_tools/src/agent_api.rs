@@ -1,7 +1,9 @@
 use crate::cdp::CdpClient;
+use crate::network::NetworkStore;
 use crate::session::{BrowserSession, BrowserTarget};
 use anyhow::{Context, Result, anyhow};
 use futures::{AsyncBufReadExt, StreamExt};
+use gpui::BackgroundExecutor;
 use http_client::HttpClient;
 use serde_json::{Value, json};
 use smol::process::Command;
@@ -21,15 +23,21 @@ pub struct AgentBrowserApi {
     next_session_id: Arc<AtomicU64>,
     chromium_path: Option<PathBuf>,
     http_client: Arc<dyn HttpClient>,
+    background_executor: BackgroundExecutor,
 }
 
 impl AgentBrowserApi {
-    pub fn new(chromium_path: Option<PathBuf>, http_client: Arc<dyn HttpClient>) -> Self {
+    pub fn new(
+        chromium_path: Option<PathBuf>,
+        http_client: Arc<dyn HttpClient>,
+        background_executor: BackgroundExecutor,
+    ) -> Self {
         Self {
             sessions: Arc::new(smol::lock::Mutex::new(HashMap::new())),
             next_session_id: Arc::new(AtomicU64::new(0)),
             chromium_path,
             http_client,
+            background_executor,
         }
     }
 
@@ -60,7 +68,8 @@ impl AgentBrowserApi {
             .arg("--remote-debugging-port=0")
             .arg(format!("--user-data-dir={}", profile_dir.display()))
             .arg("--no-first-run")
-            .arg("--no-default-browser-check");
+            .arg("--no-default-browser-check")
+            .arg("--disable-extensions");
         if headless {
             command.arg("--headless=new");
         }
@@ -78,8 +87,8 @@ impl AgentBrowserApi {
         })
         .await?;
 
-        let mut client = CdpClient::connect(&endpoint).await?;
-        let target = create_target(&mut client, url).await?;
+        let client = CdpClient::connect(&endpoint, self.background_executor.clone()).await?;
+        let target = create_target(&client, url).await?;
 
         let id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
         let mut targets = HashMap::new();
@@ -93,6 +102,7 @@ impl AgentBrowserApi {
                 targets,
                 active_target_id: Some(active_target_id),
                 child,
+                network_store: NetworkStore::new(),
             },
         );
         Ok(id)
@@ -103,7 +113,7 @@ impl AgentBrowserApi {
         let session = sessions
             .get_mut(&session_id)
             .context("unknown browser session")?;
-        let target = create_target(&mut session.client, url).await?;
+        let target = create_target(&session.client, url).await?;
         let target_json = target_to_json(&target);
         let target_id = target.target_id.clone();
         session.active_target_id = Some(target_id.clone());
@@ -175,7 +185,7 @@ impl AgentBrowserApi {
             .context("unknown browser session")?;
         let target_session_id = resolve_target_session_id(session, target_id)?;
         let page = evaluate_value(
-            &mut session.client,
+            &session.client,
             Some(&target_session_id),
             SNAPSHOT_EXPRESSION,
         )
@@ -271,8 +281,7 @@ impl AgentBrowserApi {
             "(() => {{ const el = document.querySelector({selector}); if (!el) return {{ clicked: false, reason: 'no element matches selector' }}; el.click(); return {{ clicked: true, tag: el.tagName.toLowerCase(), text: (el.innerText || el.value || '').toString().slice(0, 500) }}; }})()",
             selector = serde_json::to_string(selector)?,
         );
-        let value =
-            evaluate_value(&mut session.client, Some(&target_session_id), &expression).await?;
+        let value = evaluate_value(&session.client, Some(&target_session_id), &expression).await?;
         Ok(json!({ "clicked": value }))
     }
 
@@ -293,7 +302,7 @@ impl AgentBrowserApi {
             "(() => {{ const el = document.querySelector({selector}); if (!el) return {{ focused: false, reason: 'no element matches selector' }}; el.focus(); return {{ focused: true, tag: el.tagName.toLowerCase() }}; }})()",
             selector = serde_json::to_string(selector)?,
         );
-        let focused = evaluate_value(&mut session.client, Some(&target_session_id), &focus).await?;
+        let focused = evaluate_value(&session.client, Some(&target_session_id), &focus).await?;
         if focused.get("focused").and_then(Value::as_bool) != Some(true) {
             return Ok(json!({
                 "typed": false,
@@ -323,7 +332,7 @@ impl AgentBrowserApi {
         let target_session_id = resolve_target_session_id(session, target_id)?;
         let events = session.client.recent_events();
         Ok(json!({
-            "console": filter_events(events, is_console_event, Some(&target_session_id), 100),
+            "console": filter_events(&events, is_console_event, Some(&target_session_id), 100),
         }))
     }
 
@@ -334,8 +343,17 @@ impl AgentBrowserApi {
             .context("unknown browser session")?;
         let target_session_id = resolve_target_session_id(session, target_id)?;
         let events = session.client.recent_events();
+
+        // Feed the typed store from every matching event so it reflects the
+        // full capture, not just the bounded slice returned to the caller.
+        for event in events.iter().filter(|event| {
+            is_network_event(event) && session_id_matches(event, Some(&target_session_id))
+        }) {
+            session.network_store.ingest(event);
+        }
+
         Ok(json!({
-            "network": filter_events(events, is_network_event, Some(&target_session_id), 100),
+            "network": filter_events(&events, is_network_event, Some(&target_session_id), 100),
         }))
     }
 
@@ -347,7 +365,7 @@ impl AgentBrowserApi {
             .remove(&session_id)
             .context("unknown browser session")?;
 
-        let mut client = session.client;
+        let client = session.client;
         let mut child = session.child;
 
         if keep_open {
@@ -419,7 +437,7 @@ fn update_target_url(session: &mut BrowserSession, target_id: Option<&str>, url:
     }
 }
 
-async fn create_target(client: &mut CdpClient, url: &str) -> Result<BrowserTarget> {
+async fn create_target(client: &CdpClient, url: &str) -> Result<BrowserTarget> {
     let create_result = client
         .send_command("Target.createTarget", json!({ "url": "about:blank" }))
         .await?;
@@ -453,7 +471,18 @@ async fn create_target(client: &mut CdpClient, url: &str) -> Result<BrowserTarge
         .send_command_with_session(Some(&session_id), "Runtime.enable", json!({}))
         .await?;
     client
-        .send_command_with_session(Some(&session_id), "Network.enable", json!({}))
+        .send_command_with_session(Some(&session_id), "Log.enable", json!({}))
+        .await?;
+    client
+        .send_command_with_session(
+            Some(&session_id),
+            "Network.enable",
+            json!({
+                "maxTotalBufferSize": 50_000_000,
+                "maxResourceBufferSize": 10_000_000,
+                "maxPostDataSize": 1_000_000,
+            }),
+        )
         .await?;
     client
         .send_command_with_session(Some(&session_id), "Page.navigate", json!({ "url": url }))
@@ -528,7 +557,7 @@ const SNAPSHOT_EXPRESSION: &str = r#"(function() {
 })()"#;
 
 async fn evaluate_value(
-    client: &mut CdpClient,
+    client: &CdpClient,
     session_id: Option<&str>,
     expression: &str,
 ) -> Result<Value> {
@@ -550,11 +579,7 @@ async fn evaluate_value(
         .unwrap_or(Value::Null))
 }
 
-async fn wait_for_page_load(
-    client: &mut CdpClient,
-    session_id: Option<&str>,
-    url: &str,
-) -> Result<()> {
+async fn wait_for_page_load(client: &CdpClient, session_id: Option<&str>, url: &str) -> Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         let state = evaluate_value(
