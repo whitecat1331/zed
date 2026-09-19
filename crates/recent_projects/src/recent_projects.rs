@@ -313,7 +313,7 @@ pub fn init(cx: &mut App) {
                 PathPromptOptions {
                     files: false,
                     directories: true,
-                    multiple: false,
+                    multiple: true,
                     prompt: None,
                 },
                 DirectoryLister::Local(
@@ -1020,8 +1020,13 @@ impl EventEmitter<DismissEvent> for ManagedWorkspacesModal {}
 impl ModalView for ManagedWorkspacesModal {}
 
 impl Render for ManagedWorkspacesModal {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().child(self.picker.clone())
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("ManagedWorkspacesModal")
+            .elevation_3(cx)
+            .w(rems(36.))
+            .overflow_hidden()
+            .child(self.picker.clone())
     }
 }
 

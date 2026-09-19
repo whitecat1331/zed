@@ -894,7 +894,8 @@ impl TitleBar {
                 Icon::new(IconName::ChevronUpDown)
                     .size(IconSize::Small)
                     .color(Color::Muted),
-            );
+            )
+            .child(Label::new("Workspaces").size(LabelSize::Small).color(Color::Muted));
 
         Some(
             PopoverMenu::new("workspace-switcher-menu")

@@ -678,6 +678,26 @@ impl ThreadMetadataStore {
         self.threads_by_workspace.keys()
     }
 
+    /// Returns non-archived threads whose `folder_paths` intersect any of
+    /// `paths`. This surfaces threads that were saved against a superset of a
+    /// workspace's current paths (e.g. a thread created against the 15-root
+    /// set while viewing a single-folder workspace).
+    pub fn entries_intersecting_paths<'a>(
+        &'a self,
+        paths: &'a [PathBuf],
+    ) -> impl Iterator<Item = &'a ThreadMetadata> + 'a {
+        self.threads
+            .values()
+            .filter(move |metadata| {
+                metadata
+                    .folder_paths()
+                    .paths()
+                    .iter()
+                    .any(|folder_path| paths.iter().any(|path| path == folder_path))
+            })
+            .filter(|metadata| !metadata.archived)
+    }
+
     pub fn reload(&mut self, cx: &mut Context<Self>) -> Shared<Task<()>> {
         let db = self.db.clone();
         self.reload_task.take();

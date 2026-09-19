@@ -1720,6 +1720,27 @@ impl Sidebar {
                     }
                 }
 
+                // Threads saved against a superset of this group's paths (e.g. a
+                // thread created against the 15-root set while viewing a
+                // single-folder workspace) still involve this workspace. Surface
+                // them here so opening a single-folder workspace shows its threads.
+                let group_has_managed_workspace = group_workspaces
+                    .iter()
+                    .any(|ws| ws.read(cx).managed_workspace_id().is_some());
+                if group_has_managed_workspace {
+                    for row in thread_store
+                        .read(cx)
+                        .entries_intersecting_paths(group_key.path_list().paths())
+                        .cloned()
+                    {
+                        if !seen_thread_ids.insert(row.thread_id) {
+                            continue;
+                        }
+                        let workspace = resolve_workspace(row.folder_paths());
+                        threads.push(make_thread_entry(row, workspace));
+                    }
+                }
+
                 for thread in &mut threads {
                     if thread.draft.is_none() {
                         continue;
