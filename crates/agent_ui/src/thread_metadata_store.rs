@@ -142,6 +142,7 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
                         created_at: entry.created_at,
                         interacted_at: None,
                         worktree_paths: WorktreePaths::from_folder_paths(&entry.folder_paths),
+                        workspace_id: None,
                         remote_connection: None,
                         archived: true,
                     })
@@ -323,6 +324,10 @@ pub struct ThreadMetadata {
     /// Doesn't include the time when a queued message is fired.
     pub interacted_at: Option<DateTime<Utc>>,
     pub worktree_paths: WorktreePaths,
+    /// The stable managed-workspace id this thread belongs to, if one is known.
+    /// Persisted so add/remove-folder keeps the thread under the same header
+    /// even though its `folder_paths` change.
+    pub workspace_id: Option<ManagedWorkspaceId>,
     pub remote_connection: Option<RemoteConnectionOptions>,
     pub archived: bool,
 }
@@ -734,11 +739,13 @@ impl ThreadMetadataStore {
             .threads
             .iter()
             .filter_map(|(thread_id, metadata)| {
-                WorkspaceManager::global(cx)
-                    .workspace_id_for_paths(metadata.folder_paths())
-                    .log_err()
-                    .flatten()
-                    .map(|workspace_id| (workspace_id, *thread_id))
+                let workspace_id = metadata.workspace_id.or_else(|| {
+                    WorkspaceManager::global(cx)
+                        .workspace_id_for_paths(metadata.folder_paths())
+                        .log_err()
+                        .flatten()
+                });
+                workspace_id.map(|workspace_id| (workspace_id, *thread_id))
             })
             .collect();
         for (workspace_id, thread_id) in workspace_threads {
@@ -861,6 +868,13 @@ impl ThreadMetadataStore {
 
     fn save_internal(&mut self, metadata: ThreadMetadata) {
         if let Some(thread) = self.threads.get(&metadata.thread_id) {
+            if thread.workspace_id != metadata.workspace_id {
+                if let Some(workspace_id) = thread.workspace_id {
+                    if let Some(thread_ids) = self.threads_by_workspace.get_mut(&workspace_id) {
+                        thread_ids.remove(&metadata.thread_id);
+                    }
+                }
+            }
             if thread.folder_paths() != metadata.folder_paths() {
                 if let Some(thread_ids) = self.threads_by_paths.get_mut(thread.folder_paths()) {
                     thread_ids.remove(&metadata.thread_id);
@@ -902,6 +916,13 @@ impl ThreadMetadataStore {
         if !metadata.main_worktree_paths().is_empty() {
             self.threads_by_main_paths
                 .entry(metadata.main_worktree_paths().clone())
+                .or_default()
+                .insert(metadata.thread_id);
+        }
+
+        if let Some(workspace_id) = metadata.workspace_id {
+            self.threads_by_workspace
+                .entry(workspace_id)
                 .or_default()
                 .insert(metadata.thread_id);
         }
@@ -1452,6 +1473,16 @@ impl ThreadMetadataStore {
             .map(|t| t.archived)
             .unwrap_or(worktree_paths.is_empty());
 
+        // A thread's managed-workspace identity is stable once tagged: keep the
+        // persisted id even as its folder set changes, and only backfill (from
+        // the folder set) threads that predate tagging.
+        let workspace_id = existing_thread.and_then(|t| t.workspace_id).or_else(|| {
+            WorkspaceManager::global(cx)
+                .workspace_id_for_paths(worktree_paths.folder_path_list())
+                .log_err()
+                .flatten()
+        });
+
         let was_draft = existing_thread.map_or(true, |t| t.is_draft());
         if was_draft && !is_draft {
             // Draft has been promoted: drop its persisted prompt since the
@@ -1470,6 +1501,7 @@ impl ThreadMetadataStore {
             interacted_at,
             updated_at,
             worktree_paths,
+            workspace_id,
             remote_connection,
             archived,
         };
@@ -1606,6 +1638,9 @@ impl Domain for ThreadMetadataDb {
             ON sidebar_threads(session_id)
             WHERE session_id IS NOT NULL;
         ),
+        sql!(
+            ALTER TABLE sidebar_threads ADD COLUMN workspace_id TEXT;
+        ),
     ];
 }
 
@@ -1622,7 +1657,7 @@ impl ThreadMetadataDb {
 
     const LIST_QUERY: &str = "SELECT thread_id, session_id, agent_id, title, updated_at, \
         created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, \
-        main_worktree_paths_order, remote_connection, title_override \
+        main_worktree_paths_order, remote_connection, title_override, workspace_id \
         FROM sidebar_threads \
         ORDER BY updated_at DESC";
 
@@ -1673,6 +1708,7 @@ impl ThreadMetadataDb {
             .transpose()
             .context("serialize thread metadata remote connection")?;
         let title_override = row.title_override.as_ref().map(|t| t.to_string());
+        let workspace_id = row.workspace_id.map(|id| id.to_key_string());
         let thread_id = row.thread_id;
         let archived = row.archived;
 
@@ -1691,8 +1727,8 @@ impl ThreadMetadataDb {
                 delete.exec()?;
             }
 
-            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, workspace_id) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
                        ON CONFLICT(thread_id) DO UPDATE SET \
                            session_id = excluded.session_id, \
                            agent_id = excluded.agent_id, \
@@ -1706,7 +1742,8 @@ impl ThreadMetadataDb {
                            main_worktree_paths = excluded.main_worktree_paths, \
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
                            remote_connection = excluded.remote_connection, \
-                           title_override = excluded.title_override";
+                           title_override = excluded.title_override, \
+                           workspace_id = COALESCE(excluded.workspace_id, sidebar_threads.workspace_id)";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&thread_id, 1)?;
             i = stmt.bind(&session_id, i)?;
@@ -1721,7 +1758,8 @@ impl ThreadMetadataDb {
             i = stmt.bind(&main_worktree_paths, i)?;
             i = stmt.bind(&main_worktree_paths_order, i)?;
             i = stmt.bind(&remote_connection, i)?;
-            stmt.bind(&title_override, i)?;
+            i = stmt.bind(&title_override, i)?;
+            stmt.bind(&workspace_id, i)?;
             stmt.exec()
         })
         .await
@@ -1879,6 +1917,7 @@ impl Column for ThreadMetadata {
         let (remote_connection_json, next): (Option<String>, i32) =
             Column::column(statement, next)?;
         let (title_override, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (workspace_id, next): (Option<String>, i32) = Column::column(statement, next)?;
 
         let agent_id = agent_id
             .map(|id| AgentId::new(id))
@@ -1943,6 +1982,10 @@ impl Column for ThreadMetadata {
                 created_at,
                 interacted_at,
                 worktree_paths,
+                workspace_id: workspace_id
+                    .as_deref()
+                    .map(ManagedWorkspaceId::from_key_string)
+                    .transpose()?,
                 remote_connection,
                 archived,
             },
@@ -2034,6 +2077,7 @@ mod tests {
             created_at: Some(updated_at),
             interacted_at: None,
             worktree_paths: WorktreePaths::from_folder_paths(&folder_paths),
+            workspace_id: None,
             remote_connection: None,
         }
     }
@@ -2364,6 +2408,7 @@ mod tests {
             created_at: Some(updated_time),
             interacted_at: None,
             worktree_paths: WorktreePaths::from_folder_paths(&second_paths),
+            workspace_id: None,
             remote_connection: None,
             archived: false,
         };
@@ -2449,6 +2494,7 @@ mod tests {
             created_at: Some(now - chrono::Duration::seconds(10)),
             interacted_at: None,
             worktree_paths: WorktreePaths::from_folder_paths(&project_a_paths),
+            workspace_id: None,
             remote_connection: None,
             archived: false,
         };
@@ -2575,6 +2621,7 @@ mod tests {
             created_at: Some(existing_updated_at),
             interacted_at: None,
             worktree_paths: WorktreePaths::from_folder_paths(&project_paths),
+            workspace_id: None,
             remote_connection: None,
             archived: false,
         };
@@ -3320,6 +3367,7 @@ mod tests {
             created_at: Some(now),
             interacted_at: None,
             worktree_paths: linked_worktree_paths.clone(),
+            workspace_id: None,
             remote_connection: None,
         };
 
@@ -3334,6 +3382,7 @@ mod tests {
             created_at: Some(now - chrono::Duration::seconds(1)),
             interacted_at: None,
             worktree_paths: linked_worktree_paths,
+            workspace_id: None,
             remote_connection: Some(remote_a.clone()),
         };
 

@@ -1635,6 +1635,30 @@ impl Sidebar {
                         })
                     };
 
+                // For managed workspaces, group by stable identity first so a
+                // thread whose stored paths no longer match the group's current
+                // paths (after add/remove-folder) still lands under its own
+                // workspace. The path-based lookups below then backfill legacy
+                // threads and closed (non-managed) workspaces.
+                for ws in group_workspaces {
+                    let Some(workspace_id) = ws.read(cx).managed_workspace_id() else {
+                        continue;
+                    };
+                    for row in thread_store
+                        .read(cx)
+                        .entries_for_workspace(workspace_id)
+                        .cloned()
+                    {
+                        if !seen_thread_ids.insert(row.thread_id) {
+                            continue;
+                        }
+                        threads.push(make_thread_entry(
+                            row,
+                            ThreadEntryWorkspace::Open(ws.clone()),
+                        ));
+                    }
+                }
+
                 // Main code path: one query per group via main_worktree_paths.
                 // The main_worktree_paths column is set on all new threads and
                 // points to the group's canonical paths regardless of which
@@ -1714,29 +1738,6 @@ impl Sidebar {
                                 folder_paths: worktree_path_list.clone(),
                                 project_group_key: group_key.clone(),
                             },
-                        ));
-                    }
-                }
-
-                // Threads whose stored paths no longer match the group's current
-                // paths (after add/remove-folder) still belong to the same managed
-                // workspace. Pull them in by stable identity so membership changes
-                // keep threads under the same header.
-                for ws in group_workspaces {
-                    let Some(workspace_id) = ws.read(cx).managed_workspace_id() else {
-                        continue;
-                    };
-                    for row in thread_store
-                        .read(cx)
-                        .entries_for_workspace(workspace_id)
-                        .cloned()
-                    {
-                        if !seen_thread_ids.insert(row.thread_id) {
-                            continue;
-                        }
-                        threads.push(make_thread_entry(
-                            row,
-                            ThreadEntryWorkspace::Open(ws.clone()),
                         ));
                     }
                 }
