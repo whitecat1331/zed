@@ -320,6 +320,8 @@ actions!(
         ScrollOutputToPreviousMessage,
         /// Scroll the output to the next user message.
         ScrollOutputToNextMessage,
+        /// Scroll the output to the focused user message.
+        ScrollOutputToFocusedMessage,
         /// Toggles in-thread search over the current agent thread's contents.
         ToggleSearch,
         /// Import agent threads from other Zed release channels (e.g. Preview, Nightly).
@@ -673,9 +675,47 @@ pub fn init(
              _: &SyncThreads,
              _window: &mut Window,
              cx: &mut Context<Workspace>| {
-                thread_metadata_store::ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-                    let _ = store.reload(cx);
-                });
+                // Reconcile diverged threads in the shared database first, then
+                // refresh both the full thread store and the sidebar so the
+                // merged result is what the user sees.
+                let reconcile = agent::reconcile_threads(cx);
+                let thread_store = agent::ThreadStore::global(cx);
+                let metadata_store = thread_metadata_store::ThreadMetadataStore::global(cx);
+                cx.spawn(async move |_workspace, cx| {
+                    match reconcile.await {
+                        Ok(summary) => {
+                            if summary.merged_threads > 0 {
+                                log::info!(
+                                    "[SYNC] reconciled {} duplicate threads across {} groups",
+                                    summary.merged_threads,
+                                    summary.duplicate_groups,
+                                );
+                            }
+                            // Archive sidebar rows that point at a merged session
+                            // so the collapsed thread is not shown twice. The
+                            // archive is awaited before the reload so a racing
+                            // reload cannot resurrect the merged-away rows.
+                            if !summary.merged_session_ids.is_empty() {
+                                let merged: Vec<acp::SessionId> = summary
+                                    .merged_session_ids
+                                    .iter()
+                                    .map(|session_id| acp::SessionId::new(session_id.clone()))
+                                    .collect();
+                                metadata_store.update(cx, |store, cx| {
+                                    let _ = store.archive_merged_sessions_and_reload(&merged, cx);
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            log::warn!("[SYNC] thread reconcile failed: {error:#}");
+                        }
+                    }
+
+                    thread_store.update(cx, |store, cx| {
+                        store.reload(cx);
+                    });
+                })
+                .detach();
             },
         );
     })

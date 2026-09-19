@@ -38,6 +38,9 @@ smallvec.workspace = true
 util.workspace = true
 zlog.workspace = true
 
+[build-dependencies]
+fs_embed_build.workspace = true
+
 [dev-dependencies]
 fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
