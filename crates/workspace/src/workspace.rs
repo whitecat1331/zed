@@ -11210,8 +11210,12 @@ pub fn open_managed_workspace_paths(
     cx: &mut App,
 ) {
     let paths = paths.to_vec();
+    let requesting_window = cx
+        .active_window()
+        .and_then(|window| window.downcast::<MultiWorkspace>());
     let options = OpenOptions {
-        open_mode: OpenMode::NewWindow,
+        requesting_window,
+        open_mode: OpenMode::Activate,
         workspace_matching: WorkspaceMatching::None,
         skip_managed_workspace_ask: true,
         ..Default::default()
