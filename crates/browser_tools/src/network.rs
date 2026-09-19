@@ -415,6 +415,24 @@ mod control_tests {
         let online = ThrottleConditions::default().to_cdp_params();
         assert!(online.get("connectionType").is_none());
     }
+
+    #[test]
+    fn interception_pattern_serializes_to_cdp_request_pattern() {
+        let scoped = InterceptionPattern {
+            url_pattern: "https://api.example.com/*".to_string(),
+            request_stage: Some("Response".to_string()),
+        };
+        let params = scoped.to_cdp_params();
+        assert_eq!(params["urlPattern"].as_str(), Some("https://api.example.com/*"));
+        assert_eq!(params["requestStage"].as_str(), Some("Response"));
+
+        let stage_optional = InterceptionPattern {
+            url_pattern: "*://localhost/*".to_string(),
+            request_stage: None,
+        };
+        let params = stage_optional.to_cdp_params();
+        assert!(params.get("requestStage").is_none());
+    }
 }
 
 #[cfg(test)]

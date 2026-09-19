@@ -1059,3 +1059,70 @@ fn control_state_to_json(control: &NetworkControlState) -> Value {
         })),
     })
 }
+
+#[cfg(test)]
+mod control_state_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn control_state_serializes_full_surface() {
+        let control = NetworkControlState {
+            offline: true,
+            throttle: Some(crate::network::ThrottlePreset::Slow3G.conditions()),
+            cache_disabled: true,
+            bypass_service_worker: true,
+            blocked_urls: vec!["*://tracker.example.com/*".to_string()],
+            extra_http_headers: HashMap::from([("X-Debug".to_string(), "1".to_string())]),
+            user_agent: Some("ZedDebug/1.0".to_string()),
+            interception: Some(InterceptionConfig {
+                patterns: vec![InterceptionPattern {
+                    url_pattern: "https://api.example.com/*".to_string(),
+                    request_stage: Some("Request".to_string()),
+                }],
+            }),
+        };
+        let json = control_state_to_json(&control);
+        assert_eq!(json["offline"].as_bool(), Some(true));
+        assert_eq!(json["cache_disabled"].as_bool(), Some(true));
+        assert_eq!(json["bypass_service_worker"].as_bool(), Some(true));
+        assert_eq!(json["blocked_urls"][0].as_str(), Some("*://tracker.example.com/*"));
+        assert_eq!(json["extra_http_headers"]["X-Debug"].as_str(), Some("1"));
+        assert_eq!(json["user_agent"].as_str(), Some("ZedDebug/1.0"));
+        let throttle = &json["throttle"];
+        assert_eq!(throttle["offline"].as_bool(), Some(false));
+        assert_eq!(throttle["latency_ms"].as_u64(), Some(2_000));
+        assert_eq!(throttle["connection_type"].as_str(), Some("cellular3g"));
+        let interception = &json["interception"];
+        assert_eq!(
+            interception["patterns"][0]["url_pattern"].as_str(),
+            Some("https://api.example.com/*")
+        );
+        assert_eq!(
+            interception["patterns"][0]["request_stage"].as_str(),
+            Some("Request")
+        );
+    }
+
+    #[test]
+    fn fetch_request_paused_filter_matches_only_pause_events() {
+        let paused = json!({
+            "method": "Fetch.requestPaused",
+            "params": { "requestId": "123" },
+        });
+        let will_be_sent = json!({
+            "method": "Network.requestWillBeSent",
+            "params": { "requestId": "123" },
+        });
+        assert!(is_fetch_request_paused(&paused));
+        assert!(!is_fetch_request_paused(&will_be_sent));
+    }
+
+    #[test]
+    fn session_id_matching_scopes_events_to_target() {
+        let event = json!({ "method": "Network.requestWillBeSent", "sessionId": "s1" });
+        assert!(session_id_matches(&event, Some("s1")));
+        assert!(!session_id_matches(&event, Some("s2")));
+        assert!(session_id_matches(&event, None));
+    }
+}
