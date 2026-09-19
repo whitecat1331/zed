@@ -3923,6 +3923,16 @@ impl ProjectPanel {
         }
     }
 
+    fn paths_equal(a: &Path, b: &Path) -> bool {
+        let a = a.to_string_lossy();
+        let b = b.to_string_lossy();
+        if cfg!(target_os = "windows") {
+            a.eq_ignore_ascii_case(b.as_ref())
+        } else {
+            a == b
+        }
+    }
+
     fn add_folder_to_workspace(
         &mut self,
         _: &AddFolderToWorkspace,
@@ -3949,7 +3959,25 @@ impl ProjectPanel {
             let Ok(Ok(Some(paths))) = paths.await else {
                 return anyhow::Ok(());
             };
-            for path in &paths {
+            // A folder that is already a member of this workspace is a no-op:
+            // skip it so re-adding it doesn't re-open and focus the existing
+            // worktree.
+            let existing_paths = manager
+                .project_paths(managed_workspace_id)
+                .log_err()
+                .unwrap_or_default();
+            let new_paths: Vec<PathBuf> = paths
+                .into_iter()
+                .filter(|path| {
+                    !existing_paths
+                        .iter()
+                        .any(|existing| Self::paths_equal(existing.as_path(), path.as_path()))
+                })
+                .collect();
+            if new_paths.is_empty() {
+                return anyhow::Ok(());
+            }
+            for path in &new_paths {
                 manager
                     .add_project(managed_workspace_id, path.clone())
                     .await
@@ -3958,7 +3986,7 @@ impl ProjectPanel {
             if let Some(workspace) = workspace.upgrade() {
                 let task = workspace.update_in(cx, |workspace, window, cx| {
                     workspace.open_paths(
-                        paths,
+                        new_paths,
                         OpenOptions {
                             visible: Some(OpenVisible::All),
                             skip_managed_workspace_ask: true,
