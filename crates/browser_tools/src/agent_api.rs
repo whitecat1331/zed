@@ -82,13 +82,15 @@ impl AgentBrowserApi {
 
         let stderr = child.stderr.take().context("Chromium has no stderr")?;
         let endpoint = smol::future::race(read_devtools_endpoint(stderr), async {
-            smol::Timer::after(Duration::from_secs(15)).await;
+            self.background_executor
+                .timer(Duration::from_secs(15))
+                .await;
             Err(anyhow!("timed out waiting for Chromium DevTools endpoint"))
         })
         .await?;
 
         let client = CdpClient::connect(&endpoint, self.background_executor.clone()).await?;
-        let target = create_target(&client, url).await?;
+        let target = create_target(&client, url, &self.background_executor).await?;
 
         let id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
         let mut targets = HashMap::new();
@@ -113,7 +115,7 @@ impl AgentBrowserApi {
         let session = sessions
             .get_mut(&session_id)
             .context("unknown browser session")?;
-        let target = create_target(&session.client, url).await?;
+        let target = create_target(&session.client, url, &self.background_executor).await?;
         let target_json = target_to_json(&target);
         let target_id = target.target_id.clone();
         session.active_target_id = Some(target_id.clone());
@@ -437,7 +439,11 @@ fn update_target_url(session: &mut BrowserSession, target_id: Option<&str>, url:
     }
 }
 
-async fn create_target(client: &CdpClient, url: &str) -> Result<BrowserTarget> {
+async fn create_target(
+    client: &CdpClient,
+    url: &str,
+    executor: &BackgroundExecutor,
+) -> Result<BrowserTarget> {
     let create_result = client
         .send_command("Target.createTarget", json!({ "url": "about:blank" }))
         .await?;
@@ -487,7 +493,7 @@ async fn create_target(client: &CdpClient, url: &str) -> Result<BrowserTarget> {
     client
         .send_command_with_session(Some(&session_id), "Page.navigate", json!({ "url": url }))
         .await?;
-    wait_for_page_load(client, Some(&session_id), url).await?;
+    wait_for_page_load(client, Some(&session_id), url, executor).await?;
 
     Ok(BrowserTarget {
         target_id,
@@ -579,7 +585,12 @@ async fn evaluate_value(
         .unwrap_or(Value::Null))
 }
 
-async fn wait_for_page_load(client: &CdpClient, session_id: Option<&str>, url: &str) -> Result<()> {
+async fn wait_for_page_load(
+    client: &CdpClient,
+    session_id: Option<&str>,
+    url: &str,
+    executor: &BackgroundExecutor,
+) -> Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         let state = evaluate_value(
@@ -605,7 +616,7 @@ async fn wait_for_page_load(client: &CdpClient, session_id: Option<&str>, url: &
         if std::time::Instant::now() >= deadline {
             return Err(anyhow!("timed out waiting for {url} to load"));
         }
-        smol::Timer::after(Duration::from_millis(100)).await;
+        executor.timer(Duration::from_millis(100)).await;
     }
 }
 
