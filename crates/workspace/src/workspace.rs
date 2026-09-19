@@ -424,8 +424,8 @@ actions!(
         ActivateNextWindow,
         /// Switches to the previous window.
         ActivatePreviousWindow,
-        /// Adds a folder to the current project.
-        AddFolderToProject,
+        /// Adds a folder to the current workspace.
+        AddFolderToWorkspace,
         /// Clears all bookmarks in the project.
         ClearBookmarks,
         /// Clears all notifications.
@@ -4270,9 +4270,9 @@ impl Workspace {
             .map(|wt| wt.read(cx).abs_path().as_ref().to_path_buf())
     }
 
-    pub fn add_folder_to_project(
+    pub fn add_folder_to_workspace(
         &mut self,
-        _: &AddFolderToProject,
+        _: &AddFolderToWorkspace,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -8139,7 +8139,7 @@ impl Workspace {
             .on_action(cx.listener(Self::close_item_in_all_panes))
             .on_action(cx.listener(Self::save_all))
             .on_action(cx.listener(Self::send_keystrokes))
-            .on_action(cx.listener(Self::add_folder_to_project))
+            .on_action(cx.listener(Self::add_folder_to_workspace))
             .on_action(cx.listener(Self::follow_next_collaborator))
             .on_action(cx.listener(Self::activate_pane_at_index))
             .on_action(cx.listener(Self::move_item_to_pane_at_index))

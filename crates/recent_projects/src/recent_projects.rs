@@ -1696,9 +1696,9 @@ impl PickerDelegate for RecentProjectsDelegate {
                     .unzip();
 
                 let tooltip_title = if paths.len() > 1 {
-                    "Add Folders to this Project"
+                    "Add Folders to this Workspace"
                 } else {
-                    "Add Folder to this Project"
+                    "Add Folder to this Workspace"
                 };
 
                 let prefix = match &location {
@@ -2137,7 +2137,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                                         menu.context(focus_handle)
                                             .when(show_add_to_workspace, |menu| {
                                                 menu.action(
-                                                    "Add Folder to this Project",
+                                                    "Add Folder to this Workspace",
                                                     AddToWorkspace.boxed_clone(),
                                                 )
                                                 .separator()
