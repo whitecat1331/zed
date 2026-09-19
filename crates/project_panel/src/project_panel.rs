@@ -3961,6 +3961,7 @@ impl ProjectPanel {
                         paths,
                         OpenOptions {
                             visible: Some(OpenVisible::All),
+                            skip_managed_workspace_ask: true,
                             ..Default::default()
                         },
                         None,

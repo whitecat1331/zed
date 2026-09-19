@@ -342,6 +342,7 @@ impl WorkspaceManager {
             connection.exec_bound::<(&str, &str, i64)>(sql! {
                 INSERT INTO managed_workspace_projects (workspace_id, path, position)
                 VALUES (?, ?, ?)
+                ON CONFLICT(workspace_id, path) DO NOTHING
             })?((key.as_str(), path.as_str(), position))?;
             Ok(())
         })

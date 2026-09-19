@@ -11212,6 +11212,7 @@ pub fn open_managed_workspace_paths(
     let paths = paths.to_vec();
     let options = OpenOptions {
         open_mode: OpenMode::NewWindow,
+        workspace_matching: WorkspaceMatching::None,
         skip_managed_workspace_ask: true,
         ..Default::default()
     };
