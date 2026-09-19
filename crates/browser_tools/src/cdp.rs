@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use async_tungstenite::tungstenite::{Error as TungsteniteError, Message};
-use async_tungstenite::{WebSocketStream, client_async};
+use async_tungstenite::client_async;
 use futures::channel::oneshot;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use gpui::BackgroundExecutor;
