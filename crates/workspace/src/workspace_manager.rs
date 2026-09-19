@@ -37,6 +37,11 @@ impl ManagedWorkspaceId {
     pub fn from_key_string(key: &str) -> Result<Self> {
         Ok(Self(Uuid::parse_str(key)?))
     }
+
+    /// The raw [`Uuid`], used as the layout `workspaces.workspace_uuid` key.
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
+    }
 }
 
 impl StaticColumnCount for ManagedWorkspaceId {}

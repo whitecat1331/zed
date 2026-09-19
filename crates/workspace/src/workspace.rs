@@ -2229,7 +2229,17 @@ impl Workspace {
                 }
             }
 
-            let serialized_workspace = db.workspace_for_roots(paths_to_open.as_slice());
+            // Prefer restoring by the managed workspace's stable id so layout
+            // survives membership changes; fall back to path-set matching.
+            let managed_workspace_id = cx.update(|cx| {
+                WorkspaceManager::global(cx)
+                    .workspace_id_for_paths(&PathList::new(paths_to_open.as_slice()))
+                    .log_err()
+                    .flatten()
+            });
+            let serialized_workspace = managed_workspace_id
+                .and_then(|workspace_id| db.workspace_for_uuid(workspace_id.as_uuid()))
+                .or_else(|| db.workspace_for_roots(paths_to_open.as_slice()));
 
             if let Some(paths) = serialized_workspace.as_ref().map(|ws| &ws.paths) {
                 paths_to_open = paths.ordered_paths().cloned().collect();
@@ -7792,8 +7802,10 @@ impl Workspace {
                 };
 
                 let db = WorkspaceDb::global(cx);
+                let managed_workspace_uuid = self.managed_workspace_id().map(|id| id.as_uuid());
                 cx.background_spawn(async move {
-                    db.save_workspace(serialized_workspace).await;
+                    db.save_workspace_with_uuid(serialized_workspace, managed_workspace_uuid)
+                        .await;
                 })
             }
             WorkspaceLocation::DetachFromSession => {

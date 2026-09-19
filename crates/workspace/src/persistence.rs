@@ -1559,10 +1559,27 @@ impl WorkspaceDb {
         ret
     }
 
+    #[cfg(test)]
     pub(crate) async fn save_workspace(&self, workspace: SerializedWorkspace) {
+        self.save_workspace_with_uuid(workspace, None).await
+    }
+
+    pub(crate) async fn save_workspace_with_uuid(
+        &self,
+        workspace: SerializedWorkspace,
+        managed_workspace_uuid: Option<Uuid>,
+    ) {
         let paths = workspace.paths.serialize();
         let identity_paths = workspace.identity_paths.map(|paths| paths.serialize());
         log::debug!("Saving workspace at location: {:?}", workspace.location);
+        // The managed identity wins; otherwise reuse the layout row's existing
+        // uuid; otherwise mint one. Minted uuids are reused for the lifetime of
+        // the layout row (matched by the i64 cascade key), so a workspace's
+        // identity survives membership changes.
+        let workspace_uuid = managed_workspace_uuid
+            .or_else(|| self.workspace_uuid_for_id(workspace.id))
+            .unwrap_or_else(Uuid::new_v4);
+        let workspace_uuid_key = workspace_uuid.hyphenated().to_string();
         self.write(move |conn| {
             conn.with_savepoint("update_worktrees", || {
                 let remote_connection_id = match workspace.location.clone() {
@@ -1574,23 +1591,6 @@ impl WorkspaceDb {
                         )?.0)
                     }
                 };
-
-                // Resolve the stable workspace uuid. Once minted it is reused for
-                // the lifetime of the layout row (matched by the i64 cascade key),
-                // so a workspace's identity survives membership changes.
-                let workspace_uuid = {
-                    let existing = conn
-                        .select_row_bound::<WorkspaceId, String>(sql! {
-                            SELECT workspace_uuid FROM workspaces WHERE workspace_id = ?
-                        })
-                        .and_then(|mut prepared_statement| prepared_statement(workspace.id))
-                        .context("Looking up workspace uuid")?;
-                    match existing {
-                        Some(key) => Uuid::parse_str(&key).context("Parsing workspace uuid")?,
-                        None => Uuid::new_v4(),
-                    }
-                };
-                let workspace_uuid_key = workspace_uuid.hyphenated().to_string();
 
                 // Clear out panes and pane_groups
                 conn.exec_bound(sql!(
