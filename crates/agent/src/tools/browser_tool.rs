@@ -1,14 +1,12 @@
 use agent_client_protocol::schema::v1 as acp;
-use agent_settings::{AgentSettings, builtin_profiles};
+use agent_settings::builtin_profiles;
 use anyhow::{Context as _, Result};
 use browser_tools::AgentBrowserApi;
 use gpui::{App, AppContext as _, SharedString, Task, WeakEntity};
-use http_client::HttpClient;
 use language_model::{LanguageModelImage, LanguageModelImageExt, LanguageModelToolResultContent};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use settings::Settings;
 use std::sync::Arc;
 
 use crate::{AgentTool, Thread, ToolCallEventStream, ToolInput, ToolPermissionContext};
@@ -137,17 +135,13 @@ impl From<BrowserToolOutput> for LanguageModelToolResultContent {
 }
 
 pub struct BrowserTool {
-    api: AgentBrowserApi,
+    api: Arc<AgentBrowserApi>,
     thread: WeakEntity<Thread>,
 }
 
 impl BrowserTool {
-    pub fn new(thread: WeakEntity<Thread>, http_client: Arc<dyn HttpClient>, cx: &App) -> Self {
-        let chromium_path = AgentSettings::get_global(cx).browser_chromium_path.clone();
-        Self {
-            api: AgentBrowserApi::new(chromium_path, http_client, cx.background_executor().clone()),
-            thread,
-        }
+    pub fn new(thread: WeakEntity<Thread>, api: Arc<AgentBrowserApi>) -> Self {
+        Self { api, thread }
     }
 
     fn is_read_only_profile(&self, cx: &App) -> bool {
@@ -505,7 +499,7 @@ async fn authorize_browser_operation(
     task.await
 }
 
-fn permission_inputs(operation: &str, values: impl IntoIterator<Item = String>) -> Vec<String> {
+pub(crate) fn permission_inputs(operation: &str, values: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut inputs = values.into_iter().collect::<Vec<_>>();
     if inputs.is_empty() {
         inputs.push(operation.to_string());
