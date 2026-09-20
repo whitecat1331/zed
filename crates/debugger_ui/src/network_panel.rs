@@ -75,10 +75,7 @@ struct RequestRow {
     method: String,
     status: Option<u32>,
     resource_type: Option<String>,
-    mime_type: Option<String>,
     failed: bool,
-    from_cache: bool,
-    completed: bool,
 }
 
 impl RequestRow {
@@ -107,19 +104,7 @@ impl RequestRow {
                 .get("resource_type")
                 .and_then(Value::as_str)
                 .map(str::to_string),
-            mime_type: value
-                .get("mime_type")
-                .and_then(Value::as_str)
-                .map(str::to_string),
             failed: value.get("failure_reason").is_some() || value.get("blocked_reason").is_some(),
-            from_cache: value
-                .get("from_cache")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            completed: value
-                .get("completed")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
         }
     }
 }
@@ -161,7 +146,6 @@ async fn fetch_snapshot(browser_api: &AgentBrowserApi) -> Option<NetworkSnapshot
 pub struct NetworkPanel {
     browser_api: Arc<AgentBrowserApi>,
     focus_handle: FocusHandle,
-    workspace: WeakEntity<Workspace>,
     session_id: Option<u64>,
     requests: Vec<Value>,
     control: Value,
@@ -195,7 +179,6 @@ impl NetworkPanel {
             let mut this = Self {
                 browser_api,
                 focus_handle,
-                workspace: workspace.weak_handle(),
                 session_id: None,
                 requests: Vec::new(),
                 control: Value::Null,
@@ -365,7 +348,7 @@ impl NetworkPanel {
         cx.spawn(async move |this, cx| {
             let _ = browser_api.set_driven_by(session_id, DrivenBy::Human).await;
             let _ = browser_api
-                .block_urls(session_id, None, &[url.clone()])
+                .block_urls(session_id, None, std::slice::from_ref(&url))
                 .await;
             this.update(cx, |_, cx| cx.notify()).ok();
         })
@@ -497,7 +480,7 @@ impl NetworkPanel {
                     .child(Label::new(row.method.clone()))
                     .child(Label::new(status))
                     .child(Label::new(row.resource_type.clone().unwrap_or_default()))
-                    .child(Label::new(row.url.clone()).truncate()),
+                    .child(Label::new(row.url).truncate()),
             )
             .into_any_element()
     }
