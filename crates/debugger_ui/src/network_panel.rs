@@ -22,6 +22,13 @@ pub struct NetworkPanelFeatureFlag;
 impl FeatureFlag for NetworkPanelFeatureFlag {
     const NAME: &'static str = "browser-network-panel";
     type Value = PresenceFlag;
+
+    // Always on. The default `enabled_for_staff()` would hide the panel from
+    // everyone in release/quick builds (staff can't be set there), so gate by
+    // `enabled_for_all` to keep it testable in the fork.
+    fn enabled_for_all() -> bool {
+        true
+    }
 }
 register_feature_flag!(NetworkPanelFeatureFlag);
 
@@ -399,9 +406,19 @@ impl NetworkPanel {
             .get("offline")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let driven_by = match self.driven_by.as_str() {
+            "human" => "Human",
+            "agent" => "Agent",
+            _ => "Idle",
+        };
         h_flex()
             .gap_1()
             .p_1()
+            .child(
+                Label::new(format!("driven by: {driven_by}"))
+                    .color(Color::Muted)
+                    .size(LabelSize::Small),
+            )
             .child(
                 Button::new("record", if self.record { "Pause" } else { "Record" })
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_record(cx))),
