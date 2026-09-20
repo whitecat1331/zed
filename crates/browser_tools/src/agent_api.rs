@@ -1043,6 +1043,16 @@ impl AgentBrowserApi {
         Ok(json!({ "driven_by": session.driven_by.as_str() }))
     }
 
+    /// Clear the captured requests in a session's typed store.
+    pub async fn clear_requests(&self, session_id: u64) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        session.network_store = NetworkStore::new();
+        Ok(json!({ "cleared": true }))
+    }
+
     async fn fetch_disposition(
         &self,
         session_id: u64,
