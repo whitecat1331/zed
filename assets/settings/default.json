@@ -1266,6 +1266,7 @@
         "tools": {
           "memory": true,
           "browser": true,
+          "network": true,
           "create_thread": true,
           "debugger": true,
           "diagnostics": true,
@@ -1291,6 +1292,7 @@
         "tools": {
           "memory": true,
           "browser": true,
+          "network": true,
           "copy_path": true,
           "create_directory": true,
           "create_thread": true,
@@ -1322,6 +1324,7 @@
         "tools": {
           "memory": true,
           "browser": true,
+          "network": true,
           "copy_path": true,
           "create_directory": true,
           "create_thread": true,
@@ -1354,6 +1357,7 @@
         "tools": {
           "memory": true,
           "browser": true,
+          "network": true,
           "create_thread": true,
           "debugger": true,
           "diagnostics": true,
@@ -1379,6 +1383,7 @@
         "tools": {
           "memory": true,
           "browser": true,
+          "network": true,
           "copy_path": true,
           "create_directory": true,
           "create_thread": true,
