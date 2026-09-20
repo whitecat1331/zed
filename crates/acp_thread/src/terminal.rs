@@ -647,6 +647,7 @@ pub async fn create_terminal_entity(
         .unwrap_or_else(|| Shell::Program(get_default_system_shell_preferring_bash()));
     let is_windows = project.read_with(cx, |project, cx| project.path_style(cx).is_windows());
     let (task_command, task_args) = task::ShellBuilder::new(&shell, is_windows)
+        .non_interactive()
         .redirect_stdin_to_dev_null()
         .build(Some(command.clone()), &args);
 
