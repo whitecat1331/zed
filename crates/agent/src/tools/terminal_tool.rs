@@ -29,6 +29,10 @@ const COMMAND_OUTPUT_LIMIT: u64 = 16 * 1024;
 const DEFAULT_TERMINAL_TIMEOUT_MS: u64 = 600_000;
 const MAX_TERMINAL_TIMEOUT_MS: u64 = 7_200_000;
 
+// Poll cadence for the output sampler that detects a failing command from its
+// output before the timeout fires.
+const SAMPLER_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Executes a shell one-liner and returns the combined output.
 ///
 /// This tool spawns a process using the user's shell, reads from stdout and stderr (preserving the order of writes), and returns a string with the combined output result.
@@ -1002,15 +1006,42 @@ async fn run_terminal_tool(
     let timeout = Duration::from_millis(terminal_timeout_ms(input.timeout_ms)?);
 
     let mut timed_out = false;
+    let mut failure_detected = false;
     let mut user_stopped_via_signal = false;
     let wait_for_exit = terminal.wait_for_exit(cx).map_err(|e| e.to_string())?;
 
     let timeout_task = cx.background_executor().timer(timeout);
+    let sampler_task = cx.spawn({
+        let terminal = terminal.clone();
+        async move |cx| {
+            let mut last_output_len = 0usize;
+            let mut state = ErrorStreamState::default();
+            loop {
+                cx.background_executor().timer(SAMPLER_POLL_INTERVAL).await;
+                let Ok(output) = terminal.current_output(cx) else {
+                    continue;
+                };
+                let content = &output.output;
+                if content.len() > last_output_len {
+                    let delta = &content[last_output_len..];
+                    last_output_len = content.len();
+                    if detect_error_stream(delta, &mut state) {
+                        return;
+                    }
+                }
+            }
+        }
+    });
 
     futures::select! {
         _ = wait_for_exit.clone().fuse() => {},
         _ = timeout_task.fuse() => {
             timed_out = true;
+            terminal.kill(cx).map_err(|e| e.to_string())?;
+            wait_for_exit.await;
+        }
+        _ = sampler_task.fuse() => {
+            failure_detected = true;
             terminal.kill(cx).map_err(|e| e.to_string())?;
             wait_for_exit.await;
         }
@@ -1028,6 +1059,15 @@ async fn run_terminal_tool(
     let output = terminal.current_output(cx).map_err(|e| e.to_string())?;
 
     let result = process_content(output, &input.command, timed_out, user_stopped, selection);
+    let result = if failure_detected {
+        format!(
+            "Command \"{}\" was stopped early because its output looked like a failure \
+             (a sustained stream of error output was detected).\n\n{result}",
+            input.command
+        )
+    } else {
+        result
+    };
     let notes = sandbox_note.into_iter().collect::<Vec<_>>();
     Ok(if notes.is_empty() {
         result
@@ -1238,6 +1278,63 @@ fn wsl_interop_blocked(content: &str) -> bool {
     content.contains("UtilGetPpid") || content.contains("Failed to parse: /proc/1/stat")
 }
 
+// Error signatures a failing command tends to emit. Matching is case-insensitive
+// substring matching, so the set is deliberately loose: the sampler only fires
+// on a *sustained* stream of these lines, not a single occurrence.
+const ERROR_SIGNATURES: &[&str] = &[
+    "error",
+    "fatal",
+    "panic",
+    "traceback",
+    "exception",
+    "command not found",
+    "no such file",
+    "permission denied",
+    "cannot",
+    "syntax error",
+    "failed",
+    "failure",
+];
+
+// Minimum number of error-signature lines before the sampler concludes a command
+// is failing, plus a startup grace so a command's first few lines aren't judged
+// before it gets going.
+const SAMPLER_ERROR_LINE_THRESHOLD: usize = 10;
+const SAMPLER_STARTUP_GRACE_LINES: usize = 4;
+
+#[derive(Default)]
+struct ErrorStreamState {
+    error_lines: usize,
+    total_lines: usize,
+}
+
+fn detect_error_stream(delta: &str, state: &mut ErrorStreamState) -> bool {
+    for line in delta.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        state.total_lines += 1;
+        if is_error_line(line) {
+            state.error_lines += 1;
+        }
+    }
+
+    if state.total_lines < SAMPLER_STARTUP_GRACE_LINES {
+        return false;
+    }
+
+    state.error_lines >= SAMPLER_ERROR_LINE_THRESHOLD
+        || (state.error_lines >= 4 && state.error_lines * 2 >= state.total_lines)
+}
+
+fn is_error_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    ERROR_SIGNATURES
+        .iter()
+        .any(|signature| lower.contains(*signature))
+}
+
 fn terminal_timeout_ms(timeout_ms: Option<u64>) -> Result<u64, String> {
     let timeout_ms = timeout_ms.unwrap_or(DEFAULT_TERMINAL_TIMEOUT_MS);
     if timeout_ms > MAX_TERMINAL_TIMEOUT_MS {
@@ -1426,6 +1523,41 @@ mod tests {
         assert_eq!(terminal_timeout_ms(Some(5)).unwrap(), 5);
         assert_eq!(terminal_timeout_ms(Some(7_200_000)).unwrap(), 7_200_000);
         assert!(terminal_timeout_ms(Some(7_200_001)).is_err());
+    }
+
+    #[test]
+    fn test_detect_error_stream_flags_sustained_errors() {
+        let mut state = ErrorStreamState::default();
+        let delta = "error: 1\nerror: 2\nerror: 3\nerror: 4\nerror: 5\nerror: 6\nerror: 7\nerror: 8\nerror: 9\nerror: 10\n";
+        assert!(detect_error_stream(delta, &mut state));
+    }
+
+    #[test]
+    fn test_detect_error_stream_flags_error_dominated_output() {
+        let mut state = ErrorStreamState::default();
+        let delta = "error: a\nerror: b\nerror: c\nerror: d\nok\n";
+        assert!(detect_error_stream(delta, &mut state));
+    }
+
+    #[test]
+    fn test_detect_error_stream_ignores_sparse_errors() {
+        let mut state = ErrorStreamState::default();
+        let delta = "a\nb\nc\nerror: x\nd\ne\nf\nerror: y\ng\nh\n";
+        assert!(!detect_error_stream(delta, &mut state));
+    }
+
+    #[test]
+    fn test_detect_error_stream_ignores_clean_output() {
+        let mut state = ErrorStreamState::default();
+        let delta = "compiling foo\nlinking bar\nrunning tests\nfinished in 2s\nok\n";
+        assert!(!detect_error_stream(delta, &mut state));
+    }
+
+    #[test]
+    fn test_detect_error_stream_ignores_startup_noise() {
+        let mut state = ErrorStreamState::default();
+        let delta = "error: 1\nerror: 2\n";
+        assert!(!detect_error_stream(delta, &mut state));
     }
 
     #[test]
