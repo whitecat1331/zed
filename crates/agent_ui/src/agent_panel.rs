@@ -4665,6 +4665,55 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.reconcile_thread_and_reopen(
+            agent, thread_id, session_id, work_dirs, title, focus, source, true, window, cx,
+        );
+    }
+
+    /// Reconcile a thread's dedup group when the user re-activates an
+    /// already-open thread from the sidebar. An unmerged re-click leaves the
+    /// in-memory view untouched; the view is reopened only when the clicked
+    /// session was merged into a canonical one.
+    pub fn reconcile_thread_on_sidebar_reactivation(
+        &mut self,
+        agent: Agent,
+        thread_id: ThreadId,
+        session_id: acp::SessionId,
+        work_dirs: Option<PathList>,
+        title: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.reconcile_thread_and_reopen(
+            agent,
+            thread_id,
+            session_id,
+            work_dirs,
+            title,
+            true,
+            AgentThreadSource::Sidebar,
+            false,
+            window,
+            cx,
+        );
+    }
+
+    /// Shared reconcile + reopen flow. `reopen_when_unmerged` distinguishes a
+    /// cold open (no in-memory view, always reopen) from a warm re-activation
+    /// (reopen only when the clicked session was merged away).
+    fn reconcile_thread_and_reopen(
+        &mut self,
+        agent: Agent,
+        thread_id: ThreadId,
+        session_id: acp::SessionId,
+        work_dirs: Option<PathList>,
+        title: Option<SharedString>,
+        focus: bool,
+        source: AgentThreadSource,
+        reopen_when_unmerged: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let reconcile = agent::reconcile_thread(cx, session_id.clone());
         let thread_store = agent::ThreadStore::global(cx);
         let metadata_store = ThreadMetadataStore::global(cx);
@@ -4687,6 +4736,8 @@ impl AgentPanel {
                     .unwrap_or_else(|| session_id.clone()),
                 None => session_id.clone(),
             };
+
+            let merged_away = canonical_session != session_id;
 
             let reload = metadata_store.update(cx, |store, cx| {
                 let merged: Vec<acp::SessionId> = summary
@@ -4722,31 +4773,33 @@ impl AgentPanel {
                 }
             }
 
-            thread_store.update(cx, |store, cx| {
-                store.reload(cx);
-            });
+            if merged_away || reopen_when_unmerged {
+                thread_store.update(cx, |store, cx| {
+                    store.reload(cx);
+                });
 
-            this.update_in(cx, |this, window, cx| {
-                let canonical_thread_id = ThreadMetadataStore::try_global(cx)
-                    .and_then(|store| {
-                        store
-                            .read(cx)
-                            .entry_by_session(&canonical_session)
-                            .map(|entry| entry.thread_id)
-                    })
-                    .unwrap_or(thread_id);
-                this.open_fresh_thread(
-                    agent,
-                    canonical_thread_id,
-                    work_dirs,
-                    title,
-                    focus,
-                    source,
-                    window,
-                    cx,
-                );
-            })
-            .ok();
+                this.update_in(cx, |this, window, cx| {
+                    let canonical_thread_id = ThreadMetadataStore::try_global(cx)
+                        .and_then(|store| {
+                            store
+                                .read(cx)
+                                .entry_by_session(&canonical_session)
+                                .map(|entry| entry.thread_id)
+                        })
+                        .unwrap_or(thread_id);
+                    this.open_fresh_thread(
+                        agent,
+                        canonical_thread_id,
+                        work_dirs,
+                        title,
+                        focus,
+                        source,
+                        window,
+                        cx,
+                    );
+                })
+                .ok();
+            }
         })
         .detach();
     }
