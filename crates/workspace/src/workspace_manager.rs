@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -37,6 +37,11 @@ impl ManagedWorkspaceId {
     pub fn from_key_string(key: &str) -> Result<Self> {
         Ok(Self(Uuid::parse_str(key)?))
     }
+
+    /// The raw [`Uuid`], used as the layout `workspaces.workspace_uuid` key.
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
+    }
 }
 
 impl StaticColumnCount for ManagedWorkspaceId {}
@@ -71,6 +76,15 @@ pub struct ManagedWorkspaceProject {
     pub path: PathBuf,
     pub position: i64,
     pub remote_connection_id: Option<i64>,
+}
+
+/// A managed workspace that contains a folder being opened — one option in the
+/// open-folder ask.
+#[derive(Debug, Clone)]
+pub struct AskCandidate {
+    pub workspace_id: ManagedWorkspaceId,
+    pub name: String,
+    pub project_count: usize,
 }
 
 /// The single source of truth for workspace identity: a thin wrapper over
@@ -214,6 +228,41 @@ impl WorkspaceManager {
         Ok(None)
     }
 
+    /// Managed workspaces whose membership includes the given project path —
+    /// the disambiguation set for the open-folder ask.
+    pub fn workspaces_for_path(&self, path: &Path) -> Result<Vec<ManagedWorkspaceId>> {
+        let key = path.to_string_lossy().into_owned();
+        let rows = self.select_bound::<&str, String>(sql! {
+            SELECT workspace_id FROM managed_workspace_projects WHERE path = ?
+        })?(key.as_str())?;
+        rows.into_iter()
+            .map(|id| ManagedWorkspaceId::from_key_string(&id))
+            .collect()
+    }
+
+    /// The disambiguation options for the open-folder ask: the managed
+    /// workspaces (with more than one project) that contain `path`. A folder
+    /// that is the *only* member of a workspace is suppressed, since "open that
+    /// workspace" and "open alone" are equivalent.
+    pub fn ask_candidates(&self, path: &Path) -> Result<Vec<AskCandidate>> {
+        let mut candidates = Vec::new();
+        for workspace_id in self.workspaces_for_path(path)? {
+            let project_count = self.projects(workspace_id)?.len();
+            if project_count <= 1 {
+                continue;
+            }
+            let Some(workspace) = self.get(workspace_id)? else {
+                continue;
+            };
+            candidates.push(AskCandidate {
+                workspace_id,
+                name: workspace.name,
+                project_count,
+            });
+        }
+        Ok(candidates)
+    }
+
     /// Resolve a workspace by its hyphenated id or its user-giveable name.
     pub fn resolve(&self, id_or_name: &str) -> Result<Option<ManagedWorkspaceId>> {
         if let Ok(id) = ManagedWorkspaceId::from_key_string(id_or_name)
@@ -239,6 +288,13 @@ impl WorkspaceManager {
             .into_iter()
             .map(|project| project.path)
             .collect())
+    }
+
+    /// The project paths to open for a workspace, in position order — the
+    /// UI-facing "open by id" entry point. Callers feed the result to
+    /// [`crate::open_paths`] to actually open the workspace.
+    pub fn open(&self, workspace_id: ManagedWorkspaceId) -> Result<Vec<PathBuf>> {
+        self.project_paths(workspace_id)
     }
 
     /// The full managed-workspace list, ordered by name — backing for the home
@@ -291,6 +347,7 @@ impl WorkspaceManager {
             connection.exec_bound::<(&str, &str, i64)>(sql! {
                 INSERT INTO managed_workspace_projects (workspace_id, path, position)
                 VALUES (?, ?, ?)
+                ON CONFLICT(workspace_id, path) DO NOTHING
             })?((key.as_str(), path.as_str(), position))?;
             Ok(())
         })

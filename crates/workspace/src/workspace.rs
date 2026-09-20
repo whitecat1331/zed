@@ -44,7 +44,7 @@ pub use remote::{
 };
 pub use toast_layer::{ToastAction, ToastLayer, ToastView};
 pub use workspace_manager::{
-    ManagedWorkspace, ManagedWorkspaceId, ManagedWorkspaceProject, WorkspaceManager,
+    AskCandidate, ManagedWorkspace, ManagedWorkspaceId, ManagedWorkspaceProject, WorkspaceManager,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -65,10 +65,10 @@ use futures::{
 };
 use gpui::{
     Action, AnyEntity, AnyView, AnyWeakView, App, AppContext, AsyncApp, AsyncWindowContext, Axis,
-    Bounds, ClipboardItem, Context, CursorStyle, Decorations, DragMoveEvent, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke,
-    ManagedView, MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size,
-    Stateful, Subscription, SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity,
+    Bounds, ClipboardItem, Context, CursorStyle, Decorations, DismissEvent, DragMoveEvent, Entity,
+    EntityId, EventEmitter, FocusHandle, Focusable, Global, HitboxBehavior, Hsla, KeyContext,
+    Keystroke, ManagedView, MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge,
+    Size, Stateful, Subscription, SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity,
     WindowBounds, WindowHandle, WindowId, WindowOptions, actions, canvas, point, relative, size,
     transparent_black,
 };
@@ -152,7 +152,7 @@ pub use toolbar::{
     PaneSearchBarCallbacks, Toolbar, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
 };
 pub use ui;
-use ui::{Window, prelude::*};
+use ui::{Clickable, Window, prelude::*};
 use url::Url;
 use util::{
     ResultExt, TryFutureExt,
@@ -424,8 +424,8 @@ actions!(
         ActivateNextWindow,
         /// Switches to the previous window.
         ActivatePreviousWindow,
-        /// Adds a folder to the current project.
-        AddFolderToProject,
+        /// Adds a folder to the current workspace.
+        AddFolderToWorkspace,
         /// Clears all bookmarks in the project.
         ClearBookmarks,
         /// Clears all notifications.
@@ -979,23 +979,35 @@ pub fn prompt_for_open_path_and_open(
         window,
         cx,
     );
-    let multi_workspace_handle = window.window_handle().downcast::<MultiWorkspace>();
     cx.spawn_in(window, async move |this, cx| {
         let Some(paths) = paths.await.log_err().flatten() else {
             return;
         };
         if !create_new_window {
-            if let Some(handle) = multi_workspace_handle {
-                if let Some(task) = handle
-                    .update(cx, |multi_workspace, window, cx| {
-                        multi_workspace.open_project(paths, OpenMode::Activate, window, cx)
-                    })
-                    .log_err()
-                {
-                    task.await.log_err();
-                }
+            // "Open Folder" adds the folders to the active workspace rather than
+            // opening them as a separate workspace keyed by their path set.
+            let Some(task) = this
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.open_paths(
+                        paths,
+                        OpenOptions {
+                            visible: Some(OpenVisible::All),
+                            skip_managed_workspace_ask: true,
+                            ..Default::default()
+                        },
+                        None,
+                        window,
+                        cx,
+                    )
+                })
+                .log_err()
+            else {
                 return;
+            };
+            for result in task.await.into_iter().flatten() {
+                result.log_err();
             }
+            return;
         }
         if let Some(task) = this
             .update_in(cx, |this, window, cx| {
@@ -1637,6 +1649,9 @@ pub struct Workspace {
     active_call: Option<(GlobalAnyActiveCall, Vec<Subscription>)>,
     leader_updates_tx: mpsc::UnboundedSender<(PeerId, proto::UpdateFollowers)>,
     database_id: Option<WorkspaceId>,
+    /// The stable id-keyed identity of the workspace this window displays,
+    /// set when the workspace is opened through the WorkspaceManager.
+    managed_workspace_id: Option<ManagedWorkspaceId>,
     app_state: Arc<AppState>,
     dispatching_keystrokes: Rc<RefCell<DispatchingKeystrokes>>,
     _subscriptions: Vec<Subscription>,
@@ -2143,6 +2158,7 @@ impl Workspace {
             dirty_items: Default::default(),
             active_call,
             database_id: workspace_id,
+            managed_workspace_id: None,
             app_state,
             _observe_current_user,
             _apply_leader_updates,
@@ -2213,7 +2229,17 @@ impl Workspace {
                 }
             }
 
-            let serialized_workspace = db.workspace_for_roots(paths_to_open.as_slice());
+            // Prefer restoring by the managed workspace's stable id so layout
+            // survives membership changes; fall back to path-set matching.
+            let managed_workspace_id = cx.update(|cx| {
+                WorkspaceManager::global(cx)
+                    .workspace_id_for_paths(&PathList::new(paths_to_open.as_slice()))
+                    .log_err()
+                    .flatten()
+            });
+            let serialized_workspace = managed_workspace_id
+                .and_then(|workspace_id| db.workspace_for_uuid(workspace_id.as_uuid()))
+                .or_else(|| db.workspace_for_roots(paths_to_open.as_slice()));
 
             if let Some(paths) = serialized_workspace.as_ref().map(|ws| &ws.paths) {
                 paths_to_open = paths.ordered_paths().cloned().collect();
@@ -2303,6 +2329,7 @@ impl Workspace {
                             );
 
                             workspace.centered_layout = centered_layout;
+                            workspace.set_managed_workspace_id(managed_workspace_id);
 
                             // Call init callback to add items before window renders
                             if let Some(init) = init {
@@ -2366,6 +2393,7 @@ impl Workspace {
                                     cx,
                                 );
                                 workspace.centered_layout = centered_layout;
+                                workspace.set_managed_workspace_id(managed_workspace_id);
 
                                 // Call init callback to add items before window renders
                                 if let Some(init) = init {
@@ -4244,9 +4272,9 @@ impl Workspace {
             .map(|wt| wt.read(cx).abs_path().as_ref().to_path_buf())
     }
 
-    pub fn add_folder_to_project(
+    pub fn add_folder_to_workspace(
         &mut self,
-        _: &AddFolderToProject,
+        _: &AddFolderToWorkspace,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -7528,6 +7556,16 @@ impl Workspace {
         self.database_id
     }
 
+    /// The managed-workspace identity of this workspace, if it was opened
+    /// through the WorkspaceManager.
+    pub fn managed_workspace_id(&self) -> Option<ManagedWorkspaceId> {
+        self.managed_workspace_id
+    }
+
+    pub fn set_managed_workspace_id(&mut self, id: Option<ManagedWorkspaceId>) {
+        self.managed_workspace_id = id;
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_database_id(&mut self, id: WorkspaceId) {
         self.database_id = Some(id);
@@ -7766,8 +7804,10 @@ impl Workspace {
                 };
 
                 let db = WorkspaceDb::global(cx);
+                let managed_workspace_uuid = self.managed_workspace_id().map(|id| id.as_uuid());
                 cx.background_spawn(async move {
-                    db.save_workspace(serialized_workspace).await;
+                    db.save_workspace_with_uuid(serialized_workspace, managed_workspace_uuid)
+                        .await;
                 })
             }
             WorkspaceLocation::DetachFromSession => {
@@ -8101,7 +8141,7 @@ impl Workspace {
             .on_action(cx.listener(Self::close_item_in_all_panes))
             .on_action(cx.listener(Self::save_all))
             .on_action(cx.listener(Self::send_keystrokes))
-            .on_action(cx.listener(Self::add_folder_to_project))
+            .on_action(cx.listener(Self::add_folder_to_workspace))
             .on_action(cx.listener(Self::follow_next_collaborator))
             .on_action(cx.listener(Self::activate_pane_at_index))
             .on_action(cx.listener(Self::move_item_to_pane_at_index))
@@ -10930,6 +10970,10 @@ pub struct OpenOptions {
     pub open_mode: OpenMode,
     pub env: Option<HashMap<String, String>>,
     pub open_in_dev_container: bool,
+    /// Skip the managed-workspace disambiguation ask. Set on opens that were
+    /// already resolved through the WorkspaceManager (the ask's own buttons,
+    /// the workspace switcher, pickers), so they never re-prompt.
+    pub skip_managed_workspace_ask: bool,
 }
 
 impl Default for OpenOptions {
@@ -10944,6 +10988,7 @@ impl Default for OpenOptions {
             open_mode: OpenMode::default(),
             env: None,
             open_in_dev_container: false,
+            skip_managed_workspace_ask: false,
         }
     }
 }
@@ -11081,6 +11126,138 @@ pub fn open_workspace_by_id(
 }
 
 #[allow(clippy::type_complexity)]
+/// Disambiguation prompt shown when opening a bare folder that is already a
+/// member of one or more managed workspaces.
+struct ManagedWorkspaceAsk {
+    folder: PathBuf,
+    candidates: Vec<AskCandidate>,
+    app_state: Arc<AppState>,
+    focus_handle: FocusHandle,
+}
+
+impl ManagedWorkspaceAsk {
+    fn new(
+        folder: PathBuf,
+        candidates: Vec<AskCandidate>,
+        app_state: Arc<AppState>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            folder,
+            candidates,
+            app_state,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    fn open(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let app_state = self.app_state.clone();
+        cx.defer(move |cx| {
+            let options = OpenOptions {
+                skip_managed_workspace_ask: true,
+                ..Default::default()
+            };
+            open_paths(&paths, app_state, options, cx).detach_and_log_err(cx);
+        });
+        cx.emit(DismissEvent);
+    }
+}
+
+impl ModalView for ManagedWorkspaceAsk {}
+
+impl EventEmitter<DismissEvent> for ManagedWorkspaceAsk {}
+
+impl Focusable for ManagedWorkspaceAsk {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for ManagedWorkspaceAsk {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let folder = self.folder.clone();
+        let folder_name = folder
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| folder.display().to_string());
+        let candidates = self.candidates.clone();
+        v_flex()
+            .key_context("ManagedWorkspaceAsk")
+            .elevation_3(cx)
+            .w(rems(34.))
+            .p_3()
+            .gap_2()
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|_this, _: &menu::Cancel, _window, cx| {
+                cx.emit(DismissEvent);
+            }))
+            .child(
+                ui::Label::new(format!("\"{folder_name}\" is already part of a workspace."))
+                    .truncate(),
+            )
+            .children(candidates.iter().map(|candidate| {
+                let workspace_id = candidate.workspace_id;
+                let name = candidate.name.clone();
+                let project_count = candidate.project_count;
+                ui::Button::new(
+                    format!("open-workspace-{}", workspace_id.to_key_string()),
+                    format!("Open workspace \"{name}\" ({project_count} projects)"),
+                )
+                .full_width()
+                .truncate(true)
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    let Some(paths) = WorkspaceManager::global(cx).open(workspace_id).log_err()
+                    else {
+                        return;
+                    };
+                    let app_state = this.app_state.clone();
+                    open_managed_workspace_paths(&paths, workspace_id, app_state, cx);
+                    cx.emit(DismissEvent);
+                }))
+            }))
+            .child(
+                ui::Button::new("open-folder-alone", "Open just this folder")
+                    .full_width()
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.open(vec![folder.clone()], cx);
+                    })),
+            )
+    }
+}
+
+/// Opens a managed workspace's project paths in a new window and tags the
+/// resulting workspace with its managed identity. This is the shared code path
+/// behind every "open workspace" action: new window, no re-ask, and the live
+/// `Workspace` carries its `ManagedWorkspaceId`.
+pub fn open_managed_workspace_paths(
+    paths: &[PathBuf],
+    workspace_id: ManagedWorkspaceId,
+    app_state: Arc<AppState>,
+    cx: &mut App,
+) {
+    let paths = paths.to_vec();
+    let requesting_window = cx
+        .active_window()
+        .and_then(|window| window.downcast::<MultiWorkspace>());
+    let options = OpenOptions {
+        requesting_window,
+        open_mode: OpenMode::Activate,
+        workspace_matching: WorkspaceMatching::None,
+        skip_managed_workspace_ask: true,
+        ..Default::default()
+    };
+    let open_task = open_paths(&paths, app_state, options, cx);
+    cx.spawn(async move |cx| {
+        if let Ok(open_result) = open_task.await {
+            open_result.workspace.update(cx, |workspace, cx| {
+                workspace.set_managed_workspace_id(Some(workspace_id));
+                cx.notify();
+            });
+        }
+    })
+    .detach();
+}
+
 pub fn open_paths(
     abs_paths: &[PathBuf],
     app_state: Arc<AppState>,
@@ -11094,6 +11271,59 @@ pub fn open_paths(
         .find_map(|p| util::paths::WslPath::from_path(p));
 
     cx.spawn(async move |cx| {
+        // Open-folder ask: a single directory that is a member of a managed
+        // workspace prompts for disambiguation before opening.
+        if !open_options.skip_managed_workspace_ask && abs_paths.len() == 1 {
+            let is_dir = app_state
+                .fs
+                .metadata(&abs_paths[0])
+                .await
+                .log_err()
+                .flatten()
+                .map(|metadata| metadata.is_dir)
+                .unwrap_or(false);
+            if is_dir {
+                let folder = abs_paths[0].clone();
+                let candidates = cx.update(|cx| {
+                    WorkspaceManager::global(cx)
+                        .ask_candidates(&folder)
+                        .log_err()
+                        .unwrap_or_default()
+                });
+                if !candidates.is_empty() {
+                    let shown = cx.update(|cx| {
+                        let Some(window) = cx
+                            .active_window()
+                            .and_then(|window| window.downcast::<MultiWorkspace>())
+                        else {
+                            return false;
+                        };
+                        window
+                            .update(cx, |multi_workspace, window, cx| {
+                                let workspace = multi_workspace.workspace().clone();
+                                workspace.update(cx, |workspace, cx| {
+                                    workspace.toggle_modal(window, cx, |_window, cx| {
+                                        ManagedWorkspaceAsk::new(
+                                            folder.clone(),
+                                            candidates.clone(),
+                                            app_state.clone(),
+                                            cx,
+                                        )
+                                    });
+                                });
+                            })
+                            .log_err();
+                        true
+                    });
+                    if shown {
+                        return Err(anyhow::anyhow!(
+                            "open deferred to managed-workspace ask"
+                        ));
+                    }
+                }
+            }
+        }
+
         let (mut existing, mut open_visible) = find_existing_workspace(
             &abs_paths,
             &open_options,

@@ -1308,7 +1308,7 @@
     "use_key_equivalents": true,
     "bindings": {
       "cmd-k": "recent_projects::ToggleActionsMenu",
-      "cmd-shift-a": "workspace::AddFolderToProject",
+      "cmd-shift-a": "workspace::AddFolderToWorkspace",
       "shift-backspace": "recent_projects::RemoveSelected",
       "cmd-shift-enter": "recent_projects::AddToWorkspace",
     },

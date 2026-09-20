@@ -1266,7 +1266,7 @@
     "bindings": {
       "ctrl-k": "recent_projects::ToggleActionsMenu",
       "ctrl-k ctrl-o": "workspace::Open",
-      "ctrl-shift-a": "workspace::AddFolderToProject",
+      "ctrl-shift-a": "workspace::AddFolderToWorkspace",
       "shift-backspace": "recent_projects::RemoveSelected",
       "ctrl-shift-enter": "recent_projects::AddToWorkspace",
     },
