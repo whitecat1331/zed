@@ -3744,6 +3744,15 @@ impl TerminalHandle for AcpTerminalHandle {
             .terminal
             .read_with(cx, |term, _cx| term.was_stopped_by_user()))
     }
+
+    fn mark_failure_detected(&self, reason: String, cx: &AsyncApp) -> Result<()> {
+        cx.update(|cx| {
+            self.terminal.update(cx, |terminal, _cx| {
+                terminal.mark_failure_detected(reason);
+            });
+        });
+        Ok(())
+    }
 }
 
 /// Build the catalog the model sees in its system prompt: filter out hidden

@@ -1085,6 +1085,10 @@ async fn run_terminal_tool(
                                 };
                                 if kill {
                                     failure_detected = true;
+                                    let reason = format!("a sustained stream of {detected_error_lines} error-signature lines was detected");
+                                    terminal
+                                        .mark_failure_detected(reason, cx)
+                                        .map_err(|e| e.to_string())?;
                                     terminal.kill(cx).map_err(|e| e.to_string())?;
                                     wait_for_exit.await;
                                     break 'wait;
