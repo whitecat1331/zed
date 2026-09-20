@@ -1,7 +1,9 @@
 use crate::{
-    NewFile, Open, OpenMode, PathList, RecentWorkspace, SerializedWorkspaceLocation,
-    ToggleWorkspaceSidebar, Workspace, WorkspaceSettings,
+    ManagedWorkspace, NewFile, Open, OpenMode, PathList, RecentWorkspace,
+    SerializedWorkspaceLocation, ToggleWorkspaceSidebar, Workspace, WorkspaceManager,
+    WorkspaceSettings,
     item::{Item, ItemEvent},
+    open_managed_workspace_paths,
     persistence::WorkspaceDb,
 };
 use agent_settings::AgentSettings;
@@ -20,12 +22,20 @@ use ui::{ButtonLike, Divider, DividerColor, KeyBinding, Vector, VectorName, prel
 use util::ResultExt;
 use zed_actions::{
     Extensions, OpenKeymap, OpenOnboarding, OpenSettings, assistant::ToggleFocus, command_palette,
+    workspace::NewManagedWorkspace,
 };
 
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
 #[action(namespace = welcome)]
 #[serde(transparent)]
 pub struct OpenRecentProject {
+    pub index: usize,
+}
+
+#[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
+#[action(namespace = welcome)]
+#[serde(transparent)]
+pub struct OpenManagedWorkspace {
     pub index: usize,
 }
 
@@ -242,6 +252,7 @@ pub struct WelcomePage {
     focus_handle: FocusHandle,
     fallback_to_recent_projects: bool,
     recent_workspaces: Option<Vec<RecentWorkspace>>,
+    managed_workspaces: Vec<ManagedWorkspace>,
 }
 
 impl WelcomePage {
@@ -254,6 +265,11 @@ impl WelcomePage {
         let focus_handle = cx.focus_handle();
         cx.on_focus(&focus_handle, window, |_, _, cx| cx.notify())
             .detach();
+
+        let managed_workspaces = WorkspaceManager::global(cx)
+            .all()
+            .log_err()
+            .unwrap_or_default();
 
         if fallback_to_recent_projects {
             let fs = workspace
@@ -282,6 +298,7 @@ impl WelcomePage {
             focus_handle,
             fallback_to_recent_projects,
             recent_workspaces: None,
+            managed_workspaces,
         }
     }
 
@@ -324,6 +341,28 @@ impl WelcomePage {
                 }
             }
         }
+    }
+
+    fn open_managed_workspace(
+        &mut self,
+        action: &OpenManagedWorkspace,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.managed_workspaces.get(action.index) else {
+            return;
+        };
+        let workspace_id = workspace.workspace_id;
+        let Some(paths) = WorkspaceManager::global(cx).open(workspace_id).log_err() else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let app_state = workspace.read(cx).app_state().clone();
+        cx.defer(move |cx| {
+            open_managed_workspace_paths(&paths, workspace_id, app_state, cx);
+        });
     }
 
     fn render_agent_card(&self, tab_index: usize, cx: &mut Context<Self>) -> impl IntoElement {
@@ -373,6 +412,34 @@ impl WelcomePage {
                         focus.dispatch_action(&ToggleFocus, window, cx);
                     }),
             )
+    }
+
+    fn render_managed_workspace_section(&self, tab_offset: usize) -> impl IntoElement {
+        let workspace_count = self.managed_workspaces.len();
+        v_flex()
+            .w_full()
+            .child(SectionHeader::new("Managed Workspaces"))
+            .children(
+                self.managed_workspaces
+                    .iter()
+                    .enumerate()
+                    .map(|(index, workspace)| {
+                        SectionButton::new(
+                            workspace.name.clone(),
+                            IconName::Folder,
+                            &OpenManagedWorkspace { index },
+                            tab_offset + index,
+                            self.focus_handle.clone(),
+                        )
+                    }),
+            )
+            .child(SectionButton::new(
+                "New Workspace…",
+                IconName::Plus,
+                &NewManagedWorkspace,
+                tab_offset + workspace_count,
+                self.focus_handle.clone(),
+            ))
     }
 
     fn render_recent_project_section(
@@ -438,6 +505,8 @@ impl Render for WelcomePage {
 
         let showing_recent_projects =
             self.fallback_to_recent_projects && !recent_projects.is_empty();
+        let showing_managed_workspaces = !self.managed_workspaces.is_empty();
+        let managed_tab_offset = first_section_entries + second_section.entries.len() + 5;
         let second_section = if showing_recent_projects {
             self.render_recent_project_section(recent_projects)
                 .into_any_element()
@@ -459,6 +528,7 @@ impl Render for WelcomePage {
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::open_recent_project))
+            .on_action(cx.listener(Self::open_managed_workspace))
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .justify_center()
@@ -489,6 +559,9 @@ impl Render for WelcomePage {
                     )
                     .child(first_section.render(Default::default(), &self.focus_handle))
                     .child(second_section)
+                    .when(showing_managed_workspaces, |this| {
+                        this.child(self.render_managed_workspace_section(managed_tab_offset))
+                    })
                     .when(ai_enabled && !showing_recent_projects, |this| {
                         let agent_tab_index = next_tab_index;
                         next_tab_index += 1;

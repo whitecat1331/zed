@@ -72,7 +72,8 @@ use util::{
 };
 use workspace::{
     DraggedSelection, OpenInTerminal, OpenMode, OpenOptions, OpenVisible, PreviewTabsSettings,
-    SelectedEntry, SplitDirection, Workspace, WorkspaceSettings, copy_file_permalink,
+    SelectedEntry, SplitDirection, Workspace, WorkspaceManager, WorkspaceSettings,
+    copy_file_permalink,
     dock::{DockPosition, Panel, PanelEvent},
     focus_follows_mouse::FocusFollowsMouse as _,
     notifications::{DetachAndPromptErr, NotifyResultExt, NotifyTaskExt},
@@ -370,8 +371,10 @@ actions!(
         Duplicate,
         /// Reveals the selected item in the system file manager.
         RevealInFileManager,
-        /// Removes the selected folder from the project.
-        RemoveFromProject,
+        /// Removes the selected root folder from the current managed workspace.
+        RemoveFromWorkspace,
+        /// Adds a root folder to the current managed workspace.
+        AddFolderToWorkspace,
         /// Cuts the selected file or directory.
         Cut,
         /// Pastes the previously cut or copied item.
@@ -1238,10 +1241,14 @@ impl ProjectPanel {
                             .when(!is_collab && is_root, |menu| {
                                 menu.separator()
                                     .action(
-                                        "Add Folders to Project…",
-                                        Box::new(workspace::AddFolderToProject),
+                                        "Open Workspace…",
+                                        Box::new(zed_actions::workspace::OpenManagedWorkspace),
                                     )
-                                    .action("Remove from Project", Box::new(RemoveFromProject))
+                                    .action(
+                                        "Add Folder to Workspace…",
+                                        Box::new(AddFolderToWorkspace),
+                                    )
+                                    .action("Remove from Workspace", Box::new(RemoveFromWorkspace))
                             })
                             .when(is_dir && !is_root, |menu| {
                                 menu.separator()
@@ -3881,17 +3888,122 @@ impl ProjectPanel {
         }
     }
 
-    fn remove_from_project(
+    fn remove_from_workspace(
         &mut self,
-        _: &RemoveFromProject,
+        _: &RemoveFromWorkspace,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let managed_workspace_id = self
+            .workspace
+            .read_with(cx, |workspace, _cx| workspace.managed_workspace_id())
+            .ok()
+            .flatten();
         for entry in self.effective_entries().iter() {
             let worktree_id = entry.worktree_id;
+            if let Some(managed_workspace_id) = managed_workspace_id {
+                let path = self.project.update(cx, |project, cx| {
+                    project
+                        .worktree_for_id(worktree_id, cx)
+                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                });
+                if let Some(path) = path {
+                    let manager = WorkspaceManager::global(cx);
+                    cx.spawn(async move |_this, _cx| {
+                        manager
+                            .remove_project(managed_workspace_id, path)
+                            .await
+                            .log_err();
+                    })
+                    .detach();
+                }
+            }
             self.project
                 .update(cx, |project, cx| project.remove_worktree(worktree_id, cx));
         }
+    }
+
+    fn paths_equal(a: &Path, b: &Path) -> bool {
+        let a = a.to_string_lossy();
+        let b = b.to_string_lossy();
+        if cfg!(target_os = "windows") {
+            a.eq_ignore_ascii_case(b.as_ref())
+        } else {
+            a == b
+        }
+    }
+
+    fn add_folder_to_workspace(
+        &mut self,
+        _: &AddFolderToWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(managed_workspace_id) = self
+            .workspace
+            .read_with(cx, |workspace, _cx| workspace.managed_workspace_id())
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        let manager = WorkspaceManager::global(cx);
+        let workspace = self.workspace.clone();
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: true,
+            prompt: None,
+        });
+        cx.spawn_in(window, async move |_this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return anyhow::Ok(());
+            };
+            // A folder that is already a member of this workspace is a no-op:
+            // skip it so re-adding it doesn't re-open and focus the existing
+            // worktree.
+            let existing_paths = manager
+                .project_paths(managed_workspace_id)
+                .log_err()
+                .unwrap_or_default();
+            let new_paths: Vec<PathBuf> = paths
+                .into_iter()
+                .filter(|path| {
+                    !existing_paths
+                        .iter()
+                        .any(|existing| Self::paths_equal(existing.as_path(), path.as_path()))
+                })
+                .collect();
+            if new_paths.is_empty() {
+                return anyhow::Ok(());
+            }
+            for path in &new_paths {
+                manager
+                    .add_project(managed_workspace_id, path.clone())
+                    .await
+                    .log_err();
+            }
+            if let Some(workspace) = workspace.upgrade() {
+                let task = workspace.update_in(cx, |workspace, window, cx| {
+                    workspace.open_paths(
+                        new_paths,
+                        OpenOptions {
+                            visible: Some(OpenVisible::All),
+                            skip_managed_workspace_ask: true,
+                            ..Default::default()
+                        },
+                        None,
+                        window,
+                        cx,
+                    )
+                })?;
+                for result in task.await.into_iter().flatten() {
+                    result.log_err();
+                }
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn file_abs_paths_to_diff(&self, cx: &Context<Self>) -> Option<(PathBuf, PathBuf)> {
@@ -7282,7 +7394,8 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::new_search_in_directory))
                 .on_action(cx.listener(Self::unfold_directory))
                 .on_action(cx.listener(Self::fold_directory))
-                .on_action(cx.listener(Self::remove_from_project))
+                .on_action(cx.listener(Self::remove_from_workspace))
+                .on_action(cx.listener(Self::add_folder_to_workspace))
                 .on_action(cx.listener(Self::compare_marked_files))
                 .when(!project.is_read_only(cx), |el| {
                     el.on_action(cx.listener(Self::new_file))

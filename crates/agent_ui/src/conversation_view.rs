@@ -98,8 +98,7 @@ use crate::{
     ScrollOutputLineDown, ScrollOutputLineUp, ScrollOutputPageDown, ScrollOutputPageUp,
     ScrollOutputToBottom, ScrollOutputToFocusedMessage, ScrollOutputToNextMessage,
     ScrollOutputToPreviousMessage, ScrollOutputToTop, SendImmediately, SendNextQueuedMessage,
-    ToggleFastMode,
-    ToggleProfileSelector, ToggleSteerFirstQueuedMessage, ToggleThinkingEffortMenu,
+    ToggleFastMode, ToggleProfileSelector, ToggleSteerFirstQueuedMessage, ToggleThinkingEffortMenu,
     ToggleThinkingMode, UndoLastReject,
 };
 
@@ -4715,6 +4714,7 @@ pub(crate) mod tests {
                         created_at: Some(Utc::now()),
                         interacted_at: None,
                         worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
+                        workspace_id: None,
                         remote_connection: None,
                         archived: false,
                     },

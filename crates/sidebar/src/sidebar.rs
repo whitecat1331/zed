@@ -68,7 +68,8 @@ use workspace::{
     CloseWindow, FocusWorkspaceSidebar, MoveProjectDown, MoveProjectUp, MultiWorkspace,
     MultiWorkspaceEvent, NextProject, NextThread, Open, OpenMode, PreviousProject, PreviousThread,
     ProjectGroupKey, RemovalIntent, SaveIntent, Sidebar as WorkspaceSidebar, SidebarSide, Toast,
-    ToggleWorkspaceSidebar, Workspace, notifications::NotificationId, sidebar_side_context_menu,
+    ToggleWorkspaceSidebar, Workspace, WorkspaceManager, notifications::NotificationId,
+    sidebar_side_context_menu,
 };
 
 use git_ui_core::worktree_service::{RemoteBranchName, worktree_create_targets};
@@ -1375,6 +1376,15 @@ impl Sidebar {
         let mw = multi_workspace.read(cx);
         let workspaces: Vec<_> = mw.workspaces().cloned().collect();
         let active_workspace = Some(mw.workspace().clone());
+        let active_managed_workspace_id = active_workspace.as_ref().and_then(|workspace| {
+            workspace.read(cx).managed_workspace_id().or_else(|| {
+                let paths = workspace_path_list(workspace, cx);
+                WorkspaceManager::global(cx)
+                    .workspace_id_for_paths(&paths)
+                    .log_err()
+                    .flatten()
+            })
+        });
 
         let agent_server_store = workspaces
             .first()
@@ -1468,6 +1478,17 @@ impl Sidebar {
         for group in &groups {
             let group_key = &group.key;
             let group_workspaces = &group.workspaces;
+
+            // When the active workspace is a managed workspace, the sidebar shows
+            // only that workspace's group so its threads are not mixed with the
+            // other projects retained in the window's MultiWorkspace.
+            if active_managed_workspace_id.is_some()
+                && !active_workspace
+                    .as_ref()
+                    .is_some_and(|active| group_workspaces.contains(active))
+            {
+                continue;
+            }
 
             let workspace_by_path_list: HashMap<PathList, &Entity<Workspace>> = group_workspaces
                 .iter()
@@ -1613,6 +1634,30 @@ impl Sidebar {
                             diff_stats: DiffStats::default(),
                         })
                     };
+
+                // For managed workspaces, group by stable identity first so a
+                // thread whose stored paths no longer match the group's current
+                // paths (after add/remove-folder) still lands under its own
+                // workspace. The path-based lookups below then backfill legacy
+                // threads and closed (non-managed) workspaces.
+                for ws in group_workspaces {
+                    let Some(workspace_id) = ws.read(cx).managed_workspace_id() else {
+                        continue;
+                    };
+                    for row in thread_store
+                        .read(cx)
+                        .entries_for_workspace(workspace_id)
+                        .cloned()
+                    {
+                        if !seen_thread_ids.insert(row.thread_id) {
+                            continue;
+                        }
+                        threads.push(make_thread_entry(
+                            row,
+                            ThreadEntryWorkspace::Open(ws.clone()),
+                        ));
+                    }
+                }
 
                 // Main code path: one query per group via main_worktree_paths.
                 // The main_worktree_paths column is set on all new threads and
