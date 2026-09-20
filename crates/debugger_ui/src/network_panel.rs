@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_settings::AgentSettings;
-use browser_tools::{AgentBrowserApi, RequestFilter, ThrottlePreset, shared_browser_api};
+use browser_tools::{AgentBrowserApi, DrivenBy, RequestFilter, ThrottlePreset, shared_browser_api};
 use feature_flags::{FeatureFlag, FeatureFlagAppExt as _, PresenceFlag, register_feature_flag};
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment,
@@ -303,6 +303,7 @@ impl NetworkPanel {
         };
         let browser_api = self.browser_api.clone();
         cx.spawn(async move |this, cx| {
+            let _ = browser_api.set_driven_by(session_id, DrivenBy::Human).await;
             let _ = browser_api.clear_requests(session_id).await;
             if this
                 .update(cx, |panel, cx| {
@@ -325,6 +326,7 @@ impl NetworkPanel {
         let next = next_throttle_preset(&self.control);
         let browser_api = self.browser_api.clone();
         cx.spawn(async move |this, cx| {
+            let _ = browser_api.set_driven_by(session_id, DrivenBy::Human).await;
             let conditions = next.conditions();
             let _ = browser_api.set_throttle(session_id, None, conditions).await;
             this.update(cx, |_, cx| cx.notify()).ok();
@@ -343,6 +345,7 @@ impl NetworkPanel {
             .unwrap_or(false);
         let browser_api = self.browser_api.clone();
         cx.spawn(async move |this, cx| {
+            let _ = browser_api.set_driven_by(session_id, DrivenBy::Human).await;
             let _ = browser_api.set_offline(session_id, None, !offline).await;
             this.update(cx, |_, cx| cx.notify()).ok();
         })
@@ -360,6 +363,7 @@ impl NetworkPanel {
         let browser_api = self.browser_api.clone();
         let url = url.trim().to_string();
         cx.spawn(async move |this, cx| {
+            let _ = browser_api.set_driven_by(session_id, DrivenBy::Human).await;
             let _ = browser_api
                 .block_urls(session_id, None, &[url.clone()])
                 .await;
@@ -507,7 +511,7 @@ impl NetworkPanel {
                 .items_center()
                 .justify_center()
                 .child(Label::new(
-                    "No browser session — start one with the browser tool",
+                    "No browser session in this window — start one with the browser tool",
                 ))
                 .into_any_element();
         }
@@ -625,7 +629,7 @@ impl Panel for NetworkPanel {
     }
 
     fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
-        DockPosition::Right
+        DockPosition::Bottom
     }
 
     fn position_is_valid(&self, _: DockPosition) -> bool {

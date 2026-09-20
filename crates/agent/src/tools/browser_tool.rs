@@ -1,7 +1,7 @@
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::builtin_profiles;
 use anyhow::{Context as _, Result};
-use browser_tools::AgentBrowserApi;
+use browser_tools::{AgentBrowserApi, DrivenBy};
 use gpui::{App, AppContext as _, SharedString, Task, WeakEntity};
 use language_model::{LanguageModelImage, LanguageModelImageExt, LanguageModelToolResultContent};
 use schemars::JsonSchema;
@@ -234,6 +234,7 @@ impl BrowserTool {
                 )
                 .await?;
                 let session_id = self.api.start_session(&url, headless).await?;
+                let _ = self.api.set_driven_by(session_id, DrivenBy::Agent).await;
                 Ok(success(
                     operation,
                     "started browser session",
@@ -468,11 +469,18 @@ impl AgentTool for BrowserTool {
                     error: format!("Failed to receive browser tool input: {error}"),
                 })?;
             let operation = operation_name(&input).to_string();
+            let session_id = input.session_id;
+            let api = self.api.clone();
             match self
                 .run_operation(input, operation.clone(), event_stream, cx)
                 .await
             {
-                Ok(output) => Ok(output),
+                Ok(output) => {
+                    if let Some(session_id) = session_id {
+                        let _ = api.set_driven_by(session_id, DrivenBy::Agent).await;
+                    }
+                    Ok(output)
+                }
                 Err(error) => Err(BrowserToolOutput::Error {
                     operation: Some(operation),
                     error: error.to_string(),

@@ -1,7 +1,7 @@
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::builtin_profiles;
 use anyhow::{Context as _, Result};
-use browser_tools::{AgentBrowserApi, InterceptionPattern, RequestFilter, ThrottleConditions, ThrottlePreset};
+use browser_tools::{AgentBrowserApi, DrivenBy, InterceptionPattern, RequestFilter, ThrottleConditions, ThrottlePreset};
 use gpui::{App, SharedString, Task, WeakEntity};
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
@@ -829,11 +829,18 @@ impl AgentTool for NetworkTool {
                     error: format!("Failed to receive network tool input: {error}"),
                 })?;
             let operation = operation_name(&input).to_string();
+            let session_id = input.session_id;
+            let api = self.api.clone();
             match self
                 .run_operation(input, operation.clone(), event_stream, cx)
                 .await
             {
-                Ok(output) => Ok(output),
+                Ok(output) => {
+                    if let Some(session_id) = session_id {
+                        let _ = api.set_driven_by(session_id, DrivenBy::Agent).await;
+                    }
+                    Ok(output)
+                }
                 Err(error) => Err(NetworkToolOutput::Error {
                     operation: Some(operation),
                     error: error.to_string(),
