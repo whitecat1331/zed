@@ -2329,6 +2329,7 @@ impl Workspace {
                             );
 
                             workspace.centered_layout = centered_layout;
+                            workspace.set_managed_workspace_id(managed_workspace_id);
 
                             // Call init callback to add items before window renders
                             if let Some(init) = init {
@@ -2392,6 +2393,7 @@ impl Workspace {
                                     cx,
                                 );
                                 workspace.centered_layout = centered_layout;
+                                workspace.set_managed_workspace_id(managed_workspace_id);
 
                                 // Call init callback to add items before window renders
                                 if let Some(init) = init {
