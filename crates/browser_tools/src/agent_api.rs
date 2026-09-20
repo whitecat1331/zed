@@ -1,5 +1,5 @@
 use crate::cdp::CdpClient;
-use crate::network::{InterceptionConfig, InterceptionPattern, NetworkControlState, NetworkStore, ThrottleConditions};
+use crate::network::{InterceptionConfig, InterceptionPattern, NetworkControlState, NetworkRequest, NetworkStore, RequestFilter, ThrottleConditions};
 use crate::session::{BrowserSession, BrowserTarget};
 use anyhow::{Context, Result, anyhow};
 use futures::{AsyncBufReadExt, StreamExt};
@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The project-side browser automation surface, mirroring `AgentDebuggerApi`.
 ///
@@ -345,19 +345,267 @@ impl AgentBrowserApi {
             .get_mut(&session_id)
             .context("unknown browser session")?;
         let target_session_id = resolve_target_session_id(session, target_id)?;
+        sync_network_store(session);
         let events = session.client.recent_events();
-
-        // Feed the typed store from every matching event so it reflects the
-        // full capture, not just the bounded slice returned to the caller.
-        for event in events.iter().filter(|event| {
-            is_network_event(event) && session_id_matches(event, Some(&target_session_id))
-        }) {
-            session.network_store.ingest(event);
-        }
-
         Ok(json!({
             "network": filter_events(&events, is_network_event, Some(&target_session_id), 100),
         }))
+    }
+
+    /// List requests from the typed store, filtered and paginated.
+    pub async fn list_requests(
+        &self,
+        session_id: u64,
+        filter: &RequestFilter,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        sync_network_store(session);
+        let total = session
+            .network_store
+            .requests()
+            .filter(|request| filter.matches(request))
+            .count();
+        let requests = session
+            .network_store
+            .requests()
+            .filter(|request| filter.matches(request))
+            .skip(offset)
+            .take(limit)
+            .map(NetworkRequest::to_json)
+            .collect::<Vec<_>>();
+        let next_offset = if offset + limit < total {
+            Some(offset + limit)
+        } else {
+            None
+        };
+        Ok(json!({
+            "requests": requests,
+            "total": total,
+            "offset": offset,
+            "next_offset": next_offset,
+        }))
+    }
+
+    /// Fetch a single request by CDP `request_id`.
+    pub async fn get_request(&self, session_id: u64, request_id: &str) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        sync_network_store(session);
+        let request = session
+            .network_store
+            .request(request_id)
+            .context("unknown request_id")?;
+        Ok(request.to_json())
+    }
+
+    /// Fetch a response body slice. Text bodies are sliced by byte offset;
+    /// binary bodies (images, fonts, media) are returned as metadata only.
+    pub async fn get_response_body(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        request_id: &str,
+        offset: usize,
+        max_length: usize,
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let result = session
+            .client
+            .send_command_with_session(
+                Some(&target_session_id),
+                "Network.getResponseBody",
+                json!({ "requestId": request_id }),
+            )
+            .await?;
+        let base64_encoded = result
+            .get("base64Encoded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mime_type = session
+            .network_store
+            .request(request_id)
+            .and_then(|request| request.mime_type.clone());
+        if base64_encoded {
+            let body_length = result
+                .get("body")
+                .and_then(Value::as_str)
+                .map(str::len)
+                .unwrap_or(0);
+            let size = session
+                .network_store
+                .request(request_id)
+                .and_then(|request| request.encoded_data_length)
+                .unwrap_or(body_length as f64);
+            return Ok(json!({
+                "request_id": request_id,
+                "binary": true,
+                "mime_type": mime_type,
+                "size": size,
+            }));
+        }
+        let body = result.get("body").and_then(Value::as_str).unwrap_or("");
+        let bytes = body.as_bytes();
+        let start = offset.min(bytes.len());
+        let end = offset.saturating_add(max_length).min(bytes.len());
+        let slice = &bytes[start..end];
+        let truncated = end < bytes.len();
+        Ok(json!({
+            "request_id": request_id,
+            "binary": false,
+            "mime_type": mime_type,
+            "body_length": bytes.len(),
+            "body": String::from_utf8_lossy(slice),
+            "offset": offset,
+            "truncated": truncated,
+            "next_offset": if truncated { Some(end) } else { None },
+        }))
+    }
+
+    /// Fetch a request's POST data, preferring the captured store and falling
+    /// back to a live `Network.getRequestPostData` call.
+    pub async fn get_request_post_data(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        request_id: &str,
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        sync_network_store(session);
+        if let Some(post_data) = session
+            .network_store
+            .request(request_id)
+            .and_then(|request| request.post_data.clone())
+        {
+            return Ok(json!({ "request_id": request_id, "post_data": post_data }));
+        }
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let result = session
+            .client
+            .send_command_with_session(
+                Some(&target_session_id),
+                "Network.getRequestPostData",
+                json!({ "requestId": request_id }),
+            )
+            .await?;
+        Ok(json!({ "request_id": request_id, "post_data": result.get("postData") }))
+    }
+
+    /// Fetch the browser's cookies, optionally scoped to a URL list.
+    pub async fn get_cookies(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        urls: &[String],
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let mut params = json!({});
+        if !urls.is_empty() {
+            params["urls"] = json!(urls);
+        }
+        session
+            .client
+            .send_command_with_session(Some(&target_session_id), "Network.getCookies", params)
+            .await
+    }
+
+    /// Fetch WebSocket frames for a connection, keyed by its `request_id`.
+    pub async fn get_websocket_frames(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        request_id: &str,
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        session
+            .client
+            .send_command_with_session(
+                Some(&target_session_id),
+                "Network.getWebSocketFrames",
+                json!({ "requestId": request_id }),
+            )
+            .await
+    }
+
+    /// Wait until no requests have been in flight for `idle_for_ms`, bounded by
+    /// `timeout_ms`. Returns whether the session reached network idle.
+    pub async fn wait_for_network_idle(
+        &self,
+        session_id: u64,
+        idle_for_ms: u64,
+        timeout_ms: u64,
+    ) -> Result<Value> {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let mut idle_since: Option<Instant> = None;
+        loop {
+            let pending = {
+                let mut sessions = self.sessions.lock().await;
+                let session = sessions
+                    .get_mut(&session_id)
+                    .context("unknown browser session")?;
+                sync_network_store(session);
+                session
+                    .network_store
+                    .requests()
+                    .filter(|request| !request.completed)
+                    .map(|request| request.request_id.clone())
+                    .collect::<Vec<_>>()
+            };
+            if pending.is_empty() {
+                let now = Instant::now();
+                let since = *idle_since.get_or_insert(now);
+                if now.duration_since(since) >= Duration::from_millis(idle_for_ms) {
+                    return Ok(json!({ "idle": true, "pending": [] }));
+                }
+            } else {
+                idle_since = None;
+            }
+            if Instant::now() >= deadline {
+                return Ok(json!({ "idle": false, "pending": pending }));
+            }
+            self.background_executor.timer(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Export the session's typed store as a HAR object.
+    pub async fn export_har(&self, session_id: u64) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        sync_network_store(session);
+        Ok(crate::har::export_har(&session.network_store))
+    }
+
+    /// Replace the session's typed store with a parsed HAR object.
+    pub async fn import_har(&self, session_id: u64, har: &Value) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        session.network_store = crate::har::import_har(har)?;
+        Ok(json!({ "imported": session.network_store.len() }))
     }
 
     pub async fn set_throttle(
@@ -476,6 +724,67 @@ impl AgentBrowserApi {
             )
             .await?;
         session.control.blocked_urls = urls.to_vec();
+        Ok(result)
+    }
+
+    /// Add URLs to the blocked list (deduplicating against the current list).
+    pub async fn block_urls(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        urls: &[String],
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let mut merged = session.control.blocked_urls.clone();
+        for url in urls {
+            if !merged.iter().any(|existing| existing == url) {
+                merged.push(url.clone());
+            }
+        }
+        let result = session
+            .client
+            .send_command_with_session(
+                Some(&target_session_id),
+                "Network.setBlockedURLs",
+                json!({ "urls": &merged }),
+            )
+            .await?;
+        session.control.blocked_urls = merged;
+        Ok(result)
+    }
+
+    /// Remove URLs from the blocked list.
+    pub async fn unblock_urls(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+        urls: &[String],
+    ) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let merged = session
+            .control
+            .blocked_urls
+            .iter()
+            .filter(|existing| !urls.contains(existing))
+            .cloned()
+            .collect::<Vec<_>>();
+        let result = session
+            .client
+            .send_command_with_session(
+                Some(&target_session_id),
+                "Network.setBlockedURLs",
+                json!({ "urls": &merged }),
+            )
+            .await?;
+        session.control.blocked_urls = merged;
         Ok(result)
     }
 
@@ -756,6 +1065,16 @@ fn target_to_json(target: &BrowserTarget) -> Value {
         "target_type": target.target_type,
         "url": target.url,
     })
+}
+
+/// Drain every buffered `Network.*` event into the typed store so store-backed
+/// reads (`list_requests`, `get_request`, `export_har`, `wait_for_network_idle`)
+/// see the full capture, not just the bounded slice returned to the caller.
+fn sync_network_store(session: &mut BrowserSession) {
+    let events = session.client.recent_events();
+    for event in events.iter().filter(|event| is_network_event(event)) {
+        session.network_store.ingest(event);
+    }
 }
 
 fn resolve_target_session_id(session: &BrowserSession, target_id: Option<&str>) -> Result<String> {
