@@ -141,6 +141,12 @@ Other entities can then register a callback to handle these events by doing `cx.
   the check gate), then execute on `compiler` (Linux check/clippy/test) or
   `zed-win-build` (Windows `.exe`). This includes verification the agent starts
   on its own mid-task, not only when the user says "build"/"check".
+- **Build/launch permission.** Never run `restart-zed.py --build <slot>` (opens
+  a new build window) or pass `--agent-prompt <file>` (injects a prompt) without
+  the user's explicit permission — copy-back of the artifact is automatic, but
+  the launch + prompt injection are opt-in. Never build past a red `zed-verify`
+  gate without an explicit user override; targeted `cargo check`/`cargo test` do
+  not substitute for the full gate.
 - Adding a **new** file under an `fs_embed!`-embedded directory (e.g. `assets/themes/`,
   `crates/agent/src/templates`, `crates/edit_prediction_cli/src/prompts`) is picked up on
   the next build: each call-site crate's `build.rs` regenerates the embedded file list via
