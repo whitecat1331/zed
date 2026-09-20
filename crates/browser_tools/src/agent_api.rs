@@ -7,7 +7,7 @@ use crate::network::{
 use crate::session::{BrowserSession, BrowserTarget};
 use anyhow::{Context, Result, anyhow};
 use futures::{AsyncBufReadExt, StreamExt};
-use gpui::{AppContext as _, BackgroundExecutor};
+use gpui::BackgroundExecutor;
 use http_client::HttpClient;
 use serde_json::{Value, json};
 use smol::process::Command;
