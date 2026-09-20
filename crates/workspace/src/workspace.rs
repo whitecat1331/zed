@@ -2236,7 +2236,7 @@ impl Workspace {
             // survives membership changes; fall back to path-set matching.
             let managed_workspace_id = cx.update(|cx| {
                 WorkspaceManager::global(cx)
-                    .workspace_id_for_paths(&PathList::new(paths_to_open.as_slice()))
+                    .workspace_id_for_paths_relaxed(&PathList::new(paths_to_open.as_slice()))
                     .log_err()
                     .flatten()
             });

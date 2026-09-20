@@ -228,6 +228,79 @@ impl WorkspaceManager {
         Ok(None)
     }
 
+    /// Resolve the managed workspace that best represents the given folder
+    /// set. Prefers an exact membership match (see
+    /// [`Self::workspace_id_for_paths`]), then falls back to the workspace
+    /// whose membership is a *superset* of the set, choosing the closest by
+    /// extra-folder count. This keeps a window whose roots drifted from its
+    /// workspace's membership attached instead of silently detaching.
+    pub fn workspace_id_for_paths_relaxed(
+        &self,
+        paths: &PathList,
+    ) -> Result<Option<ManagedWorkspaceId>> {
+        if let Some(id) = self.workspace_id_for_paths(paths)? {
+            return Ok(Some(id));
+        }
+        if paths.is_empty() {
+            return Ok(None);
+        }
+
+        let target = paths
+            .paths()
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<collections::HashSet<_>>();
+
+        let rows = self
+            .select_bound::<(), (String, String)>(sql! {
+                SELECT workspace_id, path FROM managed_workspace_projects ORDER BY workspace_id, position
+            })?
+            (())?;
+
+        let mut by_workspace: collections::HashMap<String, Vec<String>> =
+            collections::HashMap::default();
+        for (workspace_id, path) in rows {
+            by_workspace.entry(workspace_id).or_default().push(path);
+        }
+
+        let mut closest: Option<(usize, ManagedWorkspaceId)> = None;
+        for (workspace_id, project_paths) in by_workspace {
+            if project_paths.len() < target.len() {
+                continue;
+            }
+            let member_set = project_paths
+                .into_iter()
+                .collect::<collections::HashSet<_>>();
+            if !target.is_subset(&member_set) {
+                continue;
+            }
+            let extra = member_set.len() - target.len();
+            let id = ManagedWorkspaceId::from_key_string(&workspace_id)?;
+            if closest.map_or(true, |(closest_extra, _)| extra < closest_extra) {
+                closest = Some((extra, id));
+            }
+        }
+
+        Ok(closest.map(|(_, id)| id))
+    }
+
+    /// Create a managed workspace for the given paths unless one with identical
+    /// membership already exists, in which case reuse (and return) its existing
+    /// id. Keeps `NewManagedWorkspace` and the `--workspace` create-if-absent
+    /// path from minting a duplicate of an already-known folder set.
+    pub async fn create_or_reuse(
+        &self,
+        name: String,
+        project_paths: Vec<PathBuf>,
+    ) -> Result<ManagedWorkspaceId> {
+        if let Some(existing) =
+            self.workspace_id_for_paths(&PathList::new(project_paths.as_slice()))?
+        {
+            return Ok(existing);
+        }
+        self.create(name, project_paths).await
+    }
+
     /// Managed workspaces whose membership includes the given project path —
     /// the disambiguation set for the open-folder ask.
     pub fn workspaces_for_path(&self, path: &Path) -> Result<Vec<ManagedWorkspaceId>> {
@@ -343,12 +416,16 @@ impl WorkspaceManager {
         let key = workspace_id.to_key_string();
         let path = path.to_string_lossy().into_owned();
         let position = self.projects(workspace_id)?.len() as i64;
+        let now = Utc::now().to_rfc3339();
         self.write(move |connection| -> Result<()> {
             connection.exec_bound::<(&str, &str, i64)>(sql! {
                 INSERT INTO managed_workspace_projects (workspace_id, path, position)
                 VALUES (?, ?, ?)
                 ON CONFLICT(workspace_id, path) DO NOTHING
             })?((key.as_str(), path.as_str(), position))?;
+            connection.exec_bound::<(&str, &str)>(sql! {
+                UPDATE managed_workspaces SET updated_at = ? WHERE workspace_id = ?
+            })?((now.as_str(), key.as_str()))?;
             Ok(())
         })
         .await
@@ -362,11 +439,15 @@ impl WorkspaceManager {
     ) -> Result<()> {
         let key = workspace_id.to_key_string();
         let path = path.to_string_lossy().into_owned();
+        let now = Utc::now().to_rfc3339();
         self.write(move |connection| -> Result<()> {
             connection.exec_bound::<(&str, &str)>(sql! {
                 DELETE FROM managed_workspace_projects
                 WHERE workspace_id = ? AND path = ?
             })?((key.as_str(), path.as_str()))?;
+            connection.exec_bound::<(&str, &str)>(sql! {
+                UPDATE managed_workspaces SET updated_at = ? WHERE workspace_id = ?
+            })?((now.as_str(), key.as_str()))?;
             Ok(())
         })
         .await
