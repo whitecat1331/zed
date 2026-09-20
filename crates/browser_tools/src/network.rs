@@ -640,3 +640,116 @@ mod tests {
         assert_eq!(ids, vec!["a", "b", "c"]);
     }
 }
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn store_with_requests() -> NetworkStore {
+        let mut store = NetworkStore::new();
+        store.ingest(&json!({
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "ok",
+                "type": "XHR",
+                "request": { "url": "https://api.example.com/items", "method": "GET" }
+            }
+        }));
+        store.ingest(&json!({
+            "method": "Network.responseReceived",
+            "params": { "requestId": "ok", "response": { "status": 200 } }
+        }));
+        store.ingest(&json!({
+            "method": "Network.loadingFinished",
+            "params": { "requestId": "ok" }
+        }));
+        store.ingest(&json!({
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "failed",
+                "type": "Script",
+                "request": { "url": "https://cdn.example.com/app.js", "method": "POST" }
+            }
+        }));
+        store.ingest(&json!({
+            "method": "Network.loadingFailed",
+            "params": { "requestId": "failed", "errorText": "net::ERR_BLOCKED_BY_CLIENT" }
+        }));
+        store.ingest(&json!({
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "pending",
+                "type": "Fetch",
+                "request": { "url": "https://api.example.com/pending", "method": "GET" }
+            }
+        }));
+        store
+    }
+
+    #[test]
+    fn request_filter_matches_each_axis() {
+        let store = store_with_requests();
+
+        let url = RequestFilter {
+            url: Some("cdn.example.com".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(store.requests().filter(|r| url.matches(r)).count(), 1);
+
+        let method = RequestFilter {
+            method: Some("post".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(store.requests().filter(|r| method.matches(r)).count(), 1);
+
+        let status = RequestFilter {
+            status: Some(200),
+            ..Default::default()
+        };
+        assert_eq!(store.requests().filter(|r| status.matches(r)).count(), 1);
+
+        let resource_type = RequestFilter {
+            resource_type: Some("xhr".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(store.requests().filter(|r| resource_type.matches(r)).count(), 1);
+
+        let failed = RequestFilter {
+            failed: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(store.requests().filter(|r| failed.matches(r)).count(), 1);
+
+        let pending = RequestFilter {
+            pending: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(store.requests().filter(|r| pending.matches(r)).count(), 1);
+
+        let empty = RequestFilter::default();
+        assert!(empty.is_empty());
+        assert_eq!(store.requests().filter(|r| empty.matches(r)).count(), 3);
+    }
+
+    #[test]
+    fn request_to_json_exposes_core_fields() {
+        let store = store_with_requests();
+        let request = store.request("ok").expect("ok request");
+        let value = request.to_json();
+        assert_eq!(value["request_id"].as_str(), Some("ok"));
+        assert_eq!(value["status"].as_u64(), Some(200));
+        assert_eq!(value["method"].as_str(), Some("GET"));
+        assert_eq!(value["resource_type"].as_str(), Some("XHR"));
+        assert_eq!(value["completed"].as_bool(), Some(true));
+        assert!(value["failure_reason"].is_null());
+
+        let failed = store.request("failed").expect("failed request");
+        let value = failed.to_json();
+        assert_eq!(value["completed"].as_bool(), Some(true));
+        assert!(value["failure_reason"].as_str().is_some());
+
+        let pending = store.request("pending").expect("pending request");
+        assert_eq!(pending.to_json()["completed"].as_bool(), Some(false));
+    }
+}
