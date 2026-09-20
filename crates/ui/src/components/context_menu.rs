@@ -91,6 +91,7 @@ pub struct ContextMenuEntry {
     icon_color: Option<Color>,
     handler: Rc<dyn Fn(Option<&FocusHandle>, &mut Window, &mut App)>,
     secondary_handler: Option<Rc<dyn Fn(Option<&FocusHandle>, &mut Window, &mut App)>>,
+    secondary_mouse_handler: Option<Rc<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     action: Option<Box<dyn Action>>,
     disabled: bool,
     documentation_aside: Option<DocumentationAside>,
@@ -113,6 +114,7 @@ impl ContextMenuEntry {
             icon_color: None,
             handler: Rc::new(|_, _, _| {}),
             secondary_handler: None,
+            secondary_mouse_handler: None,
             action: None,
             disabled: false,
             documentation_aside: None,
@@ -179,6 +181,14 @@ impl ContextMenuEntry {
 
     pub fn secondary_handler(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.secondary_handler = Some(Rc::new(move |_, window, cx| handler(window, cx)));
+        self
+    }
+
+    pub fn on_secondary_mouse_down(
+        mut self,
+        handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.secondary_mouse_handler = Some(Rc::new(handler));
         self
     }
 
@@ -562,6 +572,7 @@ impl ContextMenu {
             label: label.into(),
             handler: Rc::new(move |_, window, cx| handler(window, cx)),
             secondary_handler: None,
+            secondary_mouse_handler: None,
             icon: None,
             custom_icon_path: None,
             custom_icon_svg: None,
@@ -593,6 +604,7 @@ impl ContextMenu {
             label: label.into(),
             handler: Rc::new(move |_, window, cx| handler(window, cx)),
             secondary_handler: None,
+            secondary_mouse_handler: None,
             icon: None,
             custom_icon_path: None,
             custom_icon_svg: None,
@@ -624,6 +636,7 @@ impl ContextMenu {
             label: label.into(),
             handler: Rc::new(move |_, window, cx| handler(window, cx)),
             secondary_handler: None,
+            secondary_mouse_handler: None,
             icon: None,
             custom_icon_path: None,
             custom_icon_svg: None,
@@ -668,6 +681,7 @@ impl ContextMenu {
             label: label.into(),
             handler: Rc::new(move |_, window, cx| handler(window, cx)),
             secondary_handler: None,
+            secondary_mouse_handler: None,
             icon: None,
             custom_icon_path: None,
             custom_icon_svg: None,
@@ -778,6 +792,7 @@ impl ContextMenu {
                 window.dispatch_action(action.boxed_clone(), cx);
             }),
             secondary_handler: None,
+            secondary_mouse_handler: None,
             icon: None,
             custom_icon_path: None,
             custom_icon_svg: None,
@@ -811,6 +826,7 @@ impl ContextMenu {
                 window.dispatch_action(action.boxed_clone(), cx);
             }),
             secondary_handler: None,
+            secondary_mouse_handler: None,
             icon: None,
             custom_icon_path: None,
             custom_icon_svg: None,
@@ -846,6 +862,7 @@ impl ContextMenu {
                 window.dispatch_action(action.boxed_clone(), cx);
             }),
             secondary_handler: None,
+            secondary_mouse_handler: None,
             icon: Some(IconName::ArrowUpRight),
             custom_icon_path: None,
             custom_icon_svg: None,
@@ -1839,6 +1856,7 @@ impl ContextMenu {
             end_slot_handler,
             show_end_slot_on_hover,
             secondary_handler: _,
+            secondary_mouse_handler,
         } = entry;
         let this = cx.weak_entity();
         // Report the item's keyboard shortcut to assistive technology, resolving
@@ -2057,6 +2075,12 @@ impl ContextMenu {
                                 }
                             },
                         ))
+                    })
+                    .when_some(secondary_mouse_handler.as_ref(), |list_item, handler| {
+                        list_item.on_secondary_mouse_down({
+                            let handler = handler.clone();
+                            move |event, window, cx| (handler)(event, window, cx)
+                        })
                     })
                     .when_some(*toggle, |list_item, (position, toggled)| {
                         let contents = div()
