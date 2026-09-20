@@ -8014,6 +8014,15 @@ impl ThreadView {
             }
         });
 
+        let failure_banner = terminal_data.was_failure_detected().then(|| {
+            SharedString::from(format!(
+                "Stopped early: {}.",
+                terminal_data
+                    .failure_reason()
+                    .unwrap_or("the output looked like a failure")
+            ))
+        });
+
         let header = TerminalToolHeader::new(
             terminal.entity_id().to_string(),
             header_group,
@@ -8075,6 +8084,17 @@ impl ThreadView {
             })
             .overflow_hidden()
             .child(header)
+            .when_some(failure_banner, |this, banner| {
+                this.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .border_t_1()
+                        .border_color(border_color)
+                        .text_ui_sm(cx)
+                        .child(banner),
+                )
+            })
             .when(is_expanded && terminal_view.is_some(), |this| {
                 this.child(
                     div()

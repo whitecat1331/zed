@@ -412,6 +412,10 @@ pub struct Terminal {
     /// (e.g., clicking the Stop button). This is set before kill() is called
     /// so that code awaiting wait_for_exit() can check it deterministically.
     user_stopped: Arc<AtomicBool>,
+    /// Why this terminal was stopped by the output sampler (set before kill so
+    /// the UI can show the reason after the command exits). `None` when the
+    /// command wasn't stopped by the sampler.
+    failure_reason: Option<String>,
     /// The live sandbox (Seatbelt policy file and/or network proxy) kept alive
     /// until the sandboxed command exits. `None` when the command isn't
     /// sandboxed or after it finishes. Dropping it tears down the proxy on a
@@ -469,6 +473,7 @@ impl Terminal {
             output: None,
             output_byte_limit,
             user_stopped: Arc::new(AtomicBool::new(false)),
+            failure_reason: None,
             _output_task: cx
                 .spawn(async move |this, cx| {
                     let exit_status = command_task.await;
@@ -535,6 +540,22 @@ impl Terminal {
     /// Returns whether this terminal was stopped by explicit user action.
     pub fn was_stopped_by_user(&self) -> bool {
         self.user_stopped.load(Ordering::SeqCst)
+    }
+
+    /// Records why this terminal was stopped by the output sampler. Called
+    /// before `kill()` so the UI can show the reason after the command exits.
+    pub fn mark_failure_detected(&mut self, reason: String) {
+        self.failure_reason = Some(reason);
+    }
+
+    /// Returns whether this terminal was stopped by the output sampler.
+    pub fn was_failure_detected(&self) -> bool {
+        self.failure_reason.is_some()
+    }
+
+    /// The reason the output sampler stopped this terminal, if any.
+    pub fn failure_reason(&self) -> Option<&str> {
+        self.failure_reason.as_deref()
     }
 
     pub fn current_output(&self, cx: &App) -> acp::TerminalOutputResponse {
