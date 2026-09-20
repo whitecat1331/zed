@@ -278,7 +278,7 @@ pub fn init(cx: &mut App) {
             |workspace: &mut Workspace, _: &network_panel::ToggleNetworkPanel, window, cx| {
                 workspace.toggle_panel_focus::<network_panel::NetworkPanel>(window, cx);
             },
-        )
+        );
     })
     .detach();
 

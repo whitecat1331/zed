@@ -6,7 +6,7 @@ use browser_tools::{AgentBrowserApi, RequestFilter, ThrottlePreset, shared_brows
 use feature_flags::{FeatureFlag, FeatureFlagAppExt as _, PresenceFlag, register_feature_flag};
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment,
-    ListState, Task, TaskExt, WeakEntity, Window, actions, div, list, px,
+    ListState, Task, WeakEntity, Window, actions, div, list, px,
 };
 use serde_json::Value;
 use settings::Settings;
@@ -460,6 +460,7 @@ impl NetworkPanel {
             .unwrap_or(false);
         let request_id = row.request_id.clone();
         div()
+            .id(format!("request-row-{request_id}"))
             .px_1()
             .py_1()
             .hover(|style| style.bg(cx.theme().colors().element_hover))
@@ -655,13 +656,14 @@ impl gpui::Render for NetworkPanel {
             .flex_col()
             .child(self.render_toolbar(cx))
             .child(
-                div().flex_1().flex().flex_row().children([
-                    self.render_list(window, cx),
+                div().flex_1().flex().flex_row().children(vec![
+                    self.render_list(window, cx).into_any_element(),
                     div()
                         .flex_1()
                         .flex_col()
                         .child(self.render_detail_tabs(cx))
-                        .child(self.render_detail(cx)),
+                        .child(self.render_detail(cx))
+                        .into_any_element(),
                 ]),
             )
     }
