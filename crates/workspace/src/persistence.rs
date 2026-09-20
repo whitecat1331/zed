@@ -1363,6 +1363,7 @@ impl WorkspaceDb {
     /// Returns the workspace with the given stable uuid, loading all associated
     /// data. This is the identity-keyed restore path: it matches by uuid rather
     /// than by the (mutable) path set.
+    #[allow(dead_code)]
     pub(crate) fn workspace_for_uuid(&self, workspace_uuid: Uuid) -> Option<SerializedWorkspace> {
         let key = workspace_uuid.hyphenated().to_string();
         let workspace_id = self
@@ -1378,6 +1379,7 @@ impl WorkspaceDb {
 
     /// The stable uuid of the layout row with the given i64 cascade key, if one
     /// has been minted.
+    #[allow(dead_code)]
     pub(crate) fn workspace_uuid_for_id(&self, workspace_id: WorkspaceId) -> Option<Uuid> {
         let key = self
             .select_row_bound::<WorkspaceId, String>(sql! {
