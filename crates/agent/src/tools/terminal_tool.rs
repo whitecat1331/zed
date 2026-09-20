@@ -33,6 +33,10 @@ const MAX_TERMINAL_TIMEOUT_MS: u64 = 7_200_000;
 // output before the timeout fires.
 const SAMPLER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+// How long to leave the "kill or continue" prompt open before stopping the
+// command automatically when the user doesn't respond.
+const SAMPLER_KILL_CONTINUE_WINDOW: Duration = Duration::from_secs(10);
+
 /// Executes a shell one-liner and returns the combined output.
 ///
 /// This tool spawns a process using the user's shell, reads from stdout and stderr (preserving the order of writes), and returns a string with the combined output result.
@@ -1010,47 +1014,89 @@ async fn run_terminal_tool(
     let mut user_stopped_via_signal = false;
     let wait_for_exit = terminal.wait_for_exit(cx).map_err(|e| e.to_string())?;
 
-    let timeout_task = cx.background_executor().timer(timeout);
-    let sampler_task = cx.spawn({
-        let terminal = terminal.clone();
-        async move |cx| {
-            let mut last_output_len = 0usize;
-            let mut state = ErrorStreamState::default();
-            loop {
-                cx.background_executor().timer(SAMPLER_POLL_INTERVAL).await;
-                let Ok(output) = terminal.current_output(cx) else {
-                    continue;
-                };
-                let content = &output.output;
-                if content.len() > last_output_len {
-                    let delta = &content[last_output_len..];
-                    last_output_len = content.len();
-                    if detect_error_stream(delta, &mut state) {
-                        return;
+    let timeout_task = cx.background_executor().timer(timeout).shared();
+
+    // Poll the command's live output for a sustained error stream. On the first
+    // detection, ask the user whether to kill the command or let it continue;
+    // stop it automatically if they don't answer within the window.
+    let mut sampler_armed = true;
+    let mut last_output_len = 0usize;
+    let mut sampler_state = ErrorStreamState::default();
+    let mut detected_error_lines = 0usize;
+
+    'wait: loop {
+        futures::select! {
+            _ = wait_for_exit.clone().fuse() => {
+                break 'wait;
+            }
+            _ = timeout_task.clone().fuse() => {
+                timed_out = true;
+                terminal.kill(cx).map_err(|e| e.to_string())?;
+                wait_for_exit.await;
+                break 'wait;
+            }
+            _ = event_stream.cancelled_by_user().fuse() => {
+                user_stopped_via_signal = true;
+                terminal.kill(cx).map_err(|e| e.to_string())?;
+                wait_for_exit.await;
+                break 'wait;
+            }
+            _ = cx.background_executor().timer(SAMPLER_POLL_INTERVAL).fuse() => {
+                if sampler_armed {
+                    if let Ok(output) = terminal.current_output(cx) {
+                        let content = &output.output;
+                        if content.len() > last_output_len {
+                            let delta = &content[last_output_len..];
+                            last_output_len = content.len();
+                            if detect_error_stream(delta, &mut sampler_state) {
+                                detected_error_lines = sampler_state.error_lines;
+                                let decision = cx.update(|cx| {
+                                    event_stream.prompt_for_decision(
+                                        None,
+                                        Some(format!(
+                                            "Detected a sustained stream of error output \
+                                             ({detected_error_lines} error-signature lines). \
+                                             Kill the command or let it continue? It is stopped \
+                                             automatically in 10 s.",
+                                        )),
+                                        vec![
+                                            acp::PermissionOption::new(
+                                                acp::PermissionOptionId::new("kill"),
+                                                "Kill",
+                                                acp::PermissionOptionKind::RejectOnce,
+                                            ),
+                                            acp::PermissionOption::new(
+                                                acp::PermissionOptionId::new("continue"),
+                                                "Continue",
+                                                acp::PermissionOptionKind::AllowOnce,
+                                            ),
+                                        ],
+                                        cx,
+                                    )
+                                });
+                                let kill = futures::select! {
+                                    outcome = decision.fuse() => match outcome {
+                                        Ok(option_id) => option_id.0.as_ref() == "kill",
+                                        Err(_) => true,
+                                    },
+                                    _ = cx.background_executor()
+                                        .timer(SAMPLER_KILL_CONTINUE_WINDOW)
+                                        .fuse() => true,
+                                };
+                                if kill {
+                                    failure_detected = true;
+                                    terminal.kill(cx).map_err(|e| e.to_string())?;
+                                    wait_for_exit.await;
+                                    break 'wait;
+                                }
+                                sampler_armed = false;
+                            }
+                        }
                     }
                 }
             }
         }
-    });
-
-    futures::select! {
-        _ = wait_for_exit.clone().fuse() => {},
-        _ = timeout_task.fuse() => {
-            timed_out = true;
-            terminal.kill(cx).map_err(|e| e.to_string())?;
-            wait_for_exit.await;
-        }
-        _ = sampler_task.fuse() => {
-            failure_detected = true;
-            terminal.kill(cx).map_err(|e| e.to_string())?;
-            wait_for_exit.await;
-        }
-        _ = event_stream.cancelled_by_user().fuse() => {
-            user_stopped_via_signal = true;
-            terminal.kill(cx).map_err(|e| e.to_string())?;
-            wait_for_exit.await;
-        }
-    };
+    }
 
     let user_stopped_via_signal = user_stopped_via_signal || event_stream.was_cancelled_by_user();
     let user_stopped_via_terminal = terminal.was_stopped_by_user(cx).unwrap_or(false);
@@ -1062,7 +1108,7 @@ async fn run_terminal_tool(
     let result = if failure_detected {
         format!(
             "Command \"{}\" was stopped early because its output looked like a failure \
-             (a sustained stream of error output was detected).\n\n{result}",
+             (a sustained stream of {detected_error_lines} error-signature lines was detected).\n\n{result}",
             input.command
         )
     } else {
