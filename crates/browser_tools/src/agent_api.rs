@@ -1,9 +1,12 @@
 use crate::cdp::CdpClient;
-use crate::network::{InterceptionConfig, InterceptionPattern, NetworkControlState, NetworkRequest, NetworkStore, RequestFilter, ThrottleConditions};
+use crate::network::{
+    DrivenBy, InterceptionConfig, InterceptionPattern, NetworkControlState, NetworkRequest,
+    NetworkStore, RequestFilter, ThrottleConditions,
+};
 use crate::session::{BrowserSession, BrowserTarget};
 use anyhow::{Context, Result, anyhow};
 use futures::{AsyncBufReadExt, StreamExt};
-use gpui::BackgroundExecutor;
+use gpui::{AppContext as _, BackgroundExecutor};
 use http_client::HttpClient;
 use serde_json::{Value, json};
 use smol::process::Command;
@@ -49,6 +52,7 @@ impl AgentBrowserApi {
                 json!({
                     "session_id": session.id,
                     "active_target_id": session.active_target_id,
+                    "driven_by": session.driven_by.as_str(),
                     "targets": session.targets.values().map(target_to_json).collect::<Vec<_>>(),
                 })
             })
@@ -106,6 +110,7 @@ impl AgentBrowserApi {
                 child,
                 network_store: NetworkStore::new(),
                 control: NetworkControlState::default(),
+                driven_by: DrivenBy::default(),
             },
         );
         Ok(id)
@@ -584,7 +589,9 @@ impl AgentBrowserApi {
             if Instant::now() >= deadline {
                 return Ok(json!({ "idle": false, "pending": pending }));
             }
-            self.background_executor.timer(Duration::from_millis(100)).await;
+            self.background_executor
+                .timer(Duration::from_millis(100))
+                .await;
         }
     }
 
@@ -947,8 +954,14 @@ impl AgentBrowserApi {
         request_id: &str,
         modifications: Value,
     ) -> Result<Value> {
-        self.fetch_disposition(session_id, target_id, "Fetch.continueRequest", request_id, modifications)
-            .await
+        self.fetch_disposition(
+            session_id,
+            target_id,
+            "Fetch.continueRequest",
+            request_id,
+            modifications,
+        )
+        .await
     }
 
     pub async fn fulfill_request(
@@ -958,8 +971,14 @@ impl AgentBrowserApi {
         request_id: &str,
         response: Value,
     ) -> Result<Value> {
-        self.fetch_disposition(session_id, target_id, "Fetch.fulfillRequest", request_id, response)
-            .await
+        self.fetch_disposition(
+            session_id,
+            target_id,
+            "Fetch.fulfillRequest",
+            request_id,
+            response,
+        )
+        .await
     }
 
     pub async fn fail_request(
@@ -995,14 +1014,32 @@ impl AgentBrowserApi {
             .context("unknown browser session")?;
         let target_session_id = resolve_target_session_id(session, target_id)?;
         let events = session.client.recent_events();
-        let paused = filter_events(&events, is_fetch_request_paused, Some(&target_session_id), 100);
+        let paused = filter_events(
+            &events,
+            is_fetch_request_paused,
+            Some(&target_session_id),
+            100,
+        );
         Ok(json!({ "paused_requests": paused }))
     }
 
     pub async fn network_control_state(&self, session_id: u64) -> Result<Value> {
         let sessions = self.sessions.lock().await;
-        let session = sessions.get(&session_id).context("unknown browser session")?;
+        let session = sessions
+            .get(&session_id)
+            .context("unknown browser session")?;
         Ok(control_state_to_json(&session.control))
+    }
+
+    /// Mark who is driving the session, so the GUI and AIUI can hand off
+    /// without stepping on each other.
+    pub async fn set_driven_by(&self, session_id: u64, driven_by: DrivenBy) -> Result<Value> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
+        session.driven_by = driven_by;
+        Ok(json!({ "driven_by": session.driven_by.as_str() }))
     }
 
     async fn fetch_disposition(
@@ -1405,7 +1442,10 @@ mod control_state_tests {
         assert_eq!(json["offline"].as_bool(), Some(true));
         assert_eq!(json["cache_disabled"].as_bool(), Some(true));
         assert_eq!(json["bypass_service_worker"].as_bool(), Some(true));
-        assert_eq!(json["blocked_urls"][0].as_str(), Some("*://tracker.example.com/*"));
+        assert_eq!(
+            json["blocked_urls"][0].as_str(),
+            Some("*://tracker.example.com/*")
+        );
         assert_eq!(json["extra_http_headers"]["X-Debug"].as_str(), Some("1"));
         assert_eq!(json["user_agent"].as_str(), Some("ZedDebug/1.0"));
         let throttle = &json["throttle"];
@@ -1444,4 +1484,30 @@ mod control_state_tests {
         assert!(!session_id_matches(&event, Some("s2")));
         assert!(session_id_matches(&event, None));
     }
+}
+
+/// A process-wide shared browser API, registered once so the agent tools and
+/// the GUI network panel drive the same sessions and store.
+pub struct BrowserApiGlobal(pub Arc<AgentBrowserApi>);
+
+impl gpui::Global for BrowserApiGlobal {}
+
+/// Return the process-wide shared browser API, creating and registering it on
+/// first use. Both the agent tools and the GUI pass the same Chromium path and
+/// HTTP client, so whichever runs first establishes the shared instance.
+pub fn shared_browser_api(
+    cx: &mut gpui::App,
+    chromium_path: Option<PathBuf>,
+    http_client: Arc<dyn HttpClient>,
+) -> Arc<AgentBrowserApi> {
+    if let Some(global) = cx.try_global::<BrowserApiGlobal>() {
+        return global.0.clone();
+    }
+    let api = Arc::new(AgentBrowserApi::new(
+        chromium_path,
+        http_client,
+        cx.background_executor().clone(),
+    ));
+    cx.set_global(BrowserApiGlobal(api.clone()));
+    api
 }

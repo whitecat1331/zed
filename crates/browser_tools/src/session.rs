@@ -31,3 +31,5 @@ pub struct BrowserTarget {
     /// Most recently known URL (best-effort).
     pub url: String,
 }
+    pub url: String,
+}

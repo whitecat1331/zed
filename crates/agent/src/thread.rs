@@ -10,7 +10,6 @@ use crate::{
 use acp_thread::{ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
 use agent_settings::UserAgentsMd;
-use browser_tools::AgentBrowserApi;
 
 use crate::sandboxing::{
     SandboxRequest, ThreadSandbox, ThreadSandboxGrants, sandbox_git_dirs,
@@ -2211,11 +2210,9 @@ impl Thread {
             environment.clone(),
             cx.weak_entity(),
         ));
-        let browser_api = Arc::new(AgentBrowserApi::new(
-            AgentSettings::get_global(cx).browser_chromium_path.clone(),
-            self.project.read(cx).client().http_client(),
-            cx.background_executor().clone(),
-        ));
+        let chromium_path = AgentSettings::get_global(cx).browser_chromium_path.clone();
+        let http_client = self.project.read(cx).client().http_client();
+        let browser_api = browser_tools::shared_browser_api(cx, chromium_path, http_client);
         self.add_tool(BrowserTool::new(cx.weak_entity(), browser_api.clone()));
         self.add_tool(NetworkTool::new(cx.weak_entity(), browser_api));
         self.add_tool(EditFileTool::new(
