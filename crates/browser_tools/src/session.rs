@@ -1,4 +1,5 @@
 use crate::cdp::CdpClient;
+use crate::driven_by::DrivenBy;
 use crate::network::{NetworkControlState, NetworkStore};
 use std::collections::HashMap;
 
@@ -18,6 +19,8 @@ pub struct BrowserSession {
     pub network_store: NetworkStore,
     /// Mutable network control state (throttle, offline, blocking, interception).
     pub control: NetworkControlState,
+    /// Who is currently driving the session (Human / Agent / Idle).
+    pub driven_by: DrivenBy,
 }
 
 /// A single flattened target (page, worker, service worker, ...).
@@ -29,7 +32,5 @@ pub struct BrowserTarget {
     /// CDP target type (`page`, `worker`, `service_worker`, ...).
     pub target_type: String,
     /// Most recently known URL (best-effort).
-    pub url: String,
-}
     pub url: String,
 }

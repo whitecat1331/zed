@@ -1,7 +1,8 @@
 use crate::cdp::CdpClient;
+use crate::driven_by::DrivenBy;
 use crate::network::{
-    DrivenBy, InterceptionConfig, InterceptionPattern, NetworkControlState, NetworkRequest,
-    NetworkStore, RequestFilter, ThrottleConditions,
+    InterceptionConfig, InterceptionPattern, NetworkControlState, NetworkRequest, NetworkStore,
+    RequestFilter, ThrottleConditions,
 };
 use crate::session::{BrowserSession, BrowserTarget};
 use anyhow::{Context, Result, anyhow};
