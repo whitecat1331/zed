@@ -23,6 +23,20 @@ use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 
 const COMMAND_OUTPUT_LIMIT: u64 = 16 * 1024;
 
+// A command that never finishes would otherwise run forever, so agent terminal
+// commands get a default runtime bound (10 minutes) that the model can extend
+// up to a hard cap (2 hours) for long builds.
+const DEFAULT_TERMINAL_TIMEOUT_MS: u64 = 600_000;
+const MAX_TERMINAL_TIMEOUT_MS: u64 = 7_200_000;
+
+// Poll cadence for the output sampler that detects a failing command from its
+// output before the timeout fires.
+const SAMPLER_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+// How long to leave the "kill or continue" prompt open before stopping the
+// command automatically when the user doesn't respond.
+const SAMPLER_KILL_CONTINUE_WINDOW: Duration = Duration::from_secs(10);
+
 /// Executes a shell one-liner and returns the combined output.
 ///
 /// This tool spawns a process using the user's shell, reads from stdout and stderr (preserving the order of writes), and returns a string with the combined output result.
@@ -55,7 +69,7 @@ pub struct TerminalToolInput {
     pub command: String,
     /// Working directory: a project root directory or any subdirectory of one, given by name or absolute path. E.g. `my-project/src`, `/home/user/my-project`, or on Windows `my-project\src` or `C:\Users\me\my-project`.
     pub cd: String,
-    /// Optional maximum runtime (in milliseconds). If exceeded, the running terminal task is killed.
+    /// Optional maximum runtime in milliseconds. Defaults to 600000 (10 minutes). For a build, request a longer timeout: 3600000 for a quick build, 7200000 for a release build. Values above 7200000 are rejected. If exceeded, the running terminal task is killed.
     pub timeout_ms: Option<u64>,
     /// Return only the first N lines of terminal output to the model after the command finishes. Do not pipe output to `head`; use this parameter instead so the user can still see live output. Avoid requesting too many lines, or the response may waste tokens or exceed the context window.
     #[serde(default)]
@@ -97,7 +111,7 @@ pub struct SandboxedTerminalToolInput {
     pub command: String,
     /// Working directory: a project root directory or any subdirectory of one, given by name or absolute path. E.g. `my-project/src`, `/home/user/my-project`, or on Windows `my-project\src` or `C:\Users\me\my-project`.
     pub cd: String,
-    /// Optional maximum runtime (in milliseconds). If exceeded, the running terminal task is killed.
+    /// Optional maximum runtime in milliseconds. Defaults to 600000 (10 minutes). For a build, request a longer timeout: 3600000 for a quick build, 7200000 for a release build. Values above 7200000 are rejected. If exceeded, the running terminal task is killed.
     pub timeout_ms: Option<u64>,
     /// Return only the first N lines of terminal output to the model after the command finishes. Do not pipe output to `head`; use this parameter instead so the user can still see live output. Avoid requesting too many lines, or the response may waste tokens or exceed the context window.
     #[serde(default)]
@@ -993,41 +1007,100 @@ async fn run_terminal_tool(
         event_stream.update_fields(fields);
     }
 
-    let timeout = input.timeout_ms.map(Duration::from_millis);
+    let timeout = Duration::from_millis(terminal_timeout_ms(input.timeout_ms)?);
 
     let mut timed_out = false;
+    let mut failure_detected = false;
     let mut user_stopped_via_signal = false;
     let wait_for_exit = terminal.wait_for_exit(cx).map_err(|e| e.to_string())?;
 
-    match timeout {
-        Some(timeout) => {
-            let timeout_task = cx.background_executor().timer(timeout);
+    let timeout_task = cx.background_executor().timer(timeout).shared();
 
-            futures::select! {
-                _ = wait_for_exit.clone().fuse() => {},
-                _ = timeout_task.fuse() => {
-                    timed_out = true;
-                    terminal.kill(cx).map_err(|e| e.to_string())?;
-                    wait_for_exit.await;
-                }
-                _ = event_stream.cancelled_by_user().fuse() => {
-                    user_stopped_via_signal = true;
-                    terminal.kill(cx).map_err(|e| e.to_string())?;
-                    wait_for_exit.await;
+    // Poll the command's live output for a sustained error stream. On the first
+    // detection, ask the user whether to kill the command or let it continue;
+    // stop it automatically if they don't answer within the window.
+    let mut sampler_armed = true;
+    let mut last_output_len = 0usize;
+    let mut sampler_state = ErrorStreamState::default();
+    let mut detected_error_lines = 0usize;
+
+    'wait: loop {
+        futures::select! {
+            _ = wait_for_exit.clone().fuse() => {
+                break 'wait;
+            }
+            _ = timeout_task.clone().fuse() => {
+                timed_out = true;
+                terminal.kill(cx).map_err(|e| e.to_string())?;
+                wait_for_exit.await;
+                break 'wait;
+            }
+            _ = event_stream.cancelled_by_user().fuse() => {
+                user_stopped_via_signal = true;
+                terminal.kill(cx).map_err(|e| e.to_string())?;
+                wait_for_exit.await;
+                break 'wait;
+            }
+            _ = cx.background_executor().timer(SAMPLER_POLL_INTERVAL).fuse() => {
+                if sampler_armed {
+                    if let Ok(output) = terminal.current_output(cx) {
+                        let content = &output.output;
+                        if content.len() > last_output_len {
+                            let delta = &content[last_output_len..];
+                            last_output_len = content.len();
+                            if detect_error_stream(delta, &mut sampler_state) {
+                                detected_error_lines = sampler_state.error_lines;
+                                let decision = cx.update(|cx| {
+                                    event_stream.prompt_for_decision(
+                                        None,
+                                        Some(format!(
+                                            "Detected a sustained stream of error output \
+                                             ({detected_error_lines} error-signature lines). \
+                                             Kill the command or let it continue? It is stopped \
+                                             automatically in 10 s.",
+                                        )),
+                                        vec![
+                                            acp::PermissionOption::new(
+                                                acp::PermissionOptionId::new("kill"),
+                                                "Kill",
+                                                acp::PermissionOptionKind::RejectOnce,
+                                            ),
+                                            acp::PermissionOption::new(
+                                                acp::PermissionOptionId::new("continue"),
+                                                "Continue",
+                                                acp::PermissionOptionKind::AllowOnce,
+                                            ),
+                                        ],
+                                        cx,
+                                    )
+                                });
+                                let kill = futures::select! {
+                                    outcome = decision.fuse() => match outcome {
+                                        Ok(option_id) => option_id.0.as_ref() == "kill",
+                                        Err(_) => true,
+                                    },
+                                    _ = cx.background_executor()
+                                        .timer(SAMPLER_KILL_CONTINUE_WINDOW)
+                                        .fuse() => true,
+                                };
+                                if kill {
+                                    failure_detected = true;
+                                    let reason = format!("a sustained stream of {detected_error_lines} error-signature lines was detected");
+                                    terminal
+                                        .mark_failure_detected(reason, cx)
+                                        .map_err(|e| e.to_string())?;
+                                    terminal.kill(cx).map_err(|e| e.to_string())?;
+                                    wait_for_exit.await;
+                                    break 'wait;
+                                }
+                                sampler_armed = false;
+                            }
+                        }
+                    }
                 }
             }
         }
-        None => {
-            futures::select! {
-                _ = wait_for_exit.clone().fuse() => {},
-                _ = event_stream.cancelled_by_user().fuse() => {
-                    user_stopped_via_signal = true;
-                    terminal.kill(cx).map_err(|e| e.to_string())?;
-                    wait_for_exit.await;
-                }
-            }
-        }
-    };
+    }
 
     let user_stopped_via_signal = user_stopped_via_signal || event_stream.was_cancelled_by_user();
     let user_stopped_via_terminal = terminal.was_stopped_by_user(cx).unwrap_or(false);
@@ -1036,6 +1109,15 @@ async fn run_terminal_tool(
     let output = terminal.current_output(cx).map_err(|e| e.to_string())?;
 
     let result = process_content(output, &input.command, timed_out, user_stopped, selection);
+    let result = if failure_detected {
+        format!(
+            "Command \"{}\" was stopped early because its output looked like a failure \
+             (a sustained stream of {detected_error_lines} error-signature lines was detected).\n\n{result}",
+            input.command
+        )
+    } else {
+        result
+    };
     let notes = sandbox_note.into_iter().collect::<Vec<_>>();
     Ok(if notes.is_empty() {
         result
@@ -1246,6 +1328,73 @@ fn wsl_interop_blocked(content: &str) -> bool {
     content.contains("UtilGetPpid") || content.contains("Failed to parse: /proc/1/stat")
 }
 
+// Error signatures a failing command tends to emit. Matching is case-insensitive
+// substring matching, so the set is deliberately loose: the sampler only fires
+// on a *sustained* stream of these lines, not a single occurrence.
+const ERROR_SIGNATURES: &[&str] = &[
+    "error",
+    "fatal",
+    "panic",
+    "traceback",
+    "exception",
+    "command not found",
+    "no such file",
+    "permission denied",
+    "cannot",
+    "syntax error",
+    "failed",
+    "failure",
+];
+
+// Minimum number of error-signature lines before the sampler concludes a command
+// is failing, plus a startup grace so a command's first few lines aren't judged
+// before it gets going.
+const SAMPLER_ERROR_LINE_THRESHOLD: usize = 10;
+const SAMPLER_STARTUP_GRACE_LINES: usize = 4;
+
+#[derive(Default)]
+struct ErrorStreamState {
+    error_lines: usize,
+    total_lines: usize,
+}
+
+fn detect_error_stream(delta: &str, state: &mut ErrorStreamState) -> bool {
+    for line in delta.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        state.total_lines += 1;
+        if is_error_line(line) {
+            state.error_lines += 1;
+        }
+    }
+
+    if state.total_lines < SAMPLER_STARTUP_GRACE_LINES {
+        return false;
+    }
+
+    state.error_lines >= SAMPLER_ERROR_LINE_THRESHOLD
+        || (state.error_lines >= 4 && state.error_lines * 2 >= state.total_lines)
+}
+
+fn is_error_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    ERROR_SIGNATURES
+        .iter()
+        .any(|signature| lower.contains(*signature))
+}
+
+fn terminal_timeout_ms(timeout_ms: Option<u64>) -> Result<u64, String> {
+    let timeout_ms = timeout_ms.unwrap_or(DEFAULT_TERMINAL_TIMEOUT_MS);
+    if timeout_ms > MAX_TERMINAL_TIMEOUT_MS {
+        return Err(format!(
+            "terminal `timeout_ms` must be at most {MAX_TERMINAL_TIMEOUT_MS} ms, got {timeout_ms}"
+        ));
+    }
+    Ok(timeout_ms)
+}
+
 fn process_content(
     output: acp::TerminalOutputResponse,
     command: &str,
@@ -1417,6 +1566,49 @@ fn resolve_cd_in_worktrees(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_terminal_timeout_default_and_cap() {
+        assert_eq!(terminal_timeout_ms(None).unwrap(), 600_000);
+        assert_eq!(terminal_timeout_ms(Some(5)).unwrap(), 5);
+        assert_eq!(terminal_timeout_ms(Some(7_200_000)).unwrap(), 7_200_000);
+        assert!(terminal_timeout_ms(Some(7_200_001)).is_err());
+    }
+
+    #[test]
+    fn test_detect_error_stream_flags_sustained_errors() {
+        let mut state = ErrorStreamState::default();
+        let delta = "error: 1\nerror: 2\nerror: 3\nerror: 4\nerror: 5\nerror: 6\nerror: 7\nerror: 8\nerror: 9\nerror: 10\n";
+        assert!(detect_error_stream(delta, &mut state));
+    }
+
+    #[test]
+    fn test_detect_error_stream_flags_error_dominated_output() {
+        let mut state = ErrorStreamState::default();
+        let delta = "error: a\nerror: b\nerror: c\nerror: d\nok\n";
+        assert!(detect_error_stream(delta, &mut state));
+    }
+
+    #[test]
+    fn test_detect_error_stream_ignores_sparse_errors() {
+        let mut state = ErrorStreamState::default();
+        let delta = "a\nb\nc\nerror: x\nd\ne\nf\nerror: y\ng\nh\n";
+        assert!(!detect_error_stream(delta, &mut state));
+    }
+
+    #[test]
+    fn test_detect_error_stream_ignores_clean_output() {
+        let mut state = ErrorStreamState::default();
+        let delta = "compiling foo\nlinking bar\nrunning tests\nfinished in 2s\nok\n";
+        assert!(!detect_error_stream(delta, &mut state));
+    }
+
+    #[test]
+    fn test_detect_error_stream_ignores_startup_noise() {
+        let mut state = ErrorStreamState::default();
+        let delta = "error: 1\nerror: 2\n";
+        assert!(!detect_error_stream(delta, &mut state));
+    }
 
     #[test]
     fn test_resolve_cd_uses_project_path_style() {

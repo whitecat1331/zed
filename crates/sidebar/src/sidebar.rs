@@ -3969,6 +3969,27 @@ impl Sidebar {
             return;
         };
 
+        // Reconcile the clicked thread's dedup group on every sidebar
+        // activation, so a duplicate collapses to its canonical whether it is
+        // active, parked, or not yet open. The reopen only fires when the
+        // clicked session was merged away, so an unmerged click leaves the
+        // in-memory view untouched.
+        if let Some(session_id) = metadata.session_id.clone() {
+            if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+                panel.update(cx, |panel, cx| {
+                    panel.reconcile_thread_on_sidebar_reactivation(
+                        Agent::from(metadata.agent_id.clone()),
+                        metadata.thread_id,
+                        session_id,
+                        Some(metadata.folder_paths().clone()),
+                        metadata.title.clone(),
+                        window,
+                        cx,
+                    );
+                });
+            }
+        }
+
         if self.is_thread_active_in_workspace(&metadata.thread_id, workspace, cx) {
             workspace.update(cx, |workspace, cx| {
                 workspace.focus_panel::<AgentPanel>(window, cx);

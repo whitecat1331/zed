@@ -909,7 +909,7 @@ fn main() {
                             let manager = workspace::WorkspaceManager::global(cx);
                             let paths_for_open = paths.clone();
                             cx.spawn(async move |_cx| {
-                                manager.create(name, paths).await.log_err();
+                                manager.create_or_reuse(name, paths).await.log_err();
                             })
                             .detach();
                             Some(paths_for_open)
