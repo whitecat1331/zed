@@ -23,6 +23,35 @@ pub struct NetworkRequest {
     pub cors_error_status: Option<String>,
     pub encoded_data_length: Option<f64>,
     pub from_cache: bool,
+    /// True once the request has finished (or failed) and is no longer in flight.
+    pub completed: bool,
+}
+
+impl NetworkRequest {
+    /// Serialize to a stable JSON shape consumed by the AIUI and GUI.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "request_id": self.request_id,
+            "url": self.url,
+            "method": self.method,
+            "status": self.status,
+            "status_text": self.status_text,
+            "mime_type": self.mime_type,
+            "resource_type": self.resource_type,
+            "initiator": self.initiator,
+            "initiator_stack": self.initiator_stack,
+            "request_headers": self.request_headers,
+            "response_headers": self.response_headers,
+            "post_data": self.post_data,
+            "timing": self.timing.as_ref().map(timing_to_json),
+            "failure_reason": self.failure_reason,
+            "blocked_reason": self.blocked_reason,
+            "cors_error_status": self.cors_error_status,
+            "encoded_data_length": self.encoded_data_length,
+            "from_cache": self.from_cache,
+            "completed": self.completed,
+        })
+    }
 }
 
 /// Timing phases reported by CDP for a single request.
@@ -173,6 +202,7 @@ impl NetworkStore {
         };
         let request = self.entry(&request_id);
         request.encoded_data_length = f64_field(params, "encodedDataLength");
+        request.completed = true;
     }
 
     fn ingest_loading_failed(&mut self, params: &Value) {
@@ -193,6 +223,7 @@ impl NetworkStore {
         {
             request.cors_error_status = Some(cors_error_status.to_string());
         }
+        request.completed = true;
     }
 
     fn ingest_request_extra_info(&mut self, params: &Value) {
@@ -224,6 +255,79 @@ impl NetworkStore {
         };
         let request = self.entry(&request_id);
         request.from_cache = true;
+        request.completed = true;
+    }
+}
+
+/// Filters applied when listing requests from the store. Empty filters match
+/// every request.
+#[derive(Debug, Clone, Default)]
+pub struct RequestFilter {
+    /// Substring match against the request URL (case-insensitive).
+    pub url: Option<String>,
+    /// Exact method match (case-insensitive).
+    pub method: Option<String>,
+    /// Exact status match.
+    pub status: Option<u32>,
+    /// Exact resource type match (case-insensitive).
+    pub resource_type: Option<String>,
+    /// Only requests that failed at the network layer (`failure_reason` or
+    /// `blocked_reason` present) when true, or succeeded when false.
+    pub failed: Option<bool>,
+    /// Only in-flight requests (no `loadingFinished`/`loadingFailed` yet) when
+    /// true, or completed requests when false.
+    pub pending: Option<bool>,
+}
+
+impl RequestFilter {
+    pub fn is_empty(&self) -> bool {
+        self.url.is_none()
+            && self.method.is_none()
+            && self.status.is_none()
+            && self.resource_type.is_none()
+            && self.failed.is_none()
+            && self.pending.is_none()
+    }
+
+    pub fn matches(&self, request: &NetworkRequest) -> bool {
+        if let Some(url) = &self.url {
+            if !request.url.to_lowercase().contains(&url.to_lowercase()) {
+                return false;
+            }
+        }
+        if let Some(method) = &self.method {
+            if !request.method.eq_ignore_ascii_case(method) {
+                return false;
+            }
+        }
+        if let Some(status) = self.status {
+            if request.status != Some(status) {
+                return false;
+            }
+        }
+        if let Some(resource_type) = &self.resource_type {
+            let matches = request
+                .resource_type
+                .as_ref()
+                .map(|actual| actual.eq_ignore_ascii_case(resource_type))
+                .unwrap_or(false);
+            if !matches {
+                return false;
+            }
+        }
+        if let Some(failed) = self.failed {
+            let is_failed =
+                request.failure_reason.is_some() || request.blocked_reason.is_some();
+            if is_failed != failed {
+                return false;
+            }
+        }
+        if let Some(pending) = self.pending {
+            if !request.completed != pending {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -269,6 +373,23 @@ fn timing_from_value(value: &Value) -> NetworkTiming {
         send_end: f64_field(value, "sendEnd"),
         receive_headers_end: f64_field(value, "receiveHeadersEnd"),
     }
+}
+
+fn timing_to_json(timing: &NetworkTiming) -> Value {
+    json!({
+        "request_time": timing.request_time,
+        "proxy_start": timing.proxy_start,
+        "proxy_end": timing.proxy_end,
+        "dns_start": timing.dns_start,
+        "dns_end": timing.dns_end,
+        "connect_start": timing.connect_start,
+        "connect_end": timing.connect_end,
+        "ssl_start": timing.ssl_start,
+        "ssl_end": timing.ssl_end,
+        "send_start": timing.send_start,
+        "send_end": timing.send_end,
+        "receive_headers_end": timing.receive_headers_end,
+    })
 }
 
 /// Network throttling conditions, mirroring CDP `Network.emulateNetworkConditions`.
@@ -398,139 +519,6 @@ mod control_tests {
 
     #[test]
     fn throttle_preset_parsing_and_conditions() {
-        assert_eq!(
-            ThrottlePreset::parse("slow-3g"),
-            Some(ThrottlePreset::Slow3G)
-        );
-        assert_eq!(
-            ThrottlePreset::parse("SLOW_3G"),
-            Some(ThrottlePreset::Slow3G)
-        );
-        assert_eq!(
-            ThrottlePreset::parse("offline"),
-            Some(ThrottlePreset::Offline)
-        );
-        assert_eq!(ThrottlePreset::parse("bogus"), None);
-        assert!(ThrottlePreset::Offline.conditions().offline);
-        assert_eq!(ThrottlePreset::Slow3G.conditions().latency_ms, 2_000);
-    }
-
-    #[test]
-    fn throttle_conditions_serialize_to_cdp_params() {
-        let params = ThrottlePreset::Fast3G.conditions().to_cdp_params();
-        assert_eq!(params["latency"].as_u64(), Some(563));
-        assert_eq!(params["offline"].as_bool(), Some(false));
-        assert_eq!(params["connectionType"].as_str(), Some("cellular3g"));
-        let online = ThrottleConditions::default().to_cdp_params();
-        assert!(online.get("connectionType").is_none());
-    }
-
-    #[test]
-    fn interception_pattern_serializes_to_cdp_request_pattern() {
-        let scoped = InterceptionPattern {
-            url_pattern: "https://api.example.com/*".to_string(),
-            request_stage: Some("Response".to_string()),
-        };
-        let params = scoped.to_cdp_params();
-        assert_eq!(
-            params["urlPattern"].as_str(),
-            Some("https://api.example.com/*")
-        );
-        assert_eq!(params["requestStage"].as_str(), Some("Response"));
-
-        let stage_optional = InterceptionPattern {
-            url_pattern: "*://localhost/*".to_string(),
-            request_stage: None,
-        };
-        let params = stage_optional.to_cdp_params();
-        assert!(params.get("requestStage").is_none());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn ingests_request_lifecycle_into_typed_store() {
-        let mut store = NetworkStore::new();
-
-        store.ingest(&json!({
-            "method": "Network.requestWillBeSent",
-            "params": {
-                "requestId": "1",
-                "documentURL": "https://example.com/page",
-                "type": "XHR",
-                "request": {
-                    "url": "https://example.com/api/items",
-                    "method": "POST",
-                    "headers": { "Content-Type": "application/json" },
-                    "postData": "{\"q\":\"x\"}"
-                },
-                "initiator": { "type": "script" }
-            }
-        }));
-        store.ingest(&json!({
-            "method": "Network.responseReceived",
-            "params": {
-                "requestId": "1",
-                "response": {
-                    "url": "https://example.com/api/items",
-                    "status": 404,
-                    "statusText": "Not Found",
-                    "mimeType": "application/json",
-                    "headers": { "Content-Type": "application/json" },
-                    "timing": { "requestTime": 1.5, "dnsStart": 0.1 }
-                }
-            }
-        }));
-        store.ingest(&json!({
-            "method": "Network.loadingFailed",
-            "params": {
-                "requestId": "1",
-                "errorText": "net::ERR_ABORTED",
-                "blockedReason": "cors"
-            }
-        }));
-
-        assert_eq!(store.len(), 1);
-        let request = store.request("1").expect("request should be tracked");
-        assert_eq!(request.url, "https://example.com/api/items");
-        assert_eq!(request.method, "POST");
-        assert_eq!(request.status, Some(404));
-        assert_eq!(request.mime_type.as_deref(), Some("application/json"));
-        assert_eq!(request.resource_type.as_deref(), Some("XHR"));
-        assert_eq!(request.post_data.as_deref(), Some("{\"q\":\"x\"}"));
-        assert_eq!(request.failure_reason.as_deref(), Some("net::ERR_ABORTED"));
-        assert_eq!(request.blocked_reason.as_deref(), Some("cors"));
-        assert_eq!(
-            request
-                .request_headers
-                .get("Content-Type")
-                .map(String::as_str),
-            Some("application/json")
-        );
-        let timing = request.timing.as_ref().expect("timing should be captured");
-        assert_eq!(timing.request_time, Some(1.5));
-    }
-
-    #[test]
-    fn preserves_arrival_order() {
-        let mut store = NetworkStore::new();
-        for id in ["a", "b", "c"] {
-            store.ingest(&json!({
-                "method": "Network.requestWillBeSent",
-                "params": { "requestId": id, "request": { "url": id, "method": "GET" } }
-            }));
-        }
-        let ids: Vec<&str> = store
-            .requests()
-            .map(|request| request.request_id.as_str())
-            .collect();
-        assert_eq!(ids, vec!["a", "b", "c"]);
-    }
-}
         assert_eq!(ThrottlePreset::parse("slow-3g"), Some(ThrottlePreset::Slow3G));
         assert_eq!(ThrottlePreset::parse("SLOW_3G"), Some(ThrottlePreset::Slow3G));
         assert_eq!(ThrottlePreset::parse("offline"), Some(ThrottlePreset::Offline));

@@ -56,6 +56,7 @@ pub fn import_har(value: &Value) -> Result<NetworkStore> {
                 .and_then(|response| response.get("content"))
                 .and_then(|content| content.get("size"))
                 .and_then(Value::as_f64),
+            completed: true,
             ..Default::default()
         });
     }
@@ -170,5 +171,4 @@ mod tests {
             Some("application/json")
         );
     }
-}
 }
