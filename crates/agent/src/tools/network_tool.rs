@@ -1,8 +1,8 @@
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::builtin_profiles;
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result};
 use browser_tools::{AgentBrowserApi, InterceptionPattern, RequestFilter, ThrottleConditions, ThrottlePreset};
-use gpui::{App, AppContext as _, SharedString, Task, WeakEntity};
+use gpui::{App, SharedString, Task, WeakEntity};
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -670,7 +670,7 @@ impl NetworkTool {
                         &operation,
                         std::iter::once(format!("session_id:{session_id}")).chain(
                             patterns.iter().map(|pattern| {
-                                format!("url:{pattern.url_pattern}")
+                                format!("url:{}", pattern.url_pattern)
                             }),
                         ),
                     ),
