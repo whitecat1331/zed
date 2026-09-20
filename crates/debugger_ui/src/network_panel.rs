@@ -3,11 +3,10 @@ use std::time::Duration;
 
 use agent_settings::AgentSettings;
 use browser_tools::{AgentBrowserApi, RequestFilter, ThrottlePreset, shared_browser_api};
-use editor::EditorEvent;
 use feature_flags::{FeatureFlag, FeatureFlagAppExt as _, PresenceFlag, register_feature_flag};
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment,
-    ListState, Subscription, Task, TaskExt, WeakEntity, Window, actions, div, list, px,
+    ListState, Task, TaskExt, WeakEntity, Window, actions, div, list, px,
 };
 use serde_json::Value;
 use settings::Settings;
@@ -160,7 +159,6 @@ pub struct NetworkPanel {
     requests: Vec<Value>,
     control: Value,
     driven_by: String,
-    filter: String,
     filter_editor: Entity<InputField>,
     block_editor: Entity<InputField>,
     record: bool,
@@ -170,7 +168,6 @@ pub struct NetworkPanel {
     detail_tab: DetailTab,
     list_state: ListState,
     _refresh_task: Task<()>,
-    _subscriptions: Vec<Subscription>,
 }
 
 impl NetworkPanel {
@@ -188,15 +185,6 @@ impl NetworkPanel {
             let http_client = workspace.project().read(cx).client().http_client();
             let browser_api = shared_browser_api(cx, chromium_path, http_client);
 
-            let filter_subscription =
-                cx.subscribe(&filter_editor, |this, _, event: &EditorEvent, cx| {
-                    if matches!(event, EditorEvent::BufferEdited) {
-                        this.filter = this.filter_editor.read(cx).text(cx);
-                        this.list_state.reset(this.visible_requests().len());
-                        cx.notify();
-                    }
-                });
-
             let mut this = Self {
                 browser_api,
                 focus_handle,
@@ -205,7 +193,6 @@ impl NetworkPanel {
                 requests: Vec::new(),
                 control: Value::Null,
                 driven_by: "idle".to_string(),
-                filter: String::new(),
                 filter_editor,
                 block_editor,
                 record: true,
@@ -215,7 +202,6 @@ impl NetworkPanel {
                 detail_tab: DetailTab::Headers,
                 list_state: ListState::new(0, ListAlignment::Top, px(24.0)),
                 _refresh_task: Task::ready(()),
-                _subscriptions: vec![filter_subscription],
             };
             this.schedule_refresh(cx);
             this
@@ -260,12 +246,12 @@ impl NetworkPanel {
         self.driven_by = snapshot.driven_by;
         self.control = snapshot.control;
         self.requests = snapshot.requests;
-        self.list_state.reset(self.visible_requests().len());
+        self.list_state.reset(self.visible_requests(cx).len());
         cx.notify();
     }
 
-    fn visible_requests(&self) -> Vec<&Value> {
-        let filter = self.filter.to_lowercase();
+    fn visible_requests(&self, cx: &App) -> Vec<&Value> {
+        let filter = self.filter_editor.read(cx).text(cx).to_lowercase();
         self.requests
             .iter()
             .filter(|value| {
@@ -452,7 +438,7 @@ impl NetworkPanel {
     }
 
     fn render_entry(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
-        let visible = self.visible_requests();
+        let visible = self.visible_requests(cx);
         let Some(value) = visible.get(ix) else {
             return div().into_any_element();
         };
@@ -474,9 +460,8 @@ impl NetworkPanel {
             .unwrap_or(false);
         let request_id = row.request_id.clone();
         div()
-            .id(("request-row", row.request_id.clone()))
             .px_1()
-            .py_0p5()
+            .py_1()
             .hover(|style| style.bg(cx.theme().colors().element_hover))
             .when(selected, |style| {
                 style.bg(cx.theme().colors().element_selected)
@@ -516,7 +501,7 @@ impl NetworkPanel {
         .into_any_element()
     }
 
-    fn render_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_detail(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         let Some(request) = self.selected_request() else {
             return div()
                 .p_2()
@@ -585,9 +570,10 @@ impl NetworkPanel {
     fn render_detail_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let tabs = DetailTab::all()
             .iter()
-            .map(|tab| {
+            .enumerate()
+            .map(|(ix, tab)| {
                 let label = tab.label();
-                Tab::new(("detail-tab", label))
+                Tab::new(("detail-tab", ix))
                     .toggle_state(self.detail_tab == *tab)
                     .child(label)
                     .on_click({
