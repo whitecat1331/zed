@@ -53,7 +53,8 @@ use ui::{
 use update_version::UpdateVersion;
 use util::ResultExt;
 use workspace::{
-    AccessibleMode, MultiWorkspace, ToggleWorktreeSecurity, Workspace, WorkspaceManager,
+    AccessibleMode, MultiWorkspace, RenameWorkspaceModal, ToggleWorktreeSecurity, Workspace,
+    WorkspaceManager,
     notifications::{NotifyResultExt, NotifyTaskExt as _},
     open_managed_workspace_paths,
 };
@@ -886,6 +887,9 @@ impl TitleBar {
             return None;
         }
         let workspace = self.workspace.clone();
+        let active_workspace_id = workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).managed_workspace_id());
 
         let trigger = ButtonLike::new("workspace-switcher")
             .aria_label("Switch Workspace")
@@ -895,7 +899,11 @@ impl TitleBar {
                     .size(IconSize::Small)
                     .color(Color::Muted),
             )
-            .child(Label::new("Workspaces").size(LabelSize::Small).color(Color::Muted));
+            .child(
+                Label::new("Workspaces")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            );
 
         Some(
             PopoverMenu::new("workspace-switcher-menu")
@@ -907,18 +915,54 @@ impl TitleBar {
                             let workspace_id = managed_workspace.workspace_id;
                             let name = managed_workspace.name.clone();
                             let workspace = workspace.clone();
-                            menu = menu.entry(name, None, move |_window, cx| {
-                                let Some(paths) =
-                                    WorkspaceManager::global(cx).open(workspace_id).log_err()
-                                else {
-                                    return;
-                                };
-                                let Some(workspace) = workspace.upgrade() else {
-                                    return;
-                                };
-                                let app_state = workspace.read(cx).app_state().clone();
-                                open_managed_workspace_paths(&paths, workspace_id, app_state, cx);
-                            });
+
+                            let mut entry = ContextMenuEntry::new(name.clone());
+                            if active_workspace_id == Some(workspace_id) {
+                                entry = entry.icon(IconName::Check);
+                            }
+                            let entry = entry
+                                .handler({
+                                    let workspace = workspace.clone();
+                                    move |_window, cx| {
+                                        let Some(paths) = WorkspaceManager::global(cx)
+                                            .open(workspace_id)
+                                            .log_err()
+                                        else {
+                                            return;
+                                        };
+                                        let Some(workspace) = workspace.upgrade() else {
+                                            return;
+                                        };
+                                        let app_state = workspace.read(cx).app_state().clone();
+                                        open_managed_workspace_paths(
+                                            &paths,
+                                            workspace_id,
+                                            app_state,
+                                            cx,
+                                        );
+                                    }
+                                })
+                                .on_secondary_mouse_down({
+                                    let workspace = workspace.clone();
+                                    move |_event, window, cx| {
+                                        let Some(workspace) = workspace.upgrade() else {
+                                            return;
+                                        };
+                                        workspace.update(cx, |workspace, cx| {
+                                            let weak = workspace.weak_handle();
+                                            workspace.toggle_modal(window, cx, |window, cx| {
+                                                RenameWorkspaceModal::new(
+                                                    weak,
+                                                    workspace_id,
+                                                    name.clone(),
+                                                    window,
+                                                    cx,
+                                                )
+                                            });
+                                        });
+                                    }
+                                });
+                            menu = menu.item(entry);
                         }
                         menu.separator()
                             .entry("New Workspace…", None, move |window, cx| {

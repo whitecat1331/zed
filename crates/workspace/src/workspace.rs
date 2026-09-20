@@ -153,6 +153,7 @@ pub use toolbar::{
 };
 pub use ui;
 use ui::{Clickable, Window, prelude::*};
+use ui_input::InputField;
 use url::Url;
 use util::{
     ResultExt, TryFutureExt,
@@ -426,6 +427,8 @@ actions!(
         ActivatePreviousWindow,
         /// Adds a folder to the current workspace.
         AddFolderToWorkspace,
+        /// Renames the current workspace.
+        RenameWorkspace,
         /// Clears all bookmarks in the project.
         ClearBookmarks,
         /// Clears all notifications.
@@ -4319,6 +4322,27 @@ impl Workspace {
         .detach_and_log_err(cx);
     }
 
+    pub fn rename_workspace(
+        &mut self,
+        _: &RenameWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace_id) = self.managed_workspace_id() else {
+            return;
+        };
+        let current_name = WorkspaceManager::global(cx)
+            .get(workspace_id)
+            .log_err()
+            .flatten()
+            .map(|workspace| workspace.name)
+            .unwrap_or_default();
+        let workspace = self.weak_handle();
+        self.toggle_modal(window, cx, |window, cx| {
+            RenameWorkspaceModal::new(workspace, workspace_id, current_name, window, cx)
+        });
+    }
+
     pub fn project_path_for_path(
         project: Entity<Project>,
         abs_path: &Path,
@@ -8142,6 +8166,7 @@ impl Workspace {
             .on_action(cx.listener(Self::save_all))
             .on_action(cx.listener(Self::send_keystrokes))
             .on_action(cx.listener(Self::add_folder_to_workspace))
+            .on_action(cx.listener(Self::rename_workspace))
             .on_action(cx.listener(Self::follow_next_collaborator))
             .on_action(cx.listener(Self::activate_pane_at_index))
             .on_action(cx.listener(Self::move_item_to_pane_at_index))
@@ -11221,6 +11246,106 @@ impl Render for ManagedWorkspaceAsk {
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         this.open(vec![folder.clone()], cx);
                     })),
+            )
+    }
+}
+
+/// Prompt shown by `workspace: rename` and the workspace switcher's rename
+/// action. Collects a new name and calls [`WorkspaceManager::rename`].
+pub struct RenameWorkspaceModal {
+    workspace: WeakEntity<Workspace>,
+    workspace_id: ManagedWorkspaceId,
+    name_editor: Entity<InputField>,
+    focus_handle: FocusHandle,
+}
+
+impl RenameWorkspaceModal {
+    pub fn new(
+        workspace: WeakEntity<Workspace>,
+        workspace_id: ManagedWorkspaceId,
+        current_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let name_editor = cx.new(|cx| {
+            let input = InputField::new(window, cx, "Workspace name");
+            input.set_text(&current_name, window, cx);
+            input
+        });
+        cx.defer_in(window, move |this, window, cx| {
+            let focus_handle = this.name_editor.focus_handle(cx);
+            focus_handle.focus(window, cx);
+            let editor = this.name_editor.read(cx).editor().clone();
+            editor.select_all(window, cx);
+        });
+        Self {
+            workspace,
+            workspace_id,
+            name_editor,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    fn rename(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.name_editor.read(cx).text(cx).trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let workspace_id = self.workspace_id;
+        let workspace = self.workspace.clone();
+        let manager = WorkspaceManager::global(cx);
+        cx.spawn(async move |this, cx| {
+            manager.rename(workspace_id, name).await.log_err();
+            workspace.update(cx, |_, cx| cx.notify()).ok();
+            this.update(cx, |_, cx| cx.emit(DismissEvent)).ok();
+        })
+        .detach();
+    }
+}
+
+impl ModalView for RenameWorkspaceModal {}
+
+impl EventEmitter<DismissEvent> for RenameWorkspaceModal {}
+
+impl Focusable for RenameWorkspaceModal {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for RenameWorkspaceModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("RenameWorkspaceModal")
+            .elevation_3(cx)
+            .w(rems(34.))
+            .p_3()
+            .gap_2()
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::rename))
+            .on_action(cx.listener(|_this, _: &menu::Cancel, _window, cx| {
+                cx.emit(DismissEvent);
+            }))
+            .child(ui::Label::new("Rename Workspace"))
+            .child(self.name_editor.clone())
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        ui::Button::new("cancel-rename", "Cancel").on_click(cx.listener(
+                            |_this, _event, _window, cx| {
+                                cx.emit(DismissEvent);
+                            },
+                        )),
+                    )
+                    .child(
+                        ui::Button::new("confirm-rename", "Rename").on_click(cx.listener(
+                            |this, _event, window, cx| {
+                                this.rename(&menu::Confirm, window, cx);
+                            },
+                        )),
+                    ),
             )
     }
 }
