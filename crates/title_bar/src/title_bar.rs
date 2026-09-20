@@ -308,6 +308,10 @@ impl Render for TitleBar {
             }
         }
 
+        if let Some(workspace_name) = self.managed_workspace_name(cx) {
+            project_name = Some(workspace_name);
+        }
+
         children.push(
             h_flex()
                 .h_full()
@@ -876,6 +880,20 @@ impl TitleBar {
             )
             .anchor(gpui::Anchor::TopLeft)
             .into_any_element()
+    }
+
+    /// The managed-workspace name this window displays, if it is tagged with a
+    /// managed workspace. Shown in the title bar so a rename is visible in the
+    /// window; falls back to the derived project name when the window is untagged.
+    fn managed_workspace_name(&self, cx: &App) -> Option<SharedString> {
+        let workspace = self.workspace.upgrade()?;
+        let workspace_id = workspace.read(cx).managed_workspace_id()?;
+        let name = WorkspaceManager::global(cx)
+            .get(workspace_id)
+            .ok()
+            .flatten()?
+            .name;
+        Some(SharedString::from(name))
     }
 
     fn render_managed_workspaces_popover(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
