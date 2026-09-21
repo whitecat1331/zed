@@ -350,6 +350,8 @@ pub struct DeepseekAvailableModel {
     pub display_name: Option<String>,
     pub max_tokens: u64,
     pub max_output_tokens: Option<u64>,
+    /// Whether the model accepts image input.
+    pub supports_images: Option<bool>,
 }
 
 #[with_fallible_options]
