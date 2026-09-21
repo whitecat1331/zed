@@ -19,14 +19,13 @@ pub mod builtin_profiles {
     pub const READ: &str = "read";
     pub const WRITE: &str = "write";
     pub const EXECUTE: &str = "execute";
-    pub const PLAN: &str = "plan";
     pub const DEBUG: &str = "debug";
     pub const MINIMAL: &str = "minimal";
 
     pub fn is_builtin(profile_id: &AgentProfileId) -> bool {
         matches!(
             profile_id.as_str(),
-            READ | WRITE | EXECUTE | PLAN | DEBUG | MINIMAL
+            READ | WRITE | EXECUTE | DEBUG | MINIMAL
         )
     }
 
@@ -39,7 +38,7 @@ pub mod builtin_profiles {
     /// Whether a profile can inspect the project and run read-only tooling but
     /// cannot mutate the project or execute arbitrary operations.
     pub fn is_read_only(profile_id: &AgentProfileId) -> bool {
-        matches!(profile_id.as_str(), READ | PLAN)
+        matches!(profile_id.as_str(), READ)
     }
 }
 
@@ -336,20 +335,20 @@ mod tests {
             builtin_profiles::READ,
             builtin_profiles::WRITE,
             builtin_profiles::EXECUTE,
-            builtin_profiles::PLAN,
             builtin_profiles::DEBUG,
             builtin_profiles::MINIMAL,
         ] {
             assert!(builtin_profiles::is_builtin(&AgentProfileId(id.into())));
         }
-        assert!(!builtin_profiles::is_builtin(&AgentProfileId("custom".into())));
+        assert!(!builtin_profiles::is_builtin(&AgentProfileId(
+            "custom".into()
+        )));
 
         for (id, can_change_files) in [
             (builtin_profiles::WRITE, true),
             (builtin_profiles::EXECUTE, true),
             (builtin_profiles::DEBUG, true),
             (builtin_profiles::READ, false),
-            (builtin_profiles::PLAN, false),
             (builtin_profiles::MINIMAL, false),
         ] {
             assert_eq!(
@@ -361,7 +360,6 @@ mod tests {
 
         for (id, read_only) in [
             (builtin_profiles::READ, true),
-            (builtin_profiles::PLAN, true),
             (builtin_profiles::WRITE, false),
             (builtin_profiles::EXECUTE, false),
             (builtin_profiles::DEBUG, false),

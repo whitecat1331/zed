@@ -94,12 +94,6 @@ pub fn mode_framing(profile_id: &str) -> Option<&'static str> {
              You have full autonomy: you may edit files, run the terminal, and \
              use the debugger.",
         ),
-        builtin_profiles::PLAN => Some(
-            "## Agent mode: plan\n\n\
-             You are read-only, like read mode, but your job is to plan. Always \
-             load the `plan-manager` skill and draft or edit plans in `plans/`. \
-             Do not make code changes.",
-        ),
         builtin_profiles::DEBUG => Some(
             "## Agent mode: debug\n\n\
              Work a tight diagnose-fix-verify loop: scaffold a minimal \
@@ -110,6 +104,21 @@ pub fn mode_framing(profile_id: &str) -> Option<&'static str> {
         ),
         _ => None,
     }
+}
+
+/// The planning overlay, layered on top of whichever base profile is active.
+/// Unlike the old `plan` profile (a read-only permission tier), planning is
+/// permission-neutral: the base profile still governs the tool set, so the
+/// model may author plan files with the editor tools its base profile grants.
+pub fn plan_framing() -> &'static str {
+    "## Plan mode\n\n\
+     You are in plan mode. Always load the `plan-manager` skill and draft or \
+     edit plans in `plans/`. Your base-mode permissions still apply, so you \
+     may write plan files with whatever editor tools your base profile grants. \
+     Before finalizing a plan, state which crate tags it touches (e.g. `dap`, \
+     `browser_tools`), map those tags to validation suites with \
+     `python zed-debugger-demo/zed-tools/loop/run-suites.py --tags <tags>`, run \
+     each returned suite, and cite the results in the plan."
 }
 
 /// Handlebars helper for checking if an item is in a list
@@ -154,11 +163,6 @@ mod tests {
                 .contains("no terminal")
         );
         assert!(
-            mode_framing(builtin_profiles::PLAN)
-                .unwrap()
-                .contains("plan-manager")
-        );
-        assert!(
             mode_framing(builtin_profiles::DEBUG)
                 .unwrap()
                 .contains("remote-compiler")
@@ -166,6 +170,8 @@ mod tests {
         assert!(mode_framing(builtin_profiles::EXECUTE).is_some());
         assert!(mode_framing("custom").is_none());
         assert!(mode_framing(builtin_profiles::MINIMAL).is_none());
+        assert!(plan_framing().contains("plan-manager"));
+        assert!(plan_framing().contains("base-mode permissions"));
     }
 
     #[test]
