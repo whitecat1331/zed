@@ -4448,6 +4448,7 @@ impl ThreadView {
                                     .gap_1()
                                     .children(self.render_token_usage(cx))
                                     .children(self.profile_selector.clone())
+                                    .children(self.render_plan_toggle(cx))
                                     .map(|this| match self.config_options_view.clone() {
                                         Some(config_view) => this.child(config_view),
                                         None => this
@@ -4986,6 +4987,46 @@ impl ThreadView {
                         }),
                 )
                 .child(Divider::vertical())
+                .into_any_element(),
+        )
+    }
+
+    fn render_plan_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let thread = self.as_native_thread(cx)?.read(cx);
+
+        // Plan mode layers over the work profiles only; `debug` has its own
+        // loop and `minimal`/custom profiles don't get a planning overlay.
+        if !matches!(thread.profile().as_str(), "read" | "write" | "execute") {
+            return None;
+        }
+
+        let planning = thread.is_planning();
+
+        let (tooltip_label, color) = if planning {
+            ("Disable Plan Mode", Color::Accent)
+        } else {
+            (
+                "Enable Plan Mode",
+                Color::Custom(cx.theme().colors().icon_disabled.opacity(0.8)),
+            )
+        };
+
+        let focus_handle = self.message_editor.focus_handle(cx);
+
+        Some(
+            IconButton::new("plan-mode", IconName::ListTodo)
+                .icon_size(IconSize::Small)
+                .icon_color(color)
+                .tooltip(move |_, cx| {
+                    Tooltip::for_action_in(tooltip_label, &TogglePlanMode, &focus_handle, cx)
+                })
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    if let Some(thread) = this.as_native_thread(cx) {
+                        thread.update(cx, |thread, cx| {
+                            thread.set_planning(!thread.is_planning(), cx);
+                        });
+                    }
+                }))
                 .into_any_element(),
         )
     }
@@ -12412,6 +12453,13 @@ impl Render for ThreadView {
                         if model_allows_disabling {
                             thread.set_thinking_enabled(!thread.thinking_enabled(), cx);
                         }
+                    });
+                }
+            }))
+            .on_action(cx.listener(|this, _: &TogglePlanMode, _window, cx| {
+                if let Some(thread) = this.as_native_thread(cx) {
+                    thread.update(cx, |thread, cx| {
+                        thread.set_planning(!thread.is_planning(), cx);
                     });
                 }
             }))

@@ -1343,6 +1343,10 @@ pub struct Thread {
     initial_project_snapshot: Shared<Task<Option<Arc<ProjectSnapshot>>>>,
     pub(crate) context_server_registry: Entity<ContextServerRegistry>,
     profile_id: AgentProfileId,
+    /// Whether plan mode is on for this thread. Plan mode is an overlay layered
+    /// over `profile_id` (which still governs the tool set); it injects plan-mode
+    /// framing and routes the model to validate plans against the dispatch suites.
+    planning: bool,
     /// Whether `profile_id` was downgraded to `minimal` at thread start because
     /// the workspace is restricted. Used purely to surface a warning in the UI.
     profile_downgraded_for_restricted_workspace: bool,
@@ -1442,6 +1446,7 @@ impl Thread {
         let settings = AgentSettings::get_global(cx);
         let (profile_id, profile_downgraded_for_restricted_workspace) =
             Self::profile_for_restricted_workspace(settings.default_profile.clone(), &project, cx);
+        let (profile_id, planning) = Self::migrate_plan_profile(profile_id, false);
         let enable_thinking = settings
             .default_model
             .as_ref()
@@ -1488,6 +1493,7 @@ impl Thread {
             },
             context_server_registry,
             profile_id,
+            planning,
             profile_downgraded_for_restricted_workspace,
             project_context,
             templates,
@@ -1521,6 +1527,7 @@ impl Thread {
         self.thinking_effort = parent.thinking_effort.clone();
         self.summarization_model = parent.summarization_model.clone();
         self.profile_id = parent.profile_id.clone();
+        self.planning = parent.planning;
         self.profile_downgraded_for_restricted_workspace =
             parent.profile_downgraded_for_restricted_workspace;
     }
@@ -1814,6 +1821,7 @@ impl Thread {
         let profile_id = db_thread
             .profile
             .unwrap_or_else(|| settings.default_profile.clone());
+        let (profile_id, planning) = Self::migrate_plan_profile(profile_id, db_thread.planning);
 
         let saved_selection = db_thread.model.map(|model| SelectedModel {
             provider: model.provider.into(),
@@ -1870,6 +1878,7 @@ impl Thread {
             initial_project_snapshot: Task::ready(db_thread.initial_project_snapshot).shared(),
             context_server_registry,
             profile_id,
+            planning,
             profile_downgraded_for_restricted_workspace: false,
             project_context,
             templates,
@@ -1979,6 +1988,7 @@ impl Thread {
             request_token_usage: self.request_token_usage.clone(),
             model: (&self.model).into(),
             profile: Some(self.profile_id.clone()),
+            planning: self.planning,
             subagent_context: self.subagent_context.clone(),
             speed: self.speed,
             thinking_enabled: self.thinking_enabled,
@@ -2300,6 +2310,22 @@ impl Thread {
         &self.profile_id
     }
 
+    /// Whether plan mode is on for this thread.
+    pub fn is_planning(&self) -> bool {
+        self.planning
+    }
+
+    /// Turns plan mode on or off. Notifies so the change persists, mirroring
+    /// `set_profile`: persistence is driven by the `cx.observe(&thread)` save
+    /// subscription, which only runs when the thread notifies.
+    pub fn set_planning(&mut self, planning: bool, cx: &mut Context<Self>) {
+        if self.planning == planning {
+            return;
+        }
+        self.planning = planning;
+        cx.notify();
+    }
+
     /// Whether this thread's profile was downgraded to `minimal` at thread start
     /// because the workspace is restricted.
     pub fn profile_was_downgraded(&self) -> bool {
@@ -2332,6 +2358,18 @@ impl Thread {
         }
     }
 
+    /// Maps a legacy `plan` profile to its replacement — the `read` base profile
+    /// plus the planning overlay. `plan` was formerly a read-only permission
+    /// tier; it is now a per-thread toggle layered over a base profile, so a
+    /// saved (or default) `plan` profile keeps working after the change.
+    fn migrate_plan_profile(profile_id: AgentProfileId, planning: bool) -> (AgentProfileId, bool) {
+        if profile_id.as_str() == "plan" {
+            (AgentProfileId(builtin_profiles::READ.into()), true)
+        } else {
+            (profile_id, planning)
+        }
+    }
+
     pub fn set_profile(&mut self, profile_id: AgentProfileId, cx: &mut Context<Self>) {
         // An explicit selection means any earlier automatic downgrade no longer
         // applies, even if the user re-selects the same profile.
@@ -2342,6 +2380,13 @@ impl Thread {
         }
 
         self.profile_id = profile_id.clone();
+
+        // A profile switch must always notify, even when the new profile has no
+        // `default_model` (none of the built-ins do): thread persistence is
+        // driven by the `cx.observe(&thread)` subscription in
+        // `NativeAgent::register_session`, and without a notify the switch is
+        // never written to the threads DB.
+        cx.notify();
 
         // Swap to the profile's preferred model when available.
         if let Some(model) = Self::resolve_profile_model(&self.profile_id, cx) {
@@ -4410,6 +4455,9 @@ impl Thread {
         .expect("Invalid template");
         if let Some(framing) = crate::mode_framing(self.profile_id.as_str()) {
             system_prompt = format!("{framing}\n\n{system_prompt}");
+        }
+        if self.planning {
+            system_prompt = format!("{}\n\n{system_prompt}", crate::plan_framing());
         }
         if !memory_index.is_empty() {
             system_prompt.push_str("\n## Persistent Memory\n\n");
@@ -6944,6 +6992,54 @@ mod tests {
         let mut settings = AgentSettings::get_global(cx).clone();
         settings.auto_compact = auto_compact;
         AgentSettings::override_global(settings, cx);
+    }
+
+    #[gpui::test]
+    async fn test_set_profile_notifies_without_default_model(cx: &mut TestAppContext) {
+        let (thread, _events) = setup_thread_for_test(cx).await;
+
+        let notified = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        cx.update(|cx| {
+            cx.observe(&thread, {
+                let notified = notified.clone();
+                move |_, _| {
+                    notified.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+            .detach();
+        });
+
+        // `read` is a built-in profile with no `default_model`; before the fix,
+        // switching to it never notified, so the observer (and therefore thread
+        // persistence) never fired.
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_profile(AgentProfileId(builtin_profiles::READ.into()), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(
+            notified.load(std::sync::atomic::Ordering::SeqCst),
+            "set_profile must notify even when the profile has no default model"
+        );
+        cx.update(|cx| {
+            assert_eq!(thread.read(cx).profile().as_str(), builtin_profiles::READ);
+        });
+    }
+
+    #[test]
+    fn test_plan_profile_migrates_to_read_and_planning() {
+        let (profile, planning) =
+            Thread::migrate_plan_profile(AgentProfileId("plan".into()), false);
+        assert_eq!(profile.as_str(), builtin_profiles::READ);
+        assert!(planning);
+
+        // Non-plan profiles pass through unchanged.
+        let (profile, planning) =
+            Thread::migrate_plan_profile(AgentProfileId(builtin_profiles::WRITE.into()), true);
+        assert_eq!(profile.as_str(), builtin_profiles::WRITE);
+        assert!(planning);
     }
 
     fn set_registry_compaction_model(cx: &mut App, model: Option<Arc<dyn LanguageModel>>) {

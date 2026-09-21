@@ -40,6 +40,8 @@ pub struct SerializedThread {
     pub tool_use_limit_reached: bool,
     #[serde(default)]
     pub profile: Option<AgentProfileId>,
+    #[serde(default)]
+    pub planning: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -185,6 +187,7 @@ impl LegacySerializedThread {
             detailed_summary_state: DetailedSummaryState::default(),
             model: None,
             tool_use_limit_reached: false,
+            planning: false,
             profile: None,
         }
     }
@@ -273,6 +276,7 @@ mod tests {
                 detailed_summary_state: DetailedSummaryState::default(),
                 model: None,
                 tool_use_limit_reached: false,
+                planning: false,
                 profile: None
             }
         )
@@ -338,6 +342,7 @@ mod tests {
             detailed_summary_state: DetailedSummaryState::default(),
             model: None,
             tool_use_limit_reached: false,
+            planning: false,
             profile: None,
         });
         let upgraded = thread_v0_1_0.upgrade();
@@ -389,6 +394,7 @@ mod tests {
                 detailed_summary_state: DetailedSummaryState::default(),
                 model: None,
                 tool_use_limit_reached: false,
+                planning: false,
                 profile: None
             }
         )
