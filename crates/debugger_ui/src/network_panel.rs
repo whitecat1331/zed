@@ -536,7 +536,7 @@ impl NetworkPanel {
             self.list_state.clone(),
             cx.processor(|this, ix, _window, cx| this.render_entry(ix, cx)),
         )
-        .flex_1()
+        .size_full()
         .into_any_element()
     }
 
@@ -552,6 +552,8 @@ impl NetworkPanel {
         let body = self.detail_body(request);
         v_flex()
             .size_full()
+            .overflow_scroll()
+            .p_2()
             .child(Label::new(body))
             .into_any_element()
     }
@@ -694,10 +696,16 @@ impl gpui::Render for NetworkPanel {
             .flex_col()
             .child(self.render_toolbar(cx))
             .child(div().flex_1().flex().flex_row().children(vec![
-                    self.render_list(window, cx).into_any_element(),
+                    div()
+                        .w_1_2()
+                        .flex_none()
+                        .h_full()
+                        .child(self.render_list(window, cx))
+                        .into_any_element(),
                     div()
                         .flex_1()
                         .flex_col()
+                        .overflow_hidden()
                         .child(self.render_detail_tabs(cx))
                         .child(self.render_detail(cx))
                         .into_any_element(),
