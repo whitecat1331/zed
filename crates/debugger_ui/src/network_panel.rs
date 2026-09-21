@@ -255,17 +255,22 @@ impl NetworkPanel {
         if !self.record {
             return;
         }
-        log::info!(
-            "[network-panel] apply: session={} driven_by={} requests={}",
-            snapshot.session_id,
-            snapshot.driven_by,
-            snapshot.requests.len()
-        );
-        self.session_id = Some(snapshot.session_id);
+        let session_id = snapshot.session_id;
+        let requests_len = snapshot.requests.len();
+        self.session_id = Some(session_id);
         self.driven_by = snapshot.driven_by;
         self.control = snapshot.control;
         self.requests = snapshot.requests;
-        self.list_state.reset(self.visible_requests(cx).len());
+        let visible = self.visible_requests(cx).len();
+        self.list_state.reset(visible);
+        log::info!(
+            "[network-panel] apply: session={} driven_by={} requests={} visible={} list_items={}",
+            session_id,
+            self.driven_by,
+            requests_len,
+            visible,
+            self.list_state.item_count()
+        );
         cx.notify();
     }
 
@@ -531,7 +536,7 @@ impl NetworkPanel {
             self.list_state.clone(),
             cx.processor(|this, ix, _window, cx| this.render_entry(ix, cx)),
         )
-        .size_full()
+        .flex_1()
         .into_any_element()
     }
 
