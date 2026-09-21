@@ -552,7 +552,7 @@ impl NetworkPanel {
         let body = self.detail_body(request);
         v_flex()
             .size_full()
-            .overflow_scroll()
+            .overflow_hidden()
             .p_2()
             .child(Label::new(body))
             .into_any_element()
