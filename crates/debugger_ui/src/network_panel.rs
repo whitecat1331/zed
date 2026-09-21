@@ -119,22 +119,45 @@ struct NetworkSnapshot {
 
 async fn fetch_snapshot(browser_api: &AgentBrowserApi) -> Option<NetworkSnapshot> {
     let sessions = browser_api.list_sessions().await;
+    if sessions.is_empty() {
+        log::info!("[network-panel] fetch: no browser sessions");
+        return None;
+    }
     let session = sessions.first()?;
-    let session_id = session.get("session_id").and_then(Value::as_u64)?;
+    let Some(session_id) = session.get("session_id").and_then(Value::as_u64) else {
+        log::info!("[network-panel] fetch: session missing session_id");
+        return None;
+    };
     let driven_by = session
         .get("driven_by")
         .and_then(Value::as_str)
         .unwrap_or("idle")
         .to_string();
-    let requests = browser_api
+    let requests = match browser_api
         .list_requests(session_id, &RequestFilter::default(), 0, 500)
         .await
-        .ok()?
-        .get("requests")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let control = browser_api.network_control_state(session_id).await.ok()?;
+    {
+        Ok(value) => value
+            .get("requests")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        Err(error) => {
+            log::info!("[network-panel] fetch: list_requests failed: {error:#}");
+            return None;
+        }
+    };
+    let control = match browser_api.network_control_state(session_id).await {
+        Ok(control) => control,
+        Err(error) => {
+            log::info!("[network-panel] fetch: network_control_state failed: {error:#}");
+            return None;
+        }
+    };
+    log::info!(
+        "[network-panel] fetch: session={session_id} driven_by={driven_by} requests={}",
+        requests.len()
+    );
     Some(NetworkSnapshot {
         session_id,
         driven_by,
@@ -232,6 +255,12 @@ impl NetworkPanel {
         if !self.record {
             return;
         }
+        log::info!(
+            "[network-panel] apply: session={} driven_by={} requests={}",
+            snapshot.session_id,
+            snapshot.driven_by,
+            snapshot.requests.len()
+        );
         self.session_id = Some(snapshot.session_id);
         self.driven_by = snapshot.driven_by;
         self.control = snapshot.control;
@@ -659,8 +688,7 @@ impl gpui::Render for NetworkPanel {
             .size_full()
             .flex_col()
             .child(self.render_toolbar(cx))
-            .child(
-                div().flex_1().flex().flex_row().children(vec![
+            .child(div().flex_1().flex().flex_row().children(vec![
                     self.render_list(window, cx).into_any_element(),
                     div()
                         .flex_1()
@@ -668,8 +696,7 @@ impl gpui::Render for NetworkPanel {
                         .child(self.render_detail_tabs(cx))
                         .child(self.render_detail(cx))
                         .into_any_element(),
-                ]),
-            )
+                ]))
     }
 }
 
