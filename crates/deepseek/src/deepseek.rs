@@ -52,6 +52,8 @@ impl From<Role> for String {
 pub enum Model {
     #[serde(rename = "deepseek-v4-flash")]
     V4Flash,
+    #[serde(rename = "deepseek-flash")]
+    Flash,
     #[serde(rename = "deepseek-v4-pro")]
     #[default]
     V4Pro,
@@ -62,6 +64,9 @@ pub enum Model {
         display_name: Option<String>,
         max_tokens: u64,
         max_output_tokens: Option<u64>,
+        /// Whether the model accepts image input.
+        #[serde(default)]
+        supports_images: bool,
     },
 }
 
@@ -73,6 +78,7 @@ impl Model {
     pub fn from_id(id: &str) -> Result<Self> {
         match id {
             "deepseek-v4-flash" => Ok(Self::V4Flash),
+            "deepseek-flash" => Ok(Self::Flash),
             "deepseek-v4-pro" => Ok(Self::V4Pro),
             _ => anyhow::bail!("invalid model id {id}"),
         }
@@ -81,6 +87,7 @@ impl Model {
     pub fn id(&self) -> &str {
         match self {
             Self::V4Flash => "deepseek-v4-flash",
+            Self::Flash => "deepseek-flash",
             Self::V4Pro => "deepseek-v4-pro",
             Self::Custom { name, .. } => name,
         }
@@ -89,6 +96,7 @@ impl Model {
     pub fn display_name(&self) -> &str {
         match self {
             Self::V4Flash => "DeepSeek V4 Flash",
+            Self::Flash => "DeepSeek V4.1 Flash",
             Self::V4Pro => "DeepSeek V4 Pro",
             Self::Custom {
                 name, display_name, ..
@@ -98,17 +106,27 @@ impl Model {
 
     pub fn max_token_count(&self) -> u64 {
         match self {
-            Self::V4Flash | Self::V4Pro => 1_000_000,
+            Self::V4Flash | Self::Flash | Self::V4Pro => 1_000_000,
             Self::Custom { max_tokens, .. } => *max_tokens,
         }
     }
 
     pub fn max_output_tokens(&self) -> Option<u64> {
         match self {
-            Self::V4Flash | Self::V4Pro => Some(384_000),
+            Self::V4Flash | Self::Flash | Self::V4Pro => Some(384_000),
             Self::Custom {
                 max_output_tokens, ..
             } => *max_output_tokens,
+        }
+    }
+
+    pub fn supports_images(&self) -> bool {
+        match self {
+            Self::Flash => true,
+            Self::V4Flash | Self::V4Pro => false,
+            Self::Custom {
+                supports_images, ..
+            } => *supports_images,
         }
     }
 }
@@ -185,6 +203,39 @@ pub struct FunctionDefinition {
 }
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Plain(String),
+    Multipart(Vec<MessagePart>),
+}
+
+impl MessageContent {
+    pub fn push_part(&mut self, part: MessagePart) {
+        match self {
+            MessageContent::Plain(text) => {
+                *self =
+                    MessageContent::Multipart(vec![MessagePart::Text { text: text.clone() }, part]);
+            }
+            MessageContent::Multipart(parts) => parts.push(part),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+#[serde(tag = "type")]
+pub enum MessagePart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    Image { image_url: ImageUrl },
+}
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct ImageUrl {
+    pub url: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum RequestMessage {
     Assistant {
@@ -195,7 +246,7 @@ pub enum RequestMessage {
         reasoning_content: Option<String>,
     },
     User {
-        content: String,
+        content: MessageContent,
     },
     System {
         content: String,

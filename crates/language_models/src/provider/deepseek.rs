@@ -167,6 +167,7 @@ impl LanguageModelProvider for DeepSeekLanguageModelProvider {
         let mut models = IndexMap::default();
 
         models.insert("deepseek-v4-flash", deepseek::Model::V4Flash);
+        models.insert("deepseek-flash", deepseek::Model::Flash);
         models.insert("deepseek-v4-pro", deepseek::Model::V4Pro);
 
         for available_model in &Self::settings(cx).available_models {
@@ -177,6 +178,7 @@ impl LanguageModelProvider for DeepSeekLanguageModelProvider {
                     display_name: available_model.display_name.clone(),
                     max_tokens: available_model.max_tokens,
                     max_output_tokens: available_model.max_output_tokens,
+                    supports_images: available_model.supports_images.unwrap_or(false),
                 },
             );
         }
@@ -284,7 +286,7 @@ impl LanguageModel for DeepSeekLanguageModel {
     fn supports_thinking(&self) -> bool {
         matches!(
             self.model,
-            deepseek::Model::V4Flash | deepseek::Model::V4Pro
+            deepseek::Model::V4Flash | deepseek::Model::Flash | deepseek::Model::V4Pro
         )
     }
 
@@ -317,7 +319,7 @@ impl LanguageModel for DeepSeekLanguageModel {
     }
 
     fn supports_images(&self) -> bool {
-        false
+        self.model.supports_images()
     }
 
     fn telemetry_id(&self) -> String {
@@ -389,15 +391,24 @@ pub fn into_deepseek(
                     };
 
                     if should_add {
-                        messages.push(match message.role {
-                            Role::User => deepseek::RequestMessage::User { content: text },
-                            Role::Assistant => deepseek::RequestMessage::Assistant {
+                        match message.role {
+                            Role::User => match messages.last_mut() {
+                                Some(deepseek::RequestMessage::User { content }) => {
+                                    content.push_part(deepseek::MessagePart::Text { text });
+                                }
+                                _ => messages.push(deepseek::RequestMessage::User {
+                                    content: deepseek::MessageContent::Plain(text),
+                                }),
+                            },
+                            Role::Assistant => messages.push(deepseek::RequestMessage::Assistant {
                                 content: Some(text),
                                 tool_calls: Vec::new(),
                                 reasoning_content: current_reasoning.take(),
-                            },
-                            Role::System => deepseek::RequestMessage::System { content: text },
-                        });
+                            }),
+                            Role::System => {
+                                messages.push(deepseek::RequestMessage::System { content: text })
+                            }
+                        }
                     }
                 }
                 MessageContent::Thinking { text, .. } => {
@@ -405,7 +416,21 @@ pub fn into_deepseek(
                     current_reasoning.get_or_insert_default().push_str(&text);
                 }
                 MessageContent::RedactedThinking(_) => {}
-                MessageContent::Image(_) => {}
+                MessageContent::Image(image) => {
+                    let part = deepseek::MessagePart::Image {
+                        image_url: deepseek::ImageUrl {
+                            url: image.to_base64_url(),
+                        },
+                    };
+                    match messages.last_mut() {
+                        Some(deepseek::RequestMessage::User { content }) => {
+                            content.push_part(part);
+                        }
+                        _ => messages.push(deepseek::RequestMessage::User {
+                            content: deepseek::MessageContent::Multipart(vec![part]),
+                        }),
+                    }
+                }
                 MessageContent::Compaction(_) => {}
                 MessageContent::ToolUse(tool_use) => {
                     let input = tool_use
@@ -512,7 +537,7 @@ fn deepseek_thinking(
     thinking_allowed: bool,
 ) -> Option<deepseek::Thinking> {
     let kind = match model {
-        deepseek::Model::V4Flash | deepseek::Model::V4Pro => {
+        deepseek::Model::V4Flash | deepseek::Model::Flash | deepseek::Model::V4Pro => {
             if thinking_allowed {
                 deepseek::ThinkingType::Enabled
             } else {
