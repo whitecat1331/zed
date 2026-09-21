@@ -18,6 +18,7 @@ use zed_actions::debug_panel::{Toggle, ToggleFocus};
 pub mod attach_modal;
 pub mod debugger_panel;
 mod dropdown_menus;
+pub mod network_panel;
 mod new_process_modal;
 mod persistence;
 pub(crate) mod session;
@@ -269,6 +270,15 @@ pub fn init(cx: &mut App) {
                     }
                 })
             });
+    })
+    .detach();
+
+    cx.observe_new(|workspace: &mut Workspace, _, _| {
+        workspace.register_action(
+            |workspace: &mut Workspace, _: &network_panel::ToggleNetworkPanel, window, cx| {
+                workspace.toggle_panel_focus::<network_panel::NetworkPanel>(window, cx);
+            },
+        );
     })
     .detach();
 

@@ -1,14 +1,12 @@
 use agent_client_protocol::schema::v1 as acp;
-use agent_settings::{AgentSettings, builtin_profiles};
+use agent_settings::builtin_profiles;
 use anyhow::{Context as _, Result};
-use browser_tools::AgentBrowserApi;
+use browser_tools::{AgentBrowserApi, DrivenBy};
 use gpui::{App, AppContext as _, SharedString, Task, WeakEntity};
-use http_client::HttpClient;
 use language_model::{LanguageModelImage, LanguageModelImageExt, LanguageModelToolResultContent};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use settings::Settings;
 use std::sync::Arc;
 
 use crate::{AgentTool, Thread, ToolCallEventStream, ToolInput, ToolPermissionContext};
@@ -137,17 +135,13 @@ impl From<BrowserToolOutput> for LanguageModelToolResultContent {
 }
 
 pub struct BrowserTool {
-    api: AgentBrowserApi,
+    api: Arc<AgentBrowserApi>,
     thread: WeakEntity<Thread>,
 }
 
 impl BrowserTool {
-    pub fn new(thread: WeakEntity<Thread>, http_client: Arc<dyn HttpClient>, cx: &App) -> Self {
-        let chromium_path = AgentSettings::get_global(cx).browser_chromium_path.clone();
-        Self {
-            api: AgentBrowserApi::new(chromium_path, http_client),
-            thread,
-        }
+    pub fn new(thread: WeakEntity<Thread>, api: Arc<AgentBrowserApi>) -> Self {
+        Self { api, thread }
     }
 
     fn is_read_only_profile(&self, cx: &App) -> bool {
@@ -240,6 +234,7 @@ impl BrowserTool {
                 )
                 .await?;
                 let session_id = self.api.start_session(&url, headless).await?;
+                let _ = self.api.set_driven_by(session_id, DrivenBy::Agent).await;
                 Ok(success(
                     operation,
                     "started browser session",
@@ -474,11 +469,18 @@ impl AgentTool for BrowserTool {
                     error: format!("Failed to receive browser tool input: {error}"),
                 })?;
             let operation = operation_name(&input).to_string();
+            let session_id = input.session_id;
+            let api = self.api.clone();
             match self
                 .run_operation(input, operation.clone(), event_stream, cx)
                 .await
             {
-                Ok(output) => Ok(output),
+                Ok(output) => {
+                    if let Some(session_id) = session_id {
+                        let _ = api.set_driven_by(session_id, DrivenBy::Agent).await;
+                    }
+                    Ok(output)
+                }
                 Err(error) => Err(BrowserToolOutput::Error {
                     operation: Some(operation),
                     error: error.to_string(),
@@ -505,7 +507,7 @@ async fn authorize_browser_operation(
     task.await
 }
 
-fn permission_inputs(operation: &str, values: impl IntoIterator<Item = String>) -> Vec<String> {
+pub(crate) fn permission_inputs(operation: &str, values: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut inputs = values.into_iter().collect::<Vec<_>>();
     if inputs.is_empty() {
         inputs.push(operation.to_string());

@@ -141,10 +141,10 @@ fn string_literal(value: &str) -> String {
 
 fn write_generated(out_dir: &Path, name: &str, contents: &str) {
     let path = out_dir.join(name);
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        if existing == contents {
-            return;
-        }
+    if let Ok(existing) = std::fs::read_to_string(&path)
+        && existing == contents
+    {
+        return;
     }
     std::fs::write(&path, contents)
         .unwrap_or_else(|error| panic!("failed to write {}: {error}", path.display()));

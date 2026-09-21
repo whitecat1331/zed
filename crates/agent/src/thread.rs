@@ -3,7 +3,7 @@ use crate::{
     CopyPathTool, CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DebuggerTool,
     DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool,
     GetCodeActionsTool, GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool,
-    MemoryStore, MemoryTool, MovePathTool, ProjectSnapshot, ReadFileTool, RenameTool,
+    MemoryStore, MemoryTool, MovePathTool, NetworkTool, ProjectSnapshot, ReadFileTool, RenameTool,
     SandboxedTerminalTool, SpawnAgentTool, SystemPromptTemplate, Template, Templates, TerminalTool,
     ToolPermissionDecision, WebSearchTool, WriteFileTool, decide_permission_from_settings,
 };
@@ -2224,11 +2224,11 @@ impl Thread {
             environment.clone(),
             cx.weak_entity(),
         ));
-        self.add_tool(BrowserTool::new(
-            cx.weak_entity(),
-            self.project.read(cx).client().http_client(),
-            cx,
-        ));
+        let chromium_path = AgentSettings::get_global(cx).browser_chromium_path.clone();
+        let http_client = self.project.read(cx).client().http_client();
+        let browser_api = browser_tools::shared_browser_api(cx, chromium_path, http_client);
+        self.add_tool(BrowserTool::new(cx.weak_entity(), browser_api.clone()));
+        self.add_tool(NetworkTool::new(cx.weak_entity(), browser_api));
         self.add_tool(EditFileTool::new(
             self.project.clone(),
             cx.weak_entity(),

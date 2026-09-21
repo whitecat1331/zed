@@ -1,4 +1,6 @@
 use crate::cdp::CdpClient;
+use crate::driven_by::DrivenBy;
+use crate::network::{NetworkControlState, NetworkStore};
 use std::collections::HashMap;
 
 /// A running browser session: a browser-level connection plus its targets.
@@ -13,6 +15,12 @@ pub struct BrowserSession {
     pub active_target_id: Option<String>,
     /// Handle to the Chromium process, so teardown can close the browser.
     pub child: smol::process::Child,
+    /// Typed request store fed from captured `Network.*` events.
+    pub network_store: NetworkStore,
+    /// Mutable network control state (throttle, offline, blocking, interception).
+    pub control: NetworkControlState,
+    /// Who is currently driving the session (Human / Agent / Idle).
+    pub driven_by: DrivenBy,
 }
 
 /// A single flattened target (page, worker, service worker, ...).
