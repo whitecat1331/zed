@@ -391,7 +391,6 @@ impl ProfilePickerDelegate {
             builtin_profiles::READ => Some("Inspect the codebase without changing it."),
             builtin_profiles::WRITE => Some("Make changes to your codebase."),
             builtin_profiles::EXECUTE => Some("Full autonomy: edit, run, and debug."),
-            builtin_profiles::PLAN => Some("Draft and edit plans without changing code."),
             builtin_profiles::DEBUG => Some("Diagnose and fix issues with the debugger."),
             _ => None,
         }

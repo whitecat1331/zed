@@ -2045,6 +2045,7 @@ mod tests {
             request_token_usage: Default::default(),
             model: None,
             profile: None,
+            planning: false,
             subagent_context: None,
             speed: None,
             thinking_enabled: false,
